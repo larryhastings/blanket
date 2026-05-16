@@ -31,7 +31,7 @@ Code paths that handle rare race conditions are by definition *rare*.
 But if you can't write a test that reliably reproduces the condition,
 how do you test it in your test suite?  How do you get to 100%?
 
-And this problem is only going to get harder. Python's "nogil" mode
+And this problem is only going to get harder. Python's "free threading" mode
 will become the default--someday soon--and more and more code will
 have to become multithreaded-aware.  Code that was reliable with the
 GIL may start exhibiting bugs it never used to.
@@ -48,8 +48,8 @@ One design choice worth mentioning up front: **blanket** *wraps*
 the real `threading.Lock`, `threading.Condition`, and so on,
 rather than reimplementing them. Your tests use the real primitives,
 which means they're guaranteed to behave like the real thing--because
-they *are* the real thing, just under **blanket** control.  Butfor
-this to work, your code has to replace the real *threading* module
+they *are* the real thing, just under **blanket** control.  But for
+this to work, your code has to replace the real `threading` module
 primitives with **blanket**-wrapped versions.
 
 **blanket** requires Python 3.7 or newer.  It depends on
@@ -262,7 +262,7 @@ There are several places where the scheduler can choose to park
 a transaction.  To make it easier to talk about, **blanket**
 gives them special names:
 
-* the *scheduler block*, which happens *efore* calling the
+* the *scheduler block*, which happens *before* calling the
   actual method.
 * the *scheduler stall*, a specific mid-transaction park
   only used for certain transactions.
@@ -492,7 +492,7 @@ the *raw* both change the internal state of the object in the same way.
 The only difference is that the raw handle is *always unregulated*;
 when you call a method on it, it always runs immediately.
 
-When is this useful?  
+When is this useful?
 Well, what if you need to change the state of a primitive while
 *inside* the scenario?  You might want to tweak a semaphore
 in the middle of a test, bumping up its value by calling `release`.
@@ -606,7 +606,7 @@ down to the middle level occasionally, and reaching into the low level
 only for tests that need surgical precision. But it's worth being
 familiar with all three.  As the classic computer science aphorism
 says: *all abstractions leak*.  So it's helpful to understand all
-three levels, even if you mostly stay at the to.
+three levels, even if you mostly stay at the top.
 
 
 ### The Low-Level API
@@ -622,7 +622,7 @@ for **blanket** to work.
 Every method call on a **blanket** primitive becomes a *transaction*.
 A transaction encapsulates:
 
-- the *primitive* the method call was ade on,
+- the *primitive* the method call was made on,
 - the *method* being called, which is a "bound method object" (`lock.acquire`),
 - the *thread* doing the calling,
 - the *state* the call is currently in,
@@ -732,9 +732,9 @@ calls. There are three free functions and three classes.
 #### park
 
 `scenario.park(*args, wait=False)` drives one or more
-named threads to specified methods, stopping each one at the
+supplied threads to specified methods, stopping each one at the
 scheduler block on the method you specified. After `park` returns,
-each named thread is parked, with its current transaction available
+each supplied thread is parked, with its current transaction available
 for inspection or manipulation:
 
 ```
@@ -1139,7 +1139,7 @@ Python function and modify it, producing a *new* function that's
 identical to the original except: you've inserted single inserted
 function call inside the function's bytecode, at a location you
 specify.  You then arrange for that injected call to be a
-**blanket** synchronization point--say, a call to 
+**blanket** synchronization point--say, a call to
 `event.wait` (on a real `threading` event)--and that gives you
 back control over the function making progress.
 
@@ -1148,7 +1148,7 @@ In short: with the injector, you insert synchronization points
 control.
 
 If you need to, you can mix injected code with code
-using **blanket** primitives.  The two are orthoganal
+using **blanket** primitives.  The two are orthogonal
 techniques and compose perfectly.
 
 
@@ -1313,7 +1313,7 @@ on.)
 ### score.lock
 
 The lock the wrappers all acquire is `score.lock`, owned by the
-scenario core.  There's exactly one of them.  Every regulated
+scenario core.  There's exactly one of them per scenario.  Every regulated
 operation in **blanket**--every method call on a primitive, every
 API-object method, every Driver/Chain/Dispatch operation, every
 scheduler-side manipulation of a transaction--enters under
