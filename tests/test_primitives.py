@@ -38,6 +38,7 @@ import unittest
 from blanket import Scenario
 from blanket import Call, Use, Terminated, Not, TimeoutState, ThreadOrderingError, Blocked, Waiting, Paused, Nested, TransactionState, State, Reached, Action
 from blanket import Stalled, Commit, Committed, Exiting, CompetingDriversError
+from blanket import Primitive
 from blanket import Location, inject_call
 from blanket import primitives as primitives_module
 from big.boundinnerclass import bound_to
@@ -526,7 +527,7 @@ class TestInstructions(unittest.TestCase):
         scenario = Scenario()
         action_record = []
 
-        def my_action():
+        def my_action(tx):
             action_record.append('executed')
 
         barrier = scenario.Barrier(2, action=my_action)
@@ -1965,7 +1966,7 @@ class TestBarrier(unittest.TestCase):
         scenario = Scenario()
         action_called = []
 
-        def barrier_action():
+        def barrier_action(tx):
             action_called.append('action')
 
         barrier = scenario.Barrier(2, action=barrier_action)
@@ -2749,41 +2750,6 @@ class TestSignalAndProxyInternals(unittest.TestCase):
         self.scenario = Scenario()
         self.core = self.scenario._core
 
-    def test_signal_minder_basic(self):
-        a = object(); b = object()
-        minder = self.core.SignalMinder(a, b)
-        self.assertFalse(minder)
-        minder.signal()
-        self.assertTrue(minder)
-        self.assertIn(a, self.core.signaling)
-        self.assertIn(b, self.core.signaling)
-
-        c = object()
-        minder.add(c)
-        self.assertIn(c, self.core.signaling)
-        minder.discard(c)
-        self.assertNotIn(c, self.core.signaling)
-
-        minder.signal()                 # nested signal: counter goes to 2
-        self.assertTrue(minder)
-        minder.unsignal()               # back to 1: still high
-        self.assertTrue(minder)
-        self.assertIn(a, self.core.signaling)
-        minder.unsignal()               # 0: items leave signaling
-        self.assertFalse(minder)
-        self.assertNotIn(a, self.core.signaling)
-
-        with minder:
-            self.assertTrue(minder)
-            self.assertIn(a, self.core.signaling)
-        self.assertFalse(minder)
-
-    def test_minders_dict_creates_signal_minders(self):
-        minder = self.core.thread_minders['alpha']
-        self.assertIsInstance(minder, self.core.SignalMinder)
-        self.assertIs(self.core.thread_minders['alpha'], minder)
-        self.assertEqual(minder.items, {'alpha'})
-
     def test_locked_dict_proxy_methods(self):
         proxy = self.core.LockedDictProxy({'a': 1, 'b': 2})
         self.assertIn("'a': 1", repr(proxy))
@@ -2892,9 +2858,12 @@ class TestScenarioCoreInternals(unittest.TestCase):
         self.core = self.scenario._core
 
     def test_reset_clears_terminated_tx_debris_from_signaling(self):
-        """reset() drops terminated-tx APIs and core tx objects from
-        score.signaling without disturbing structural items like
-        Not(thread)."""
+        """reset() drops accumulated state.  Self-reporting tx and
+        Signaled items report their own state directly; the per-score
+        "signaling" set is gone, so reset has no signaling debris to
+        clear.  This test verifies the post-refactor contract: tx.api
+        self-reports True once done and stays True across reset (state
+        is monotonic), and the log is cleared."""
         scenario = self.scenario
         lock = scenario.Lock()
         api = scenario.api(lock)
@@ -2904,13 +2873,11 @@ class TestScenarioCoreInternals(unittest.TestCase):
             api.unblock(lock.acquire, t)
             scenario.wait(Terminated(t))
             tx_api = scenario.log[-1]
-            self.assertIn(tx_api, self.core.signaling)
-            self.assertIn(tx_api._core, self.core.signaling)
+            self.assertTrue(tx_api.signal(scenario))
             scenario.reset()
-            self.assertNotIn(tx_api, self.core.signaling)
-            self.assertNotIn(tx_api._core, self.core.signaling)
-            # Structural items survive: Terminated(t) should still be high.
-            self.assertIn(Terminated(t), self.core.signaling)
+            self.assertTrue(tx_api.signal(scenario))
+            self.assertEqual(len(self.core.log), 0)
+            self.assertTrue(Terminated(t).signal(scenario))
 
     def test_reset_clears_log_and_waiters(self):
         scenario = self.scenario
@@ -2921,9 +2888,13 @@ class TestScenarioCoreInternals(unittest.TestCase):
             scenario.wait(lock.acquire)
             api.unblock(lock.acquire, t)
             scenario.wait(Terminated(t))
-        # __exit__ already auto-called reset_locked.
-        self.assertEqual(len(self.core._log), 0)
+        # __exit__ does NOT clear the log (it persists for post-mortem
+        # inspection); waiters self-clean as each wait completes.
+        self.assertGreater(len(self.core.log), 0)
         self.assertEqual(len(self.core.waiters), 0)
+        # reset() clears the log explicitly.
+        scenario.reset()
+        self.assertEqual(len(self.core.log), 0)
 
     def test_reset_is_idempotent(self):
         scenario = self.scenario
@@ -2940,10 +2911,13 @@ class TestScenarioCoreInternals(unittest.TestCase):
             api.unblock(lock.acquire, t)
             scenario.wait(Terminated(t))
             tx_api = scenario.log[-1]
-            self.assertIn(tx_api, self.core.signaling)
-        # After exit, the tx debris is gone.
-        self.assertNotIn(tx_api, self.core.signaling)
-        self.assertEqual(len(self.core._log), 0)
+            # tx.api is Signaling and self-reports True once done.
+            self.assertTrue(tx_api.signal(scenario))
+        # After exit, the log PERSISTS (for post-mortem inspection);
+        # it is cleared on the next entry, not on exit.
+        self.assertGreater(len(self.core.log), 0)
+        with scenario:
+            self.assertEqual(len(self.core.log), 0)
 
     def test_context_manager_catches_already_started_thread(self):
         ran = []
@@ -2955,22 +2929,13 @@ class TestScenarioCoreInternals(unittest.TestCase):
             pass
         self.assertTrue(ran)
 
-    def test_core_set_unset_and_wake(self):
+    def test_core_signal_requires_signaled(self):
+        # Every wait item is Signaled now; score.signal on a bare
+        # object asserts out.  This is a contract assertion, not a
+        # user-facing error -- internal callers must wrap properly.
         item = object()
-        self.core.signal(item)
-        self.assertIn(item, self.core.signaling)
-        self.core.unsignal(item)
-        self.assertNotIn(item, self.core.signaling)
-
-    def test_api_wait_and_internal_wait_branches(self):
-        sig_item = object()
-        with self.core.lock:
-            self.core.signal(sig_item)
-            got = self.core.wait({sig_item})
-            self.assertIn(sig_item, got)
-            self.assertEqual(self.core.wait({'x'}, timeout=0), set())
-            got2 = self.core.wait({sig_item})
-        self.assertIn(sig_item, got2)
+        with self.assertRaises(AssertionError):
+            self.core.signal(item)
 
     def test_wait_on_monitor_thread_raises(self):
         evt = threading.Event()
@@ -5759,14 +5724,16 @@ class TestNestedTransactions(unittest.TestCase):
 
     def test_barrier_action_nested_tx_has_parent(self):
         """A Barrier action may create a nested regulated transaction.
-        While the barrier's run_action push is in effect, the child
-        appears as a fresh root (parent=None) to the rest of blanket;
-        the cycle's scheduler discovers it via Action(opener_tx)."""
+        Under the new design, the framework does NOT stash the opener
+        around the action call, so the child appears as a proper child
+        (child.parent is opener_tx).  Action(opener_tx) still goes
+        high for the duration of the callback, so the cycle's
+        scheduler can discover the child via that signal."""
         s = Scenario()
         lock = s.Lock()
         log = []
 
-        def action():
+        def action(tx):
             log.append(('action', threading.current_thread().name))
             lock.locked()
             log.append('action_after_nested')
@@ -5795,17 +5762,17 @@ class TestNestedTransactions(unittest.TestCase):
             # deadlock here -- the opener can't reach PAUSED until the
             # child tx terminates.  Pass a scheduler callback that
             # drives the child past BLOCKED to terminal.  The scheduler
-            # waits on Action(opener_tx) -- which goes high the
-            # instant the worker pushes the opener around the action
-            # call -- rather than on Nested(opener_tx), because the
-            # push hides the parent pointer (child.parent is None
-            # while pushed) and the Nested-on-parent signal that the
-            # old design relied on no longer fires.
+            # waits on Action(opener_tx) -- which goes high while the
+            # user action callback runs.
             def drive_child():
                 s.wait(Action(opener_tx))
                 child = s.transaction(x)
                 self.assertEqual(child.method, lock.locked)
-                self.assertIsNone(child.parent)
+                # Under the new (no-implicit-stash) design, the child
+                # is a proper child of opener_tx via tx.parent.  depth
+                # is keyed by method, so child is depth 0 (lock.locked
+                # has no same-method ancestor).
+                self.assertIs(child.parent, opener_tx)
                 self.assertEqual(child.depth, 0)
                 self.assertEqual(opener_tx.method, barrier.wait)
                 self.assertTrue(opener_tx.ran_action)
@@ -5916,23 +5883,25 @@ class TestNestedTransactions(unittest.TestCase):
             s.transaction(t).unblock()
             s.wait(outer_tx)
 
-            # Worker is now in rlock.release.  Use(t, condition) is
-            # still signaling because rlock.release's tx (on rlock_core)
-            # has condition in its family aliases — proving the
-            # cross-core SignalMinder sharing works.
-            signaled = s.wait(use)
-            self.assertIn(use, signaled)
+            # Worker now heads into rlock.release.  Under the directional
+            # rule, using a condition uses its lock (cond -> ul), but NOT
+            # the reverse: rlock.release does not use any condition.  So
+            # once the wait_for txs are done, Use(t, condition) is low,
+            # while Use(t, rlock) is high during rlock.release.
+            s.wait(Call(t, rlock.release, State.BLOCKED))
+            self.assertFalse(s.wait(use, timeout=0))
+            self.assertIn(Use(t, rlock), s.wait(Use(t, rlock), timeout=0))
             s.skip(t, rlock.release, wait=True)
 
-            # Now nothing is in flight; Use(t, condition) is gone.
-            signaled = s.wait(use, timeout=0)
-            self.assertFalse(signaled)
+            # Now nothing is in flight; both Use signals are gone.
+            self.assertFalse(s.wait(use, timeout=0))
+            self.assertFalse(s.wait(Use(t, rlock), timeout=0))
 
     def test_raw_form_signals_for_condition_family(self):
         """Inside a Lock-family member's tx, every family member
-        (lock, conditions, and *all* their raws) appears in
-        score.signaling.  This includes the lock's own raw, which
-        before Stage F was missing from the family alias set."""
+        (lock, conditions, and their raws) signals as Primitive(form).
+        Raw and primitive forms normalize to the same key, so waiting
+        on any spelling returns that spelling."""
         s = Scenario()
         lock = s.Lock()
         cond = s.Condition(lock)
@@ -5947,14 +5916,16 @@ class TestNestedTransactions(unittest.TestCase):
             t = s.thread(worker)
             signaled = s.wait(
                 cond.acquire,
-                lock, lock_raw, cond, cond_raw,
+                Primitive(lock), Primitive(lock_raw),
+                Primitive(cond), Primitive(cond_raw),
                 Use(t, lock), Use(t, lock_raw), Use(t, cond), Use(t, cond_raw),
                 )
-            # All four primitive forms signal.
-            self.assertIn(lock, signaled)
-            self.assertIn(lock_raw, signaled)
-            self.assertIn(cond, signaled)
-            self.assertIn(cond_raw, signaled)
+            # All four primitive forms signal (raw normalizes to cooked,
+            # so each spelling comes back).
+            self.assertIn(Primitive(lock), signaled)
+            self.assertIn(Primitive(lock_raw), signaled)
+            self.assertIn(Primitive(cond), signaled)
+            self.assertIn(Primitive(cond_raw), signaled)
 
             # All four Use forms also signal.
             self.assertIn(Use(t, lock), signaled)
@@ -6217,24 +6188,6 @@ class TestCoverageLowHangingFruit(unittest.TestCase):
         with self.assertRaises(ValueError):
             Call(thread, lambda: None, depth=-1)
 
-    def test_signal_minder_quiet_branches(self):
-        scenario = Scenario()
-        score = scenario._core
-
-        # add/discard while counter is 0 update items but don't touch signaling.
-        a = object()
-        b = object()
-        minder = score.SignalMinder(a)
-        minder.add(b)
-        self.assertIn(b, minder.items)
-        self.assertNotIn(b, score.signaling)
-        minder.add(b)              # idempotent re-add: items unchanged
-        self.assertEqual(minder.items, {a, b})
-        minder.discard(b)
-        self.assertNotIn(b, minder.items)
-        minder.discard(b)          # idempotent re-discard: no error
-        self.assertNotIn(b, minder.items)
-
     def test_read_only_list_index_with_explicit_stop(self):
         scenario = Scenario()
         proxy = scenario._core.ReadOnlyListProxy([1, 2, 3, 2])
@@ -6427,7 +6380,7 @@ class TestCoverageLowHanging(unittest.TestCase):
         s = Scenario()
         action_threads = []
 
-        def action():
+        def action(tx):
             action_threads.append(threading.current_thread())
 
         barrier = s.Barrier(1, action=action)
@@ -8311,17 +8264,6 @@ class TestCoverageMinor(unittest.TestCase):
             disp.close()
             s.finish(t)
 
-    def test_signal_minder_repr(self):
-        """SignalMinder.__repr__ smoke test."""
-        # The SignalMinder type is exposed at the core level.
-        # Construct one directly via the bound inner class and
-        # call repr() on it.
-        s = Scenario()
-        minder = s._core.SignalMinder(frozenset())
-        r = repr(minder)
-        self.assertIn('SignalMinder', r)
-        self.assertIn('counter', r)
-
     def test_driver_unregister_not_owned_raises(self):
         """driver.unregister raises if the driver has no owner."""
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -8346,15 +8288,13 @@ class TestCoverageMinor(unittest.TestCase):
         """WaitTransaction.__repr__ produces a readable string."""
         s = Scenario()
         ev = s.Event()
-        # Construct a WaitTransaction directly so we don't need to
-        # spin up a worker (s.wait is scheduler-side).
-        wtx = s._core.WaitTransaction(
-            threading.current_thread(),
-            frozenset([ev]), blocker=lambda: None)
+        # WaitTransaction(score, items): every item is Signaling.
+        item = Primitive(ev)
+        wtx = s._core.WaitTransaction(frozenset([item]))
         r = repr(wtx)
         self.assertIn('WaitTransaction', r)
-        self.assertIn('thread=', r)
-        self.assertIn('blocker=', r)
+        self.assertIn('items=', r)
+        self.assertIn('signaled=', r)
 
     def test_chain_unregister_when_not_owned_raises(self):
         """Chain.unregister raises if the chain has no owner."""
@@ -8861,43 +8801,6 @@ class TestExternallyCreatedThreads(unittest.TestCase):
         barrier_set = {n for tag, n in order if tag == 'barrier'}
         self.assertEqual(barrier_set, {'A', 'B', 'C'})
 
-        # Flag invariant: once any externally-created thread has
-        # registered against the score, use_minders is preserved
-        # for the life of the score even across re-entries.
-        self.assertTrue(s._core.has_external_threads)
-
-    def test_external_thread_flag_is_sticky_across_reentry(self):
-        # First scenario uses an external thread; flag goes True.
-        # Second scenario uses only a managed thread; flag stays
-        # True and use_minders is not cleared.
-        s = Scenario()
-        lock = s.Lock()
-        api = s.api(lock)
-
-        def w():
-            lock.acquire()
-            lock.release()
-
-        external = threading.Thread(target=w)
-        with s:
-            external.start()
-            s.finish(external)
-        external.join()
-
-        self.assertTrue(s._core.has_external_threads)
-        # use_minders kept the entry for the external thread.
-        core = api._core
-        self.assertIn(external, core.use_minders)
-
-        with s:
-            managed = s.thread(w)
-            s.finish(managed)
-
-        # Flag still True, external entry still present (sticky leak).
-        self.assertTrue(s._core.has_external_threads)
-        self.assertIn(external, core.use_minders)
-
-
 
 class TestTimeoutTrioAndFailureDetection(unittest.TestCase):
     """Settings-only expire/disregard/revert: the trio writes the
@@ -9034,7 +8937,7 @@ class TestTimeoutTrioAndFailureDetection(unittest.TestCase):
 
 
 
-class TestPushPopAndAction(unittest.TestCase):
+class TestStashAndAction(unittest.TestCase):
     """Push/pop, Action signal, cycle validation, and Driver.nested
     state coverage.  Push/pop is an internal mechanism (barrier
     workers use it around their action callback); most tests reach
@@ -9067,7 +8970,7 @@ class TestPushPopAndAction(unittest.TestCase):
             t = s.thread(lock.locked)
             s.wait(t)
             tx = s.transaction(t)
-            self.assertFalse(Action(tx).signal)
+            self.assertFalse(Action(tx).signal(s))
             s.finish(t)
 
     def test_action_signal_high_during_barrier_action(self):
@@ -9078,7 +8981,7 @@ class TestPushPopAndAction(unittest.TestCase):
         lock = s.Lock()
         observed = {}
 
-        def action():
+        def action(tx):
             # Worker has pushed before this runs; the scheduler
             # observes Action(opener) high.  Body just needs to do
             # some regulated work the scheduler will drive.
@@ -9097,26 +9000,31 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(x)
             opener = s.transaction(x)
 
-            self.assertFalse(Action(opener).signal)
+            self.assertFalse(Action(opener).signal(s))
 
             def drive_child():
-                # Block until push happens.  The scheduler runs
-                # concurrently with the worker thread leaving WAITING
-                # and entering the action, so Action(opener) is
-                # initially low; we wait until it fires.
+                # Block until the worker enters the action.  The
+                # scheduler runs concurrently with the worker thread
+                # leaving WAITING and entering the action, so
+                # Action(opener) is initially low; we wait until it
+                # fires.
                 s.wait(Action(opener))
-                observed['during_action'] = Action(opener).signal
+                observed['during_action'] = Action(opener).signal(s)
                 child = s.transaction(x)
                 self.assertEqual(child.method, lock.locked)
-                self.assertIsNone(child.parent)
+                # Under the new no-implicit-stash design the child is
+                # a proper child of opener.  (The user could stash
+                # opener inside the action to get the old root-child
+                # behavior, but the framework no longer does it.)
+                self.assertIs(child.parent, opener)
                 child.unblock()
                 s.wait(child)
 
             cycle = bapi.cycle(a, x, scheduler=drive_child)
             cycle.close()
 
-            # After the action and pop, Action(opener) goes low.
-            self.assertFalse(Action(opener).signal)
+            # After the action returns, Action(opener) goes low.
+            self.assertFalse(Action(opener).signal(s))
 
         self.assertTrue(observed['during_action'])
 
@@ -9153,7 +9061,7 @@ class TestPushPopAndAction(unittest.TestCase):
         action is present (and is allowed when an action is absent,
         per the ValueError check using 'is _do_nothing')."""
         s = Scenario()
-        barrier = s.Barrier(2, action=lambda: None)
+        barrier = s.Barrier(2, action=lambda tx: None)
         bapi = s.api(barrier)
 
         def worker():
@@ -9175,7 +9083,7 @@ class TestPushPopAndAction(unittest.TestCase):
         pop time."""
         s = Scenario()
         log = []
-        barrier = s.Barrier(2, action=lambda: log.append('action_ran'))
+        barrier = s.Barrier(2, action=lambda tx: log.append('action_ran'))
         bapi = s.api(barrier)
 
         def worker():
@@ -9190,7 +9098,7 @@ class TestPushPopAndAction(unittest.TestCase):
             cycle.close()
         self.assertEqual(log, ['action_ran'])
 
-    def test_push_gating_close(self):
+    def test_stash_gating_close(self):
         """A pushed tx rejects close()."""
         s = Scenario()
         lock = s.Lock()
@@ -9200,15 +9108,15 @@ class TestPushPopAndAction(unittest.TestCase):
             tx_api = s.transaction(t)
             tx = tx_api._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.close()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_unblock(self):
+    def test_stash_gating_unblock(self):
         """A pushed tx rejects unblock()."""
         s = Scenario()
         lock = s.Lock()
@@ -9217,15 +9125,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.unblock()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_settle(self):
+    def test_stash_gating_settle(self):
         """A pushed tx rejects settle()."""
         s = Scenario()
         lock = s.Lock()
@@ -9234,15 +9142,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.settle()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_unpark(self):
+    def test_stash_gating_unpark(self):
         """A pushed tx rejects unpark()."""
         s = Scenario()
         lock = s.Lock()
@@ -9251,15 +9159,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.unpark(State.COMMIT)
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_set_pause(self):
+    def test_stash_gating_set_pause(self):
         """A pushed tx rejects set_pause()."""
         s = Scenario()
         lock = s.Lock()
@@ -9268,15 +9176,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.set_pause(True)
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_unpause(self):
+    def test_stash_gating_unpause(self):
         """A pushed tx rejects unpause()."""
         s = Scenario()
         lock = s.Lock()
@@ -9285,15 +9193,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.unpause()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_observe(self):
+    def test_stash_gating_observe(self):
         """A pushed tx rejects observe()."""
         s = Scenario()
         lock = s.Lock()
@@ -9302,15 +9210,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.observe(State.COMMITTED, lambda: None)
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_gating_timeout_setter(self):
+    def test_stash_gating_timeout_setter(self):
         """A pushed TimeoutTransaction rejects timeout assignment
         (which gates expire/disregard/revert)."""
         s = Scenario()
@@ -9330,20 +9238,20 @@ class TestPushPopAndAction(unittest.TestCase):
             self.assertIsInstance(
                 tx, s._core.Core.TimeoutTransaction)
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.expire()
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.disregard()
-                    with self.assertRaisesRegex(RuntimeError, "is pushed"):
+                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
                         tx.revert()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
             t.join()
 
-    def test_push_idempotency_via_context_manager(self):
+    def test_stash_idempotency_via_context_manager(self):
         """Push BIC as context manager: __exit__ pops, and re-calling
         the instance is a no-op (popped flag)."""
         s = Scenario()
@@ -9353,17 +9261,17 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                with tx.push() as ticket:
-                    self.assertIs(tx.pushed, ticket)
-                    self.assertFalse(ticket.popped)
-                self.assertTrue(ticket.popped)
-                self.assertIsNone(tx.pushed)
+                with tx.stash() as ticket:
+                    self.assertIs(tx.stashed, ticket)
+                    self.assertFalse(ticket.closed)
+                self.assertTrue(ticket.closed)
+                self.assertIsNone(tx.stashed)
                 # Second call: no-op.
-                ticket()
-                self.assertTrue(ticket.popped)
+                ticket.close()
+                self.assertTrue(ticket.closed)
             s.finish(t)
 
-    def test_push_rejects_double_push(self):
+    def test_stash_rejects_double_push(self):
         """Pushing an already-pushed tx raises."""
         s = Scenario()
         lock = s.Lock()
@@ -9372,15 +9280,15 @@ class TestPushPopAndAction(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)._core
             with s._core.lock:
-                ticket = tx.push()
+                ticket = tx.stash()
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "already pushed"):
-                        tx.push()
+                    with self.assertRaisesRegex(RuntimeError, "already stashed"):
+                        tx.stash()
                 finally:
-                    ticket()
+                    ticket.close()
             s.finish(t)
 
-    def test_push_rejects_non_root(self):
+    def test_stash_rejects_non_root(self):
         """Pushing a tx with a parent raises."""
         s = Scenario()
         lock = s.Lock()
@@ -9405,7 +9313,7 @@ class TestPushPopAndAction(unittest.TestCase):
             with s._core.lock:
                 with self.assertRaisesRegex(RuntimeError,
                         "only chain-root transactions"):
-                    child.push()
+                    child.stash()
             # Drive child out to let test exit cleanly.
             child_api.unblock()
             s.wait(Call(t, condition.wait, State.STALLED))
