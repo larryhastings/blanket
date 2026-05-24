@@ -44,7 +44,7 @@ from blanket import primitives as primitives_module
 from big.boundinnerclass import bound_to
 
 
-# Canonical timeout values for tests.  Use these instead of magic numbers:
+# Standard timeout values for tests.  Use these instead of magic numbers:
 #
 #   IMMEDIATELY  - For timeouts that are expected to fire promptly.
 #                  A properly-written blanket scheduler step should complete
@@ -1067,6 +1067,53 @@ class TestPrimitiveMasquerading(unittest.TestCase):
             with self.subTest(primitive=primitive):
                 self.assertIsInstance(primitive, blanket_class)
                 self.assertIsInstance(primitive, real_class)
+
+    def test_api_class_aliases_exposed_for_isinstance(self):
+        # The API wrapper classes are surfaced on the Scenario API at
+        # both class and instance level, as stable isinstance targets.
+        scenario = Scenario()
+        alias_names = ('LockAPI', 'RLockAPI', 'ConditionAPI', 'EventAPI',
+                       'SemaphoreAPI', 'BoundedSemaphoreAPI', 'BarrierAPI',
+                       'Transaction')
+        for name in alias_names:
+            with self.subTest(alias=name):
+                self.assertTrue(hasattr(Scenario, name))
+                # Same stable class object at class and instance level.
+                self.assertIs(getattr(Scenario, name), getattr(scenario, name))
+                self.assertIsInstance(getattr(Scenario, name), type)
+
+        # Each primitive-API alias identifies that primitive's api object.
+        primitive_checks = (
+            (scenario.Lock(), Scenario.LockAPI),
+            (scenario.RLock(), Scenario.RLockAPI),
+            (scenario.Condition(), Scenario.ConditionAPI),
+            (scenario.Event(), Scenario.EventAPI),
+            (scenario.Semaphore(), Scenario.SemaphoreAPI),
+            (scenario.BoundedSemaphore(), Scenario.BoundedSemaphoreAPI),
+            (scenario.Barrier(2), Scenario.BarrierAPI),
+        )
+        for primitive, alias in primitive_checks:
+            with self.subTest(alias=alias.__name__):
+                self.assertIsInstance(scenario.api(primitive), alias)
+
+    def test_transaction_alias_identifies_tx_objects(self):
+        # Scenario.Transaction (the merged TransactionAPI) catches every
+        # transaction the user can hold, regardless of underlying tx
+        # class.
+        scenario = Scenario()
+        lock = scenario.Lock()
+        def worker():
+            lock.acquire()
+            lock.release()
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.wait(Call(t, lock.acquire, State.BLOCKED))
+            tx = scenario.transactions[t]
+            self.assertIsInstance(tx, Scenario.Transaction)
+            self.assertIsInstance(tx, scenario.Transaction)
+            scenario.api(lock).unblock(lock.acquire, t)
+            scenario.wait(tx)
+            scenario.skip(t, lock.release, wait=True)
 
     def test_class_spoof_is_read_only(self):
         scenario = Scenario()
@@ -2873,11 +2920,11 @@ class TestScenarioCoreInternals(unittest.TestCase):
             api.unblock(lock.acquire, t)
             scenario.wait(Terminated(t))
             tx_api = scenario.log[-1]
-            self.assertTrue(tx_api.signal(scenario))
+            self.assertTrue(tx_api.sample(scenario))
             scenario.reset()
-            self.assertTrue(tx_api.signal(scenario))
+            self.assertTrue(tx_api.sample(scenario))
             self.assertEqual(len(self.core.log), 0)
-            self.assertTrue(Terminated(t).signal(scenario))
+            self.assertTrue(Terminated(t).sample(scenario))
 
     def test_reset_clears_log_and_waiters(self):
         scenario = self.scenario
@@ -2912,7 +2959,7 @@ class TestScenarioCoreInternals(unittest.TestCase):
             scenario.wait(Terminated(t))
             tx_api = scenario.log[-1]
             # tx.api is Signaling and self-reports True once done.
-            self.assertTrue(tx_api.signal(scenario))
+            self.assertTrue(tx_api.sample(scenario))
         # After exit, the log PERSISTS (for post-mortem inspection);
         # it is cleared on the next entry, not on exit.
         self.assertGreater(len(self.core.log), 0)
@@ -3246,6 +3293,35 @@ class TestHighLevelLockApiCoverage(unittest.TestCase):
         self.assertEqual(order, ['B','A','C'])
         with self.assertRaises(ValueError):
             api.relay(tb)
+
+    def test_relay_waits_for_later_arrivals_lazily(self):
+        """relay is progressive, not a snapshot: it must not wait for a
+        later chain participant to reach its tx until the chain advances
+        to it.  Here C is gated behind an event and has NOT called
+        lock.acquire() when relay() is invoked; relay drives B then A,
+        and only once we advance the iterator past A does it wait for C
+        (after we release the gate).  A snapshot relay would fail at
+        call time because C isn't parked at acquire/BLOCKED."""
+        s = Scenario(); lock = s.Lock(); api = s.api(lock); order = []
+        gate = threading.Event()
+        def a(): lock.acquire(); order.append('A'); lock.release()
+        def b(): lock.acquire(); order.append('B'); lock.release()
+        def c():
+            gate.wait()
+            lock.acquire(); order.append('C'); lock.release()
+        with s:
+            ta = s.thread(a); tb = s.thread(b); tc = s.thread(c)
+            api.assign(tb)                      # B holds the lock, at release/BLOCKED
+            it = api.relay(tb, ta, tc)
+            self.assertIs(next(it), ta)         # drives B->release, A->acquire
+            # C has not been waited for yet: it is still gated, not on a tx.
+            self.assertNotIn(tc, s.transactions)
+            gate.set()                          # now let C head toward acquire
+            self.assertIs(next(it), tc)         # relay waits for C, then drives it
+            with self.assertRaises(StopIteration):
+                next(it)
+            api.unblock(lock.release, tc)
+        self.assertEqual(order, ['B', 'A', 'C'])
 
     def test_relay_cold_start(self):
         """relay's initial arg can be an acquirer (at acquire/BLOCKED)
@@ -4396,7 +4472,7 @@ class TestCycleIteratorProtocol(unittest.TestCase):
             s.skip(a, lock.release, wait=True)
 
     def test_for_loop_drains_in_spec_order(self):
-        # The canonical with-for idiom: drain all remaining waiters
+        # The standard with-for idiom: drain all remaining waiters
         # in spec order, doing post-wake work between iterations.
         # The notifier (n) is in the cycle's orchestration but not
         # in remaining; the iterator yields only waiters.
@@ -4481,7 +4557,7 @@ class TestCycleIteratorProtocol(unittest.TestCase):
                 next(cy)
 
     def test_iter_in_with_block(self):
-        # Canonical idiom: with-as cycle, for-in drain.
+        # Standard idiom: with-as cycle, for-in drain.
         s, lock, cond, capi, log, waiter, notifier = self._setup()
         with s:
             a = s.thread(waiter('A'))
@@ -6965,7 +7041,7 @@ class TestInject(unittest.TestCase):
         instances hold a blanket RLock bound to the scenario.
 
         This pattern has been stable in the standard library across
-        many CPython versions and is the canonical pattern-2 use
+        many CPython versions and is the standard pattern-2 use
         case for inject."""
         import sched
         scenario = Scenario()
@@ -6982,7 +7058,7 @@ class TestInject(unittest.TestCase):
         """_threading_local does 'from threading import current_thread,
         RLock' (pattern 1), then constructs RLock() inside local's
         impl.  Under inject, local instances hold a blanket RLock
-        bound to the scenario.  This is the canonical pattern-1 use
+        bound to the scenario.  This is the standard pattern-1 use
         case for inject."""
         import _threading_local
         scenario = Scenario()
@@ -8937,7 +9013,7 @@ class TestTimeoutTrioAndFailureDetection(unittest.TestCase):
 
 
 
-class TestStashAndAction(unittest.TestCase):
+class TestAction(unittest.TestCase):
     """Push/pop, Action signal, cycle validation, and Driver.nested
     state coverage.  Push/pop is an internal mechanism (barrier
     workers use it around their action callback); most tests reach
@@ -8970,7 +9046,7 @@ class TestStashAndAction(unittest.TestCase):
             t = s.thread(lock.locked)
             s.wait(t)
             tx = s.transaction(t)
-            self.assertFalse(Action(tx).signal(s))
+            self.assertFalse(Action(tx).sample(s))
             s.finish(t)
 
     def test_action_signal_high_during_barrier_action(self):
@@ -9000,7 +9076,7 @@ class TestStashAndAction(unittest.TestCase):
             s.wait(x)
             opener = s.transaction(x)
 
-            self.assertFalse(Action(opener).signal(s))
+            self.assertFalse(Action(opener).sample(s))
 
             def drive_child():
                 # Block until the worker enters the action.  The
@@ -9009,13 +9085,11 @@ class TestStashAndAction(unittest.TestCase):
                 # Action(opener) is initially low; we wait until it
                 # fires.
                 s.wait(Action(opener))
-                observed['during_action'] = Action(opener).signal(s)
+                observed['during_action'] = Action(opener).sample(s)
                 child = s.transaction(x)
                 self.assertEqual(child.method, lock.locked)
-                # Under the new no-implicit-stash design the child is
-                # a proper child of opener.  (The user could stash
-                # opener inside the action to get the old root-child
-                # behavior, but the framework no longer does it.)
+                # Under the new design the child is a proper child of
+                # opener; the framework does not detach it.
                 self.assertIs(child.parent, opener)
                 child.unblock()
                 s.wait(child)
@@ -9024,7 +9098,7 @@ class TestStashAndAction(unittest.TestCase):
             cycle.close()
 
             # After the action returns, Action(opener) goes low.
-            self.assertFalse(Action(opener).signal(s))
+            self.assertFalse(Action(opener).sample(s))
 
         self.assertTrue(observed['during_action'])
 
@@ -9097,230 +9171,6 @@ class TestStashAndAction(unittest.TestCase):
             cycle = bapi.cycle(a, x)
             cycle.close()
         self.assertEqual(log, ['action_ran'])
-
-    def test_stash_gating_close(self):
-        """A pushed tx rejects close()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx_api = s.transaction(t)
-            tx = tx_api._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.close()
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_unblock(self):
-        """A pushed tx rejects unblock()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.unblock()
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_settle(self):
-        """A pushed tx rejects settle()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.settle()
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_unpark(self):
-        """A pushed tx rejects unpark()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.unpark(State.COMMIT)
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_set_pause(self):
-        """A pushed tx rejects set_pause()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.set_pause(True)
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_unpause(self):
-        """A pushed tx rejects unpause()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.unpause()
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_observe(self):
-        """A pushed tx rejects observe()."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.observe(State.COMMITTED, lambda: None)
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_gating_timeout_setter(self):
-        """A pushed TimeoutTransaction rejects timeout assignment
-        (which gates expire/disregard/revert)."""
-        s = Scenario()
-        lock = s.Lock()
-        log = []
-
-        def worker():
-            log.append('before')
-            lock.acquire(timeout=10)
-            log.append('after')
-
-        with s:
-            t = s.thread(worker)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            # First, verify it's a TimeoutTransaction.
-            self.assertIsInstance(
-                tx, s._core.Core.TimeoutTransaction)
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.expire()
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.disregard()
-                    with self.assertRaisesRegex(RuntimeError, "is stashed"):
-                        tx.revert()
-                finally:
-                    ticket.close()
-            s.finish(t)
-            t.join()
-
-    def test_stash_idempotency_via_context_manager(self):
-        """Push BIC as context manager: __exit__ pops, and re-calling
-        the instance is a no-op (popped flag)."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                with tx.stash() as ticket:
-                    self.assertIs(tx.stashed, ticket)
-                    self.assertFalse(ticket.closed)
-                self.assertTrue(ticket.closed)
-                self.assertIsNone(tx.stashed)
-                # Second call: no-op.
-                ticket.close()
-                self.assertTrue(ticket.closed)
-            s.finish(t)
-
-    def test_stash_rejects_double_push(self):
-        """Pushing an already-pushed tx raises."""
-        s = Scenario()
-        lock = s.Lock()
-        with s:
-            t = s.thread(lock.locked)
-            s.wait(t)
-            tx = s.transaction(t)._core
-            with s._core.lock:
-                ticket = tx.stash()
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "already stashed"):
-                        tx.stash()
-                finally:
-                    ticket.close()
-            s.finish(t)
-
-    def test_stash_rejects_non_root(self):
-        """Pushing a tx with a parent raises."""
-        s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        results = []
-
-        def waiter():
-            lock.acquire()
-            results.append(condition.wait_for(lambda: False, timeout=-1))
-            lock.release()
-
-        with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire, wait=True)
-            s.wait(t)
-            wf_tx = s.transaction(t)._core
-            wf_tx.unblock()
-            s.wait(Nested(wf_tx.api), Terminated(t))
-            child_api = s.transaction(t)
-            child = child_api._core
-            self.assertIs(child.parent, wf_tx)
-            with s._core.lock:
-                with self.assertRaisesRegex(RuntimeError,
-                        "only chain-root transactions"):
-                    child.stash()
-            # Drive child out to let test exit cleanly.
-            child_api.unblock()
-            s.wait(Call(t, condition.wait, State.STALLED))
-            child_api.unstall()
-            s.wait(child_api)
-            s.wait(wf_tx.api)
-            s.skip(t, lock.release, wait=True)
 
     def test_action_signal_in_signaled_module_list(self):
         """Action is exported from blanket."""

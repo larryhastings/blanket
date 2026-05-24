@@ -200,7 +200,7 @@ class Signaling:
 
     - scenario.wait queries o.signal when it's fist called.  If
       o.signal is True, we return it immediately, otherwise we wait.
-    - score.signal(o) confirms o.signal is True at call time, then
+    - score.signal(o) confirms o.sample is True at call time, then
       wakes any waiters parked on o.
 
     Notably, blanket no longer tracks o anywhere between calls.
@@ -216,12 +216,12 @@ class Signaling:
     """
     __slots__ = ()
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         "Return True if this signal is currently high in scenario."
         raise NotImplementedError
 
     def normalized(self):
-        """Return the canonical form of this signal: raw primitive
+        """Return the normalized form of this signal: raw primitive
         and raw bound-method references are normalized to their
         cooked-primitive equivalents.  The default is identity;
         signals that wrap a primitive or bound method override.
@@ -230,7 +230,7 @@ class Signaling:
 
 
 def _normalize_method(method):
-    """Normalize a bound method to its canonical form: a Condition's
+    """Normalize a bound method to its normalized form: a Condition's
     lock-shared method (acquire/release/locked) collapses to the
     underlying lock's cooked method, and any raw-handle method
     collapses to its cooked-primitive method.  Condition-only methods
@@ -277,7 +277,7 @@ class Use(Signaling, ImmutableThreadSignalToken):
     def primitive(self):
         return self[1]
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         # Walks thread's tx chain looking for any tx whose
         # use_primitives set contains our (normalized) primitive.
         core = self.primitive._core
@@ -340,7 +340,7 @@ class Call(Signaling, ImmutableThreadSignalToken):
     def depth(self):
         return self[3]
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         thread, method, state, depth = self
         score = scenario._core
         # Walk the thread's chain from leaf to root looking for a tx
@@ -383,7 +383,7 @@ class Terminated(Signaling, ImmutableThreadSignalToken):
             raise TypeError(f"Terminated expected a thread, got {thread!r}")
         return tuple.__new__(cls, (thread,))
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         return not self.thread.is_alive()
 
     def __repr__(self):
@@ -427,18 +427,18 @@ class Not(Signaling, ImmutableSignalToken):
         another Signaling like Terminated)."""
         return self[0]
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         wrapped = self.wrapped
         # A bare thread or bound method inside Not is interpreted the
         # same way the top-level boxing layer would: a bare thread
         # means "has an active tx", a bare bound method means "any
         # thread is calling this method".  We invert that.
         if isinstance(wrapped, Signaling):
-            return not wrapped.signal(scenario)
+            return not wrapped.sample(scenario)
         if isinstance(wrapped, threading.Thread):
             return wrapped not in scenario._core.transactions
         # bare bound method: aggregate "anyone calling?" -> invert.
-        return not scenario._core.BoundMethod(wrapped).signal(scenario)
+        return not scenario._core.BoundMethod(wrapped).sample(scenario)
 
     def normalized(self):
         wrapped = self.wrapped
@@ -461,19 +461,17 @@ class Not(Signaling, ImmutableSignalToken):
 class Nested(Signaling, ImmutableTransactionSignalToken):
     """A level signal that goes high while a transaction has an active child transaction.
 
-    Self-reporting (Signaling): Nested(tx).signal returns
-    tx._core.child is not None.  Stash hides the child by detaching
-    .child to None, so a stashed-parent tx reads Nested as low,
-    which is the intended invisibility semantic.
+    Self-reporting (Signaling): Nested(tx).sample returns
+    tx._core.child is not None.
     """
     __slots__ = ()
 
     def __new__(cls, tx):
-        if not isinstance(tx, Scenario._ScenarioCore.Core.API.TransactionAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
             raise TypeError(f"Nested argument must be a Transaction, not {tx!r}")
         return tuple.__new__(cls, (tx,))
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         return self.tx._core.child is not None
 
     def __repr__(self):
@@ -508,7 +506,7 @@ class Primitive(Signaling, ImmutableSignalToken):
     def primitive(self):
         return self[0]
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         outer = self.primitive._core.primitive
         score = scenario._core
         for tx in score.transactions.values():
@@ -538,12 +536,12 @@ class Reached(Signaling, ImmutableSignalToken):
     tx.state >= state on demand.  Two Reached(tx, state)
     instances compare equal and hash equal (tuple semantics),
     so they interoperate as a single key in score.waiters
-    without any canonicality machinery.
+    without any normalization machinery.
     """
     __slots__ = ()
 
     def __new__(cls, tx, state):
-        if not isinstance(tx, Scenario._ScenarioCore.Core.API.TransactionAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
             raise TypeError(f"Reached tx must be a transaction, not {tx!r}")
         if not isinstance(state, State):
             raise TypeError(f"Reached state must be a State, not {state!r}")
@@ -561,7 +559,7 @@ class Reached(Signaling, ImmutableSignalToken):
     def thread(self):
         return self.tx._core.thread
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         # Read tx._core.state directly; callers consult under score.lock.
         return self.tx._core.state.index >= self.state.index
 
@@ -576,22 +574,18 @@ class Action(Signaling, ImmutableTransactionSignalToken):
     barrier.wait around its action callback and condition.wait_for
     around its predicate callback.
 
-    Independent of tx.stash(): the user may elect to stash the parent
-    tx inside their callback (to hide it from regulated primitive
-    calls), but the Action signal fires whether or not they do.
-
-    Self-reporting: Action(tx).signal returns tx._core.in_action.
+    Self-reporting: Action(tx).sample returns tx._core.in_action.
     Two Action(tx) instances compare equal and hash equal (tuple
     semantics) and interoperate as a single key in score.waiters.
     """
     __slots__ = ()
 
     def __new__(cls, tx):
-        if not isinstance(tx, Scenario._ScenarioCore.Core.API.TransactionAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
             raise TypeError(f"Action argument must be a Transaction, not {tx!r}")
         return tuple.__new__(cls, (tx,))
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         return self.tx._core.in_action
 
     def __repr__(self):
@@ -649,7 +643,7 @@ class TransactionState(Signaling, ImmutableTransactionSignalToken):
     _subclass_for_state = {}
 
     def __new__(cls, tx, state):
-        if not isinstance(tx, Scenario._ScenarioCore.Core.API.TransactionAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
             raise TypeError(f"tx must be a transaction, not {tx!r}")
         if not isinstance(state, State):
             raise TypeError(f"state must be a State, not {state!r}")
@@ -666,7 +660,7 @@ class TransactionState(Signaling, ImmutableTransactionSignalToken):
     def state(self):
         return self[1]
 
-    def signal(self, scenario):
+    def sample(self, scenario):
         return self.tx._core.state is self.state
 
     def __repr__(self):
@@ -1134,7 +1128,7 @@ class Scenario:
                 signaled = set()
 
                 for key in self.keys:
-                    if key.signal(scenario):
+                    if key.sample(scenario):
                         signaled.add(key)
 
                 # note: if timeout is None, we want to wait for a signal
@@ -1859,7 +1853,7 @@ class Scenario:
                 return self.pursue(self.parking, 'commit', target=State.COMMIT, tx_cls=self.score.Core.TimeoutTransaction)
 
             def wait(self):
-                return self.pursue(self.parking, 'wait', target=State.WAITING, tx_cls=self.score.Core.WaitingTransaction)
+                return self.pursue(self.parking, 'wait', target=State.WAITING, tx_cls=self.score.WaitingTransaction)
 
             def stall(self):
                 return self.pursue(self.parking, 'stall', target=State.STALLED, tx_cls=self.score.Core.StallingTransaction)
@@ -3176,7 +3170,7 @@ class Scenario:
         def signal(self, item):
             """Wake any waiters parked on item.
 
-            Every wait-item is Signaling: item.signal(scenario) is its
+            Every wait-item is Signaling: item.sample(scenario) is its
             source of truth, queried on demand.  signal() is purely a
             wakeup notification -- it confirms the item is currently
             high (waking on a low signal would be a bug) and releases
@@ -3188,7 +3182,7 @@ class Scenario:
             assert isinstance(item, Signaling), (
                 f"signal({item!r}): expected a Signaling instance; "
                 "non-Signaling wait items are no longer supported")
-            assert item.signal(self.api), (
+            assert item.sample(self.api), (
                 f"signal({item!r}): item is not high; "
                 "Signaling items must be high when signaled")
             for wtx in self.waiters.pop(item, ()):
@@ -3255,7 +3249,7 @@ class Scenario:
                         f"thread must be threading.Thread, not {thread!r}")
                 return tuple.__new__(cls, (thread,))
 
-            def signal(self, scenario):
+            def sample(self, scenario):
                 return self.thread in scenario._core.transactions
 
             def __repr__(self):
@@ -3285,7 +3279,7 @@ class Scenario:
             def method(self):
                 return self[0]
 
-            def signal(self, scenario):
+            def sample(self, scenario):
                 method = self.method
                 score = scenario._core
                 for tx in score.transactions.values():
@@ -3488,7 +3482,7 @@ class Scenario:
                 self.use_fancy_repr = False
 
                 # Aggregate signals (BoundMethod/Primitive) and Call
-                # matching key on canonical forms via normalization
+                # matching key on normalized forms
                 # (raw->cooked, condition->lock), so no per-core alias
                 # set is maintained here anymore.
 
@@ -3682,241 +3676,6 @@ class Scenario:
                 # lock released), WaitingTransaction adds WAITING, etc.
                 parking_states = (State.BLOCKED, State.PAUSED)
 
-                @BoundInnerClass
-                class stash:
-                    # HEY AI: we're removing stash. gone.
-                    """Temporarily remove a tx from its thread's tx
-                    chain.  Instantiation performs the stash side
-                    effects; close() (or context-manager exit)
-                    restores the tx to the chain.
-
-                    Usage:
-                        ticket = tx.stash()    # stash happens now
-                        ...
-                        ticket.close()         # restore
-
-                    or:
-                        with tx.stash():       # stash on enter,
-                            ...                # close on exit
-
-                    Preconditions: tx.parent must be None (only
-                    chain-root txs may be stashed); tx.stashed must be
-                    None (no double-stash).
-
-                    A user-facing tool for hiding the parent tx during
-                    a regulated callback so the callback's blanket
-                    calls appear as fresh roots.  Typical use is inside
-                    a Barrier.wait action callback or a Condition.wait_for
-                    predicate, when the user wants those calls to be
-                    treated as independent of the surrounding tx.  The
-                    framework does NOT invoke stash itself.
-
-                    Signals: Action(tx.api) goes high while the
-                    callback runs (independently of stash); the
-                    "parent has a child" signaling associated with tx
-                    (Nested(tx.api), call signals, minder increments,
-                    chain membership) goes dark while stashed; close
-                    restores everything.
-
-                    Caller must hold score.lock at both stash (via
-                    instantiation) and close (via call / __exit__).
-                    """
-
-                    def __init__(self, tx):
-                        if tx.parent is not None:
-                            raise RuntimeError(
-                                f"can't stash {tx!r}: only chain-root "
-                                f"transactions (parent=None) may be stashed, "
-                                f"but parent is {tx.parent!r}")
-                        if tx.stashed is not None:
-                            raise RuntimeError(
-                                f"can't stash {tx!r}: transaction is "
-                                f"already stashed")
-
-                        self.tx = tx
-                        self.closed = False
-
-                        score = tx.score
-                        core = tx.core
-                        thread = tx.thread
-
-                        # Snapshot child for restoration at close; sever
-                        # the parent pointer so children of this tx
-                        # appear as roots while we're stashed.
-                        self.original_child = tx.child
-                        if tx.child is not None:
-                            tx.child.parent = None
-                            tx.child = None
-
-                        # Drop from per-score and per-core thread
-                        # chains.  We're necessarily the chain root
-                        # (parent=None precondition) AND the only tx
-                        # on the thread right now (any child we had
-                        # has been detached above).
-                        assert score.transactions.get(thread) is tx
-                        del score.transactions[thread]
-                        del score.transaction_apis[thread]
-                        if core.transactions.get(thread) is tx:
-                            del core.transactions[thread]
-
-                        # If we had a child whose Nested(tx.api) was
-                        # signaled at child-open, it goes low
-                        # automatically now: Nested.signal reads
-                        # tx._core.child, and we just detached the
-                        # child by manipulating the chain above.
-                        # Signaling high->low is silent.
-
-                        # Wake going-low transitions where the
-                        # Signaling type's complement matters.  Going-
-                        # high signals (Method, Use, Primitive,
-                        # Nested) silently go low when the chain
-                        # changes above; no decrement wakeup needed
-                        # since Not(Method) etc. aren't a supported
-                        # wait shape.  Not(Thread(t)) is supported and
-                        # needs an explicit wake.
-                        if tx.signals_thread:
-                            score.signal(Not(score.Thread(thread)))
-
-                        # Drop aggregate usage counts while stashed;
-                        # the restore in close() re-increfs them.
-                        score.decref_usage(*tx.cooked_methods)
-                        score.decref_usage(*tx.use_primitives)
-
-                        # Mark stashed.  Action(tx.api) is NOT signaled
-                        # here -- the Action signal tracks user-callback
-                        # execution (set by callback runners like
-                        # BarrierCore.run_action), not stash state.
-                        # A user calling tx.stash() inside their
-                        # callback does not change the Action signal.
-                        tx.stashed = self
-
-                    def close(self):
-                        """Restore tx to its thread's chain and re-emit
-                        the signals stash silenced.  Idempotent (no-op
-                        if already closed).  Caller must hold score.lock.
-                        """
-                        if self.closed:
-                            return
-
-                        tx = self.tx
-                        score = tx.score
-                        core = tx.core
-                        thread = tx.thread
-
-                        # Reconstruct the chain.  We come back as the
-                        # root (parent=None), which is symmetric with
-                        # stash's precondition.
-                        top = score.transactions.get(thread)
-
-                        # Walk top to its current root via parent
-                        # pointers.
-                        root = top
-                        while root is not None and root.parent is not None:
-                            root = root.parent
-
-                        original_child = self.original_child
-                        if original_child is None:
-                            # No child existed at stash; we expect
-                            # nothing on the thread now -- the
-                            # scheduler should have driven its
-                            # children to terminal.
-                            if top is not None:
-                                raise RuntimeError(
-                                    f"can't close {tx!r}: thread has "
-                                    f"non-terminated tx {top!r}; the "
-                                    f"scheduler left work running")
-                            new_child = None
-                        elif original_child.done:
-                            # Original child terminated during the
-                            # stash window.  Adopt whatever's currently
-                            # on the thread (could be None or a fresh
-                            # chain the scheduler started).
-                            new_child = root
-                        else:
-                            # Original child still alive.  It must be
-                            # the current chain root; if a stranger
-                            # snuck in below it, that's a contract
-                            # violation.
-                            if root is not original_child:
-                                raise RuntimeError(
-                                    f"can't close {tx!r}: original child "
-                                    f"{original_child!r} is still alive "
-                                    f"but chain root is {root!r}")
-                            new_child = original_child
-
-                        tx.child = new_child
-                        if new_child is not None:
-                            new_child.parent = tx
-
-                        # Re-add to the per-score chain.  If new_child
-                        # is None, we're now the only tx on the
-                        # thread; if not, we slot in BELOW new_child
-                        # (we're the root), leaving transactions[
-                        # thread] pointing at the current chain top
-                        # unchanged.
-                        score.transaction_apis[thread] = tx.api
-                        if new_child is None:
-                            score.transactions[thread] = tx
-                        # If new_child is not None, transactions[
-                        # thread] already points at the chain top
-                        # (some descendant of new_child or new_child
-                        # itself); leave it alone.
-
-                        # Same for core.transactions: only set if we'd
-                        # be the only tx on the thread for our core.
-                        if core.transactions.get(thread) is None:
-                            core.transactions[thread] = tx
-
-                        # Mirror the work stash silenced.
-                        score.signals(
-                            tx.call_signals(None) | tx.call_signals(tx.state))
-
-                        if tx.signals_thread:
-                            # Thread(t) now reads tx-on-chain again
-                            # via score.transactions; wake waiters.
-                            score.signal(score.Thread(thread))
-
-                        # Restore aggregate method-usage counts.
-                        score.incref_usage(*tx.cooked_methods)
-
-                        for p in tx.use_primitives:
-                            # Use(t, p) reads chain state, back after
-                            # restore above; wake its waiters (cooked).
-                            score.signal(Use(thread, p))
-                        score.incref_usage(*tx.use_primitives)
-
-                        # Re-fire any Nested(tx.api) the child
-                        # contributed at its open, so waiters parked
-                        # on "tx has a child" see the news again.
-                        if new_child is not None and new_child.nested_signal is not None:
-                            score.signal(new_child.nested_signal)
-
-                        # Wake TxState waiters at current state.  No
-                        # Reached replay is needed: by contract, stash
-                        # happens outside any tx.to() invocation
-                        # (worker stashes around its action call,
-                        # which doesn't transition the tx), so state
-                        # and last_reached_state are unchanged across
-                        # the stash window.
-                        score.signal(TransactionState(tx.api, tx.state))
-
-                        tx.stashed = None
-                        self.closed = True
-                        # Action(tx.api) is not touched here -- see the
-                        # symmetric note in __init__: Action tracks
-                        # callback execution, not stash state.
-
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, *exc):
-                        self.close()
-                        return False
-
-                    def __repr__(self):
-                        state = "closed" if self.closed else "live"
-                        return f"<stash {state} tx={self.tx!r}>"
-
                 def __init__(self, core, method, start_time, regulated):
                     score = core.score
                     thread = threading.current_thread()
@@ -3936,10 +3695,16 @@ class Scenario:
                     self.in_callback = False
                     self.kwargs = kwargs = {}
                     self.kwargs_proxy = score.LockedDictProxy(kwargs)
-                    self.method = method
-                    # Canonical method for Call/BoundMethod matching:
+                    # method is the exact bound method the call arrived
+                    # on -- raw or cooked, condition or lock -- so the
+                    # user-facing tx.method shows what they actually
+                    # called.  normalized_method is the normalized form
+                    # used internally for Call/BoundMethod matching:
                     # raw->cooked, and a Condition's acquire/release/
                     # locked collapsed to the underlying lock's method.
+                    # method is never invoked (commit runs core.actual),
+                    # so the two can differ harmlessly.
+                    self.method = method
                     self.normalized_method = _normalize_method(method)
                     self.pause = False
                     self.pausing = 0
@@ -3985,22 +3750,10 @@ class Scenario:
                     self.child = None
                     self.nested_signal = None
 
-                    # tx.stashed is None when the tx is on the thread's
-                    # tx chain normally.  When the tx is stashed via
-                    # tx.stash() (temporarily hidden from the chain so
-                    # child txs created during the stash window appear
-                    # as fresh roots), self.stashed holds the stash
-                    # ticket; the ticket's close()/__exit__ restores.
-                    self.stashed = None
-
                     # True while a user callback associated with this tx
                     # is running (currently: barrier.wait action,
-                    # condition.wait_for predicate).  Independent of
-                    # stash: Action(tx.api).signal reads this flag, not
-                    # tx.stashed.  The user can elect to call tx.stash()
-                    # inside the callback to hide the tx from their
-                    # callback's regulated primitive calls, but doing so
-                    # is unrelated to the Action signal.
+                    # condition.wait_for predicate).  Action(tx.api)
+                    # samples this flag.
                     self.in_action = False
 
                     p = core.primitive
@@ -4069,7 +3822,7 @@ class Scenario:
                 def done(self):
                     return self.state in State.terminal_states
 
-                def signal(self, scenario):
+                def sample(self, scenario):
                     # Signaling protocol: tx is high once it has reached
                     # a terminal state (RETURNED, RAISED, ...).  Sticky
                     # because tx.state is monotonic.
@@ -4093,10 +3846,10 @@ class Scenario:
                     return f"<{cls_name} {self.state.name} {self.repr_helper()} for {name}>"
 
                 def call_methods(self):
-                    """Return the canonical method(s) this tx is calling
+                    """Return the normalized method(s) this tx is calling
                     for Call/BoundMethod matching.  Normalization
                     collapses raw->cooked and condition->lock to a
-                    single canonical method, so this is just the
+                    single normalized method, so this is just the
                     normalized method.  (A set for back-compat with
                     callers that iterate / test membership.)"""
                     return {self.normalized_method}
@@ -4107,8 +3860,6 @@ class Scenario:
                     return {Call(thread, method, state, depth=depth) for method in self.call_methods()}
 
                 def observe(self, state, callback):
-                    if self.stashed:
-                        raise RuntimeError(f"can't observe {self!r}, transaction is stashed")
                     if state <= self.state:
                         raise ValueError(f"can't register observer for {state!r}, tx is already at state {self.state!r}")
                     self.state_observers.append((state, callback))
@@ -4184,8 +3935,6 @@ class Scenario:
                     hasn't yet entered its primitive's open()/park()
                     sequence.
                     """
-                    if self.stashed:
-                        raise RuntimeError(f"can't unpark {self!r}, transaction is stashed")
                     blocker = self.blocker
                     if blocker is None:
                         raise RuntimeError(
@@ -4203,13 +3952,29 @@ class Scenario:
                     caller; it's held on return.  If already settled
                     when called, the level-triggered signal returns
                     immediately."""
-                    if self.stashed:
-                        raise RuntimeError(f"can't settle {self!r}, transaction is stashed")
                     self.score.wait(self.parking_signals)
 
+                # Timeout operations.  Only TimeoutTransaction (calls
+                # that can block waiting on a timeout, e.g. lock.acquire,
+                # cond.wait) supports these; it overrides all three with
+                # real implementations.  On a plain Transaction (e.g.
+                # lock.release) they don't apply, so the base raises.
+                # This keeps the single TransactionAPI uniform: the API
+                # always delegates to the core, and the core decides
+                # whether the operation is meaningful for this call.
+                def expire(self):
+                    raise NotImplementedError(
+                        f"{self.method.__name__} transactions don't support expire()")
+
+                def disregard(self):
+                    raise NotImplementedError(
+                        f"{self.method.__name__} transactions don't support disregard()")
+
+                def revert(self):
+                    raise NotImplementedError(
+                        f"{self.method.__name__} transactions don't support revert()")
+
                 def unblock(self):
-                    if self.stashed:
-                        raise RuntimeError(f"can't unblock {self!r}, transaction is stashed")
                     if self.state != State.BLOCKED:
                         raise RuntimeError(f"can't unblock tx in {self.state.name} state")
                     self.unpark(State.COMMIT)
@@ -4228,8 +3993,6 @@ class Scenario:
                     worker thread before reaching COMMITTED.  Waits
                     until the tx settles after the unpark.
                     """
-                    if self.stashed:
-                        raise RuntimeError(f"can't unstall {self!r}, transaction is stashed")
                     if self.state != State.STALLED:
                         raise RuntimeError(f"can't unstall tx in {self.state.name} state")
                     self.unpark(State.RESUMED)
@@ -4242,8 +4005,6 @@ class Scenario:
                     pause flag is already False, raises if tx has advanced
                     past PAUSED.  If pausing reaches zero and state is
                     PAUSED, unpark to EXITING and wait for settle."""
-                    if self.stashed:
-                        raise RuntimeError(f"can't unpause {self!r}, transaction is stashed")
                     if self.state > State.PAUSED:
                         raise RuntimeError("transaction has already advanced past PAUSED state")
                     if not self.pause:
@@ -4260,8 +4021,6 @@ class Scenario:
                     pause flag (and bumps pausing); False clears it (and
                     decrements pausing via unpause()).  Idempotent and
                     state-safe."""
-                    if self.stashed:
-                        raise RuntimeError(f"can't set pause on {self!r}, transaction is stashed")
                     value = bool(value)
                     if self.state > State.PAUSED:
                         raise RuntimeError("transaction has already advanced past PAUSED state")
@@ -4339,7 +4098,7 @@ class Scenario:
                         methods = ()
                     else:
                         methods = method if isinstance(method, tuple) else (method,)
-                        # Match on canonical form: raw/cooked and
+                        # Match on normalized form: raw/cooked and
                         # condition/lock all collapse via normalization,
                         # so a tx entered as cond.acquire matches a
                         # candidate of lock.acquire (and vice versa).
@@ -4419,7 +4178,7 @@ class Scenario:
                             score.signal(score.Thread(thread))
 
                         # Aggregate method-usage: bump the usage counter
-                        # for the canonical method this tx is calling.
+                        # for the normalized method this tx is calling.
                         # incref_usage signals BoundMethod(m) on 0->1.
                         # Stored on the tx so close() decrefs the same.
                         self.cooked_methods = {self.normalized_method}
@@ -4511,22 +4270,7 @@ class Scenario:
                     RAISED termination so observers fire and close() runs
                     naturally; recurses up the parent chain so the entire stack
                     of stuck txs is unwound.  Caller must hold score.lock.
-
-                    If this tx is currently stashed (worker died mid-action),
-                    auto-close first: the stash/close contract relies on the
-                    cycle code's clean unwind, which the dying worker won't
-                    deliver.  Forced cleanup is exactly what aborted is for.
-
-                    In practice this auto-close branch is unreachable:
-                    BarrierCore.run_action's try/finally closes on any normal
-                    exit including BaseException (sys.exit, KeyboardInterrupt)
-                    before the exception propagates out, and monitor walks
-                    only score.transactions[thread] which doesn't see the
-                    stashed parent.  Kept as a backstop in case a future
-                    death path bypasses the finally clause.
                     """
-                    if self.stashed:
-                        self.stashed.close()  # pragma: no cover -- defensive
                     if not self.raised:
                         self.raised = True
                         self.result = RuntimeError(
@@ -4538,8 +4282,6 @@ class Scenario:
                         parent.aborted()
 
                 def close(self):
-                    if self.stashed:
-                        raise RuntimeError(f"can't close {self!r}, transaction is stashed")
                     self.end_time = _current_time()
 
                     if not self.done:
@@ -4662,8 +4404,6 @@ class Scenario:
 
                 @timeout.setter
                 def timeout(self, value):
-                    if self.stashed:
-                        raise RuntimeError(f"can't modify timeout on {self!r}, transaction is stashed")
                     if self.state != State.BLOCKED:
                         raise RuntimeError(
                             f"can't modify timeout, can only be done in BLOCKED state, "
@@ -4767,6 +4507,7 @@ class Scenario:
 
                 @base()
                 @BoundInnerClass
+                @base('UnboundTransactionAPI')
                 class TransactionAPI(Signaling):
                     """User-facing tx wrapper.
 
@@ -4796,7 +4537,7 @@ class Scenario:
                         with self._lock:
                             return self._core.done
 
-                    def signal(self, scenario):
+                    def sample(self, scenario):
                         # tx.state is monotonic and the done-transition
                         # is one-way; lock-free read.
                         return self._core.done
@@ -4907,11 +4648,10 @@ class Scenario:
                         with self._lock:
                             return self._core.unstall()
 
-
-
-                @base("TimeoutTransactionAPI")
-                @BoundInnerClass
-                class TimeoutTransactionAPI(base.TransactionAPI):
+                    # Timeout operations.  Delegated straight to the
+                    # core: TimeoutTransaction cores implement them;
+                    # plain Transaction cores raise NotImplementedError
+                    # naming the call.  One uniform Transaction API.
                     def expire(self):
                         with self._lock:
                             return self._core.expire()
@@ -5332,7 +5072,7 @@ class Scenario:
             class LockBaseAPI(base.API):
 
                 @BoundInnerClass
-                class acquire(base.TimeoutTransactionAPI):
+                class acquire(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Lock.acquire")
 
@@ -5446,6 +5186,7 @@ class Scenario:
                 return self.fancy_repr('LockCore')
 
             @BoundInnerClass
+            @base()
             class LockAPI(base.LockBaseAPI):
                 def __repr__(self):
                     return self._core.fancy_repr('LockAPI')
@@ -5528,6 +5269,7 @@ class Scenario:
                 return self.fancy_repr('RLockCore')
 
             @BoundInnerClass
+            @base()
             class RLockAPI(base.LockBaseAPI):
                 def __repr__(self):
                     return self._core.fancy_repr('RLockAPI')
@@ -5855,7 +5597,7 @@ class Scenario:
                     Also an iterator: __iter__ returns self, __next__
                     wakes and yields the next remaining waiter (in spec
                     order), raising StopIteration when remaining is
-                    empty or the cycle has been closed.  The canonical
+                    empty or the cycle has been closed.  The standard
                     drain idiom:
 
                         with api.cycle(*waiters) as c:
@@ -5955,7 +5697,7 @@ class Scenario:
                         # The cycle is a single-pass stateful sequence of
                         # wakings; iterator protocol matches that exactly.
                         # Equivalent to .iter() with no args.  See the
-                        # class docstring for the canonical with-for idiom.
+                        # class docstring for the standard with-for idiom.
                         return self
 
                     def __next__(self):
@@ -6403,7 +6145,7 @@ class Scenario:
                 @property
                 def __class__(self):
                     # Masquerade as threading.Condition so user-facing
-                    # introspection sees the canonical class.
+                    # introspection sees the real class.
                     return threading.Condition
 
                 def __dir__(self):
@@ -6488,10 +6230,11 @@ class Scenario:
                     # cycle-relevant park states (WAITING, STALLED)
                     # actually occur.  Driver should drive the child
                     # as if it were top-level, not skip through it.
-                    return (isinstance(child, self.score.Core.WaitingTransaction)
+                    return (isinstance(child, self.score.WaitingTransaction)
                             and child.core is self.core)
 
             @BoundInnerClass
+            @base()
             class ConditionAPI(base.ConditionBaseAPI):
                 def __init__(self, core, raw):
                     # BIC adds 'core' (the outer weakref) automatically, so
@@ -6525,12 +6268,12 @@ class Scenario:
                         return self._core.n
 
                 @BoundInnerClass
-                class wait(base.TimeoutTransactionAPI):
+                class wait(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Condition.wait")
 
                 @BoundInnerClass
-                class wait_for(base.TimeoutTransactionAPI):
+                class wait_for(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Condition.wait_for")
 
@@ -6898,7 +6641,7 @@ class Scenario:
                         return self._core.available
 
                 @BoundInnerClass
-                class acquire(base.TimeoutTransactionAPI):
+                class acquire(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Semaphore.acquire")
 
@@ -6974,6 +6717,7 @@ class Scenario:
                     )
 
             @BoundInnerClass
+            @base()
             class SemaphoreAPI(base.SemaphoreAPIBase):
                 def __repr__(self):
                     return self._core.fancy_repr('BoundedSemaphoreAPI')
@@ -6990,6 +6734,7 @@ class Scenario:
                     )
 
             @BoundInnerClass
+            @base()
             class BoundedSemaphoreAPI(base.SemaphoreAPIBase):
                 def __repr__(self):
                     return self._core.fancy_repr('BoundedSemaphoreAPI')
@@ -7223,6 +6968,7 @@ class Scenario:
 
 
             @BoundInnerClass
+            @base()
             class EventAPI(base.ConditionBaseAPI):
                 def __init__(self, core, raw):
                     super().__init__(raw)
@@ -7256,7 +7002,7 @@ class Scenario:
                         return self._core.repr("Event.clear")
 
                 @BoundInnerClass
-                class wait(base.TimeoutTransactionAPI):
+                class wait(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Event.wait")
 
@@ -7356,12 +7102,6 @@ class Scenario:
                 (no regulated tx exists), the action still runs but
                 receives None as its argument; Action is not signaled
                 in that case because there is no tx to signal against.
-
-                The framework does NOT stash the tx around the call.
-                If the user wants the callback's regulated primitive
-                calls to appear as fresh roots (rather than children
-                of the barrier tx), they receive the parent tx as an
-                argument and may call tx.stash() inside their callback.
 
                 Action is bracketed by try/finally so an exception in
                 the action still unsignals cleanly.
@@ -7619,6 +7359,7 @@ class Scenario:
 
 
             @BoundInnerClass
+            @base()
             class BarrierAPI(base.ConditionBaseAPI):
                 def __init__(self, core, raw):
                     super().__init__(raw)
@@ -7632,7 +7373,7 @@ class Scenario:
                         return len(self._core.actual._cond._waiters)
 
                 @BoundInnerClass
-                class wait(base.TimeoutTransactionAPI):
+                class wait(base.TransactionAPI):
                     def __repr__(self):
                         return self._core.repr("Barrier.wait")
 
@@ -8545,13 +8286,60 @@ class Scenario:
                 return self._core.fancy_repr('Barrier')
             return self._core.compatibility_repr()
 
+    # User-facing aliases for the API wrapper classes, surfaced on the
+    # Scenario API so callers can isinstance-check the objects they
+    # receive without reaching into the nested core.  Each is the
+    # *unwrapped* class (not the BoundInnerClass descriptor): a stable
+    # isinstance target that resolves to the same object at both
+    # Scenario.X and scenario.X.  The descriptor itself can't be used
+    # -- it tries to rebind against Scenario on instance access, and
+    # its base lives deep in the core, so that fails.
+    #
+    # The primitive APIs aren't subclassed, so @base() sits below
+    # @BoundInnerClass on each and registers the unwrapped class
+    # directly.  TransactionAPI is subclassed by every per-method tx
+    # class (which need the bound form), so it registers twice: once
+    # unwrapped as UnboundTransactionAPI (for this alias) and once
+    # wrapped as TransactionAPI (for those subclasses to inherit).
+    #
+    # Naming: bare name where it's free (Transaction -- no primitive
+    # owns it), API-suffix where the cooked primitive already owns the
+    # base name (LockAPI, etc.).  The cooked primitives, Raw handles,
+    # Driver, and Dispatch are already surfaced as direct members
+    # above, so they're not repeated here.
+    LockAPI = base.LockAPI
+    RLockAPI = base.RLockAPI
+    ConditionAPI = base.ConditionAPI
+    EventAPI = base.EventAPI
+    SemaphoreAPI = base.SemaphoreAPI
+    BoundedSemaphoreAPI = base.BoundedSemaphoreAPI
+    BarrierAPI = base.BarrierAPI
+    Transaction = base.UnboundTransactionAPI
 
 
-# Module-level alias for isinstance checks on transaction wrapper
-# instances.  Without this, callers need the full
-# Scenario._ScenarioCore.Core.API.TransactionAPI path.
-TransactionAPI = Scenario._ScenarioCore.Core.API.TransactionAPI
-export(TransactionAPI)
+# Internal aliases on the scenario core, purely for our own
+# convenience: framework code checks isinstance against the transaction
+# classes, and without these it would spell out the full nested path
+# every time (the tx API wrapper and the tx core classes otherwise sit
+# several attributes deep inside Core).  These are NOT
+# user-facing -- the user-facing aliases live on Scenario itself.  They
+# reach the same unwrapped classes via plain attribute access, so they
+# work as isinstance targets both off the class
+# (Scenario._ScenarioCore.X) and off a score instance (score.X).
+#
+# Note to future selves: this is an ad-hoc convenience set, not an
+# interface.  Add or remove entries here freely as internal needs
+# change -- each is just a reference to an existing class, and nothing
+# depends on the set being complete.  Current entries cover the tx API
+# wrapper and the four tx core classes, which is everything the present
+# isinstance checks need.
+_core_cls = Scenario._ScenarioCore.Core
+Scenario._ScenarioCore.TxAPI = _core_cls.API.TransactionAPI
+Scenario._ScenarioCore.Transaction = _core_cls.Transaction
+Scenario._ScenarioCore.TimeoutTransaction = _core_cls.TimeoutTransaction
+Scenario._ScenarioCore.WaitingTransaction = _core_cls.WaitingTransaction
+Scenario._ScenarioCore.StallingTransaction = _core_cls.StallingTransaction
+del _core_cls
 
 
 mm()
