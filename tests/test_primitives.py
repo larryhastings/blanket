@@ -8296,10 +8296,11 @@ class TestDriverCascade(unittest.TestCase):
                 next(iter(disp))
             self.assertIs(d.state, d.raised)
 
-    @unittest.skip("Location-anchored gate.set injection into Driver.signal() "
-                   "is perturbed by the base_tx idle-handler edit (Location is "
-                   "fragile to signal() body changes); re-enable once the "
-                   "nested-tx Driver work is stable")
+    @unittest.skip("cascade-match (1859) / simple-restore (1880) branches: the "
+                   "CC rebuild changed nested-tx driving so finish() no longer "
+                   "pushes cascade frames for immediate-success nested wait_fors, "
+                   "and skip(autoskip) exhausts past the match; needs a new "
+                   "deterministic scenario -- see notes")
     def test_cascade_pop_match_in_inner_loop(self):
         """Multi-level nested where intermediate ancestors close
         before the Driver processes the child's tx-end signal:
@@ -8471,10 +8472,11 @@ class TestDriverCascade(unittest.TestCase):
             # handler).
             self.assertIs(d.state, d.terminated)
 
-    @unittest.skip("Location-anchored gate.set injection into Driver.signal() "
-                   "is perturbed by the base_tx idle-handler edit (Location is "
-                   "fragile to signal() body changes); re-enable once the "
-                   "nested-tx Driver work is stable")
+    @unittest.skip("cascade-match (1859) / simple-restore (1880) branches: the "
+                   "CC rebuild changed nested-tx driving so finish() no longer "
+                   "pushes cascade frames for immediate-success nested wait_fors, "
+                   "and skip(autoskip) exhausts past the match; needs a new "
+                   "deterministic scenario -- see notes")
     def test_simple_pop_restore_when_parent_still_alive(self):
         """Normal nested pop-and-restore: child terminates while
         its parent is still in flight; the signal handler pops
@@ -11232,11 +11234,12 @@ class TestDriverEquality(unittest.TestCase):
 class TestRelayBaseTx(unittest.TestCase):
     """base_tx support for Lock.relay: each participant thread may be
     followed by a base tx, scoping its driver to its subtree under base.
-    A base applies cleanly to single-op endpoints (the hot-start
-    initial-releaser, which only releases, and the last acquirer, which
-    only acquires); a middle thread that both acquires and releases
-    across a relay yield can't sit under one spanning base tx in the
-    current model and stays at top level."""
+    A base applies to any position -- the hot-start initial-releaser,
+    the last acquirer, AND a middle thread that both acquires and
+    releases.  A middle thread's acquire and release happen in
+    consecutive relay iterations; its base stays live across the relay
+    yield (the predicate is paused mid-flight) and its reused driver
+    finds the release as the next child on reactivation."""
 
     def test_relay_base_tx_on_acquirer(self):
         """The lone acquirer takes the lock inside its base tx."""
@@ -11367,6 +11370,100 @@ class TestRelayBaseTx(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
                 list(s.api(L).relay(I, B, baseB))
+
+    def test_relay_base_tx_on_middle_thread(self):
+        """A 3-hop relay where the MIDDLE thread runs its acquire AND
+        release inside one base tx.  The acquire and release land in
+        consecutive relay iterations; the base stays live across the
+        relay yield, so the reused driver finds the release as the next
+        child."""
+        s = Scenario()
+        L = s.Lock()
+        lockM = s.Lock(); condM = s.Condition(lockM)
+        order = []
+        def initial_fn():
+            L.acquire(); L.release(); order.append('I-rel')
+        def mid():
+            lockM.acquire()
+            def pred():
+                L.acquire(); order.append('M-acq')
+                L.release(); order.append('M-rel')
+                return True
+            condM.wait_for(pred, timeout=-1)
+            lockM.release()
+        def last():
+            L.acquire(); order.append('C-acq'); L.release()
+        with s:
+            I = s.thread(initial_fn)
+            M = s.thread(mid)
+            C = s.thread(last)
+            s.skip(I, L.acquire)
+            s.block(I, L.release)
+            s.skip(M, lockM.acquire)
+            baseM = s.transaction(M); baseM.unblock()
+            s.wait(Call(M, L.acquire, State.BLOCKED))
+            s.block(C, L.acquire)
+
+            got = list(s.api(L).relay(I, M, baseM, C))
+            self.assertEqual(got, [M, C])
+            self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
+            s.skip(M, lockM.release)
+            s.skip(C, L.release)
+        self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
+
+    def test_relay_base_tx_all_three_under_base(self):
+        """A 3-hop relay with every participant -- initial releaser,
+        middle, and last acquirer -- under its own base tx."""
+        s = Scenario()
+        L = s.Lock()
+        lockI = s.Lock(); condI = s.Condition(lockI)
+        lockM = s.Lock(); condM = s.Condition(lockM)
+        lockC = s.Lock(); condC = s.Condition(lockC)
+        order = []
+        def initial_fn():
+            L.acquire()
+            lockI.acquire()
+            def pred():
+                L.release(); order.append('I-rel'); return True
+            condI.wait_for(pred, timeout=-1)
+            lockI.release()
+        def mid():
+            lockM.acquire()
+            def pred():
+                L.acquire(); order.append('M-acq')
+                L.release(); order.append('M-rel')
+                return True
+            condM.wait_for(pred, timeout=-1)
+            lockM.release()
+        def last():
+            lockC.acquire()
+            def pred():
+                L.acquire(); order.append('C-acq'); L.release(); return True
+            condC.wait_for(pred, timeout=-1)
+            lockC.release()
+        with s:
+            I = s.thread(initial_fn)
+            M = s.thread(mid)
+            C = s.thread(last)
+            s.skip(I, L.acquire)
+            s.skip(I, lockI.acquire)
+            baseI = s.transaction(I); baseI.unblock()
+            s.wait(Call(I, L.release, State.BLOCKED))
+            s.skip(M, lockM.acquire)
+            baseM = s.transaction(M); baseM.unblock()
+            s.wait(Call(M, L.acquire, State.BLOCKED))
+            s.skip(C, lockC.acquire)
+            baseC = s.transaction(C); baseC.unblock()
+            s.wait(Call(C, L.acquire, State.BLOCKED))
+
+            got = list(s.api(L).relay(I, baseI, M, baseM, C, baseC))
+            self.assertEqual(got, [M, C])
+            self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
+            s.skip(I, lockI.release)
+            s.skip(M, lockM.release)
+            s.skip(C, L.release)        # final acquirer's release (base child) is undriven
+            s.skip(C, lockC.release)
+        self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
 
 
 class TestAllocateBaseTx(unittest.TestCase):
