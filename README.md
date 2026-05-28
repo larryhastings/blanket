@@ -48,7 +48,7 @@ One design choice worth mentioning up front: **blanket** *wraps*
 the real `threading.Lock`, `threading.Condition`, and so on,
 rather than reimplementing them. Your tests use the real primitives,
 which means they're guaranteed to behave like the real thing--because
-they *are* the real thing, just under **blanket** control.  Butfor
+they *are* the real thing, just under **blanket** control.  But for
 this to work, your code has to replace the real *threading* module
 primitives with **blanket**-wrapped versions.
 
