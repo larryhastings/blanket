@@ -1,0 +1,39 @@
+[run]
+branch = True
+source =
+    blanket
+    tests
+omit =
+    tests/test_primitives_py313_plus.py
+
+
+[report]
+show_missing = True
+fail_under = 100
+exclude_also =
+    if __name__ == ['\"]__main__['\"]:
+    coverage:
+    if sys\.version_info
+    if .*_python_3_[0-9]+_plus:
+    if not .*_python_3_[0-9]+_plus:
+    if hasattr\(queue, ['\"]SimpleQueue['\"]\):
+    if hasattr\(queue\.Queue, ['\"]shutdown['\"]\):
+    if hasattr\(threading\.Lock\(\), ['\"]acquire_lock['\"]\):
+    if 'n' in inspect\.signature\(threading\.Semaphore\.release\)\.parameters:
+    if hasattr\(fake_rlock, ['\"]_recursion_count['\"]\):
+    if rlock_provides_locked:
+    if hasattr\(raw, ['\"]shutdown['\"]\):
+    if hasattr\(q, ['\"]shutdown['\"]\):
+    if hasattr\(actual, ['\"]_recursion_count['\"]\):
+    if time\.perf_counter\(\) > deadline:
+    time\.sleep\(0\.001\)
+    if score\.entered:
+    if score\.lock\.locked\(\):
+    if scenario\._core\.lock\.locked\(\):
+    if raised is not None:
+    if had_simplequeue:
+partial_branches =
+    for d in chain:
+    for d in disp:
+    for dd in dispatch:
+    if r:

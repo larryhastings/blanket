@@ -22,7 +22,7 @@ you use "synchronization primitives" from the `threading` module--`Lock`,
 `Event`, and the like.  But those are out of your control--you don't pick
 which thread gets the lock.  Instead, your operating system's scheduler
 effectively decides which thread gets the lock, seemingly at random.  This
-makes it exceedingly hard to create a reproducable test case for
+makes it exceedingly hard to create a reproducible test case for
 threading-related bugs.  And if you can't reproduce it reliably, you
 can't debug it, and your unit test suite can't actually test it.
 
@@ -45,20 +45,21 @@ becomes 100% deterministic, reliably reproducing even the most obscure
 race condition.  Every time.  100% coverage restored!
 
 One design choice worth mentioning up front: **blanket** *wraps*
-the real `threading.Lock`, `threading.Condition`, and so on,
-rather than reimplementing them. Your tests use the real primitives,
+the real `threading.Lock`, `threading.Condition`, `queue.Queue`, and so
+on, rather than reimplementing them. Your tests use the real primitives,
 which means they're guaranteed to behave like the real thing--because
-they *are* the real thing, just under **blanket** control.  Butfor
-this to work, your code has to replace the real *threading* module
+they *are* the real thing, just under **blanket** control.  But for
+this to work, your code has to replace the real `threading` and `queue`
 primitives with **blanket**-wrapped versions.
 
-**blanket** requires Python 3.7 or newer.  It depends on
+**blanket** 1.1 supports CPython 3.10 or newer.  The release
+test matrix covers CPython 3.10 through 3.14.  It depends on
 [my **big** library,](https://github.com/larryhastings/big)
-and the optional bytecode injector needs the
-[**bytecode**](https://pypi.org/project/bytecode/) module.
-**blanket** is 100% pure Python.
+and on the
+[**bytecode**](https://pypi.org/project/bytecode/) module used by
+the injector.  **blanket** is 100% pure Python.
 
-The current version is **1.0**.
+The current version is **1.1**.
 
 ## Quickstart
 
@@ -210,11 +211,11 @@ synchronization primitives normally--`with lock:`, `event.wait()`,
 and so on. The threads don't know they're being scripted.
 
 A *primitive*, or *primitive handle*, is a **blanket** `Lock`,
-`RLock`, `Condition`, `Semaphore`, `BoundedSemaphore`, `Event`, or
-`Barrier`. You construct them on the scenario: `scenario.Lock()`,
-`scenario.Barrier(3)`, etc. Each primitive is wired into the
-scenario, making every method call on it observable and steerable
-by the scheduler.
+`RLock`, `Condition`, `Semaphore`, `BoundedSemaphore`, `Event`,
+`Barrier`, or queue object. You construct them on the scenario:
+`scenario.Lock()`, `scenario.Barrier(3)`, `scenario.Queue()`, etc.
+Each primitive is wired into the scenario, making every method call
+on it observable and steerable by the scheduler.
 
 A *raw*, or *raw handle*, is a parallel handle for the same underlying
 synchronization object.  The difference is, these calls don't bother
@@ -262,7 +263,7 @@ There are several places where the scheduler can choose to park
 a transaction.  To make it easier to talk about, **blanket**
 gives them special names:
 
-* the *scheduler block*, which happens *efore* calling the
+* the *scheduler block*, which happens *before* calling the
   actual method.
 * the *scheduler stall*, a specific mid-transaction park
   only used for certain transactions.
@@ -284,7 +285,8 @@ by the actual primitive.
 
 ### Requirements
 
-**blanket** requires Python 3.7 or newer, and depends on
+**blanket** 1.1 supports CPython 3.10 or newer.  I currently test
+it on CPython 3.10 through 3.14.  It depends on
 [**big**](https://github.com/larryhastings/big) and
 [**bytecode**.](https://pypi.org/project/bytecode/) That's it.
 
@@ -364,8 +366,8 @@ scenario, you can:
 
 - inspect a thread's current transaction (`scenario.transaction`)
 - wait for something to happen (`scenario.wait`)
-- drive worker threads through method calls with the middle-level APIs: `scenario.park`, `scenario.skip`, `scenario.finish`, `scenario.Driver`, `scenario.Chain`, and `scenario.Dispatch`
-- monkey-patch another module so it uses **blanket** synchronization primitives (`scenario.inject`)
+- drive worker threads through method calls with the middle-level APIs: `scenario.park`, `scenario.skip`, `scenario.block`, `scenario.pause`, `scenario.Driver`, `scenario.Chain`, and `scenario.Dispatch`
+- monkey-patch another module so it uses **blanket** `threading` and `queue` primitives (`scenario.inject`)
 
 But that's just a taste.  We'll go over all the things you can do with
 a scenario over the course of this document--there's a lot of 'em.
@@ -382,7 +384,7 @@ anything; the synchronization primitives behave just like normal
 synchronization primitives.
 
 But that's only until you enter the scenario.  Once you enter
-the scenario, the primtiives automatically stop every time any
+the scenario, the primitives automatically stop every time any
 thread calls a method on them.  They're waiting for instructions
 from you--you have now "become the scheduler".  Until you "exit
 the scenario", you have control over when the primitive methods
@@ -434,9 +436,10 @@ scenario gives it permission to proceed.  That's the magic
 that makes **blanket** work.
 
 
-### The Seven Primitives
+### The Primitives
 
-The `threading` module contains seven synchronization primitives:
+A scenario supplies regulated versions of the synchronization objects
+most Python programs use from `threading`:
 
 * `Lock`
 * `RLock`
@@ -446,15 +449,33 @@ The `threading` module contains seven synchronization primitives:
 * `Semaphore`
 * `BoundedSemaphore`
 
-A **blanket** scenario object also contains these same seven
-primitives, with the same names.  The objects they return
-behave the same, with the same methods taking the same arguments.
+In 1.1, a scenario also supplies regulated versions of the queue
+classes from `queue`:
 
-When you construct create a `scenario.Lock()`, you get back a
-*primitive handle*, or just a *primitive* for short.  Method calls
-on the primitive behave exactly like the real thing--until you
-enter the scenario.  Once you do, the primitive is *regulated*:
-it blocks when it's called, to let you control it.
+* `SimpleQueue`, on Python versions whose stdlib has `queue.SimpleQueue`
+* `Queue`
+* `LifoQueue`
+* `PriorityQueue`
+
+The objects they return behave like the stdlib objects, with the same
+methods taking the same arguments for the Python version you're running.
+**blanket** tries hard to impersonate the stdlib exactly.  For example,
+`RLock.locked`, `Condition.locked`, `queue.SimpleQueue`, and
+`Queue.shutdown` only appear on the corresponding **blanket** objects
+when they appear on the real stdlib objects.
+
+**blanket** doesn't currently regulate the `asyncio` synchronization
+primitives.  They're similar to the `threading` primitives, but they live
+on an event loop and aren't for synchronizing OS threads.  That's a
+different problem.  If **blanket** ever grows support for `asyncio`, it'll
+probably want a separate async-flavored design, not a quick copy of the
+threading API.
+
+When you create a `scenario.Lock()` or `scenario.Queue()`, you get back
+a *primitive handle*, or just a *primitive* for short.  Method calls on
+the primitive behave exactly like the real thing--until you enter the
+scenario.  Once you do, the primitive is *regulated*: it blocks when it's
+called, to let you control it.
 Outside the `with scenario:` block, **blanket** primitives are
 *unregulated*: calls pass straight through to the real primitive,
 what we call the *actual* primitive. This means outside the scenario
@@ -483,23 +504,21 @@ or *raw* for short, which you can get from the scenario.
 raw_lock = scenario.raws[some_random_lock]
 # or:
 raw_lock = scenario.raw(some_random_lock)
-
 ```
 
-The *raw* is a second
-handle to the same internal objects; methods on the *primitive* and
-the *raw* both change the internal state of the object in the same way.
-The only difference is that the raw handle is *always unregulated*;
-when you call a method on it, it always runs immediately.
+The *raw* is a second handle to the same internal objects; methods on
+the *primitive* and the *raw* both change the internal state of the
+object in the same way. The only difference is that the raw handle is
+*always unregulated*; when you call a method on it, it always runs
+immediately.
 
-When is this useful?  
-Well, what if you need to change the state of a primitive while
-*inside* the scenario?  You might want to tweak a semaphore
-in the middle of a test, bumping up its value by calling `release`.
-But if you just call `release` on the primitive, it'll be a
-regulated call--and meanwhile, you're the guy who's supposed
-to be calling into **blanket** and letting these calls make
-progress.  You'd be deadlocked!
+When is this useful?  Well, what if you need to change the state of a
+primitive while *inside* the scenario?  You might want to tweak a
+semaphore in the middle of a test, bumping up its value by calling
+`release`. But if you just call `release` on the primitive, it'll be a
+regulated call--and meanwhile, you're the guy who's supposed to be
+calling into **blanket** and letting these calls make progress. You'd be
+deadlocked!
 
 Instead, just use the raw handle:
 
@@ -512,22 +531,19 @@ with scenario:
     raw.release()
 ```
 
-You might also want to give a *worker thread* (or some
-other piece of subsystem code) an unregulated handle,
-even though other code in the same test is using the regulated
-handle.  Regulation follows the handle, not the primitive,
-so different references to the same underlying object can be
-regulated independently.  Imagine a test that exercises three
-subsystems A, B, and C, sharing a lock, and you only want
-**blanket** to control synchronization in A and C--maybe B is
-incidental machinery you don't care about managing. You can give B
-a raw handle to the lock; B will use the lock at full speed,
-while A and C's calls on the same lock produce transactions and
-flow through the scheduler.
+You might also want to give a *worker thread* (or some other piece of
+subsystem code) an unregulated handle, even though other code in the same
+test is using the regulated handle. Regulation follows the handle, not
+the primitive, so different references to the same underlying object can
+be regulated independently. Imagine a test that exercises three
+subsystems A, B, and C, sharing a lock, and you only want **blanket** to
+control synchronization in A and C--maybe B is incidental machinery you
+don't care about managing. You can give B a raw handle to the lock; B
+will use the lock at full speed, while A and C's calls on the same lock
+produce transactions and flow through the scheduler.
 
-Outside the scenario you don't need raws--the regulated handle is
-already unregulated. Raws are only for when you're inside the scenario.
-
+Outside the scenario you don't need raws--the regulated handle is already
+unregulated. Raws are only for when you're inside the scenario.
 
 ### Masquerade
 
@@ -595,18 +611,18 @@ The three layers are:
   synchronization function `scenario.wait`.
 - **The middle-level API**: methods and classes that drive
   threads through sequences of method calls: `scenario.park`,
-  `scenario.skip`, `scenario.finish`, and the
+  `scenario.skip`, `scenario.block`, `scenario.pause`, and the
   `Driver`/`Chain`/`Dispatch` subsystem.
 - **The high-level API**: per-primitive helper methods for
-  common patterns in multithreaded programming: `assign`, `relay`, `cycle`, and
-  `allocate`.
+  common patterns in multithreaded programming: `assign`, `relay`,
+  `cycle`, `allocate`, and `deliver`.
 
 You should spend most of your time at the high level, dropping
 down to the middle level occasionally, and reaching into the low level
 only for tests that need surgical precision. But it's worth being
 familiar with all three.  As the classic computer science aphorism
 says: *all abstractions leak*.  So it's helpful to understand all
-three levels, even if you mostly stay at the to.
+three levels, even if you mostly stay at the top.
 
 
 ### The Low-Level API
@@ -622,7 +638,7 @@ for **blanket** to work.
 Every method call on a **blanket** primitive becomes a *transaction*.
 A transaction encapsulates:
 
-- the *primitive* the method call was ade on,
+- the *primitive* the method call was made on,
 - the *method* being called, which is a "bound method object" (`lock.acquire`),
 - the *thread* doing the calling,
 - the *state* the call is currently in,
@@ -713,11 +729,11 @@ representing a method that takes a `timeout` argument:
 `scenario.wait(*items, timeout=None)` is the universal blocker. It
 blocks the scheduler until any of the *items* you supply *signals*.
 A wide range of objects can be items: bound methods on primitives
-(signals while any thread is inside that method), the scenario
-itself (signals while a thread has an active visible transaction),
-a thread (signals while the thread has an active transaction),
-a transaction (signals once the transaction has completed), and
-the various signal-token classes documented below.
+(signals while any thread is inside that method), regulated primitives
+(signals while any thread is using that primitive), a thread (signals
+while the thread has an active transaction), a transaction (signals once
+the transaction has completed), and the various signal-token classes
+documented below.
 
 We'll see a lot more about `wait` in the *Signals And wait* section
 to come.
@@ -726,16 +742,34 @@ to come.
 
 ### The Middle Level
 
-The middle-level API drives threads through sequences of method
-calls. There are three free functions and three classes.
+The middle-level API drives threads through sequences of method calls.
+There are four scenario methods and three driver classes.
+
+The scenario methods all take a *thread spec* followed by one or more
+methods.  A thread spec is normally just a thread:
+
+```
+scenario.skip(A, lock.acquire)
+```
+
+When you're steering work created inside an existing transaction--for
+example, a primitive call made by a `Condition.wait_for` predicate--the
+thread spec may instead be a strict two-tuple:
+
+```
+scenario.skip((A, base_tx), lock.acquire)
+```
+
+The tuple means: look for the named call on thread `A`, but only as a
+child, grandchild, etc. of `base_tx`.  The base transaction itself is the
+scope; it is not the target.
 
 #### park
 
-`scenario.park(*args, wait=False)` drives one or more
-named threads to specified methods, stopping each one at the
-scheduler block on the method you specified. After `park` returns,
-each named thread is parked, with its current transaction available
-for inspection or manipulation:
+`scenario.park(*args)` drives one or more named threads to specified
+methods, stopping each one at the scheduler block on the method you
+specified.  `park` is *lenient*: it skips unrelated transactions until it
+finds the named call.
 
 ```
 with scenario:
@@ -748,65 +782,88 @@ with scenario:
 
 #### skip
 
-`scenario.skip(*args, wait=False)` is similar, but it
-drives the named threads *through* one or more method calls each.
-After `skip` returns, the named threads have completed all the
-method calls you specified:
+`scenario.skip(*args)` drives the named threads *through* one or more
+method calls each.  `skip` is *strict*: the named calls must be the next
+transactions, in the order you named them.  It auto-skips child
+transactions.
 
 ```
 scenario.skip(t, lock.acquire, lock.release)
 # t has now completed both lock.acquire and lock.release.
 ```
 
-#### finish
+#### block
 
-`scenario.finish(*threads)` drives each named thread
-to a terminal state--best-effort, on the theory that you just want
-them out of the way. Useful inside the scenario for cleaning up
-specific parked threads before you move on to the next phase of the
-test. You usually don't need to call `finish` just before scenario exit:
-the exit cleans up for you, unparking blanket-parked threads automatically
-and "join"-ing the managed threads.  You only need `finish` when you
-want explicit control--driving a thread through specific final method
-calls, or expiring its timeout instead of letting it sit.
+`scenario.block(*args)` is the strict sibling of `park`.  It expects the
+named call to be the next transaction, and leaves that transaction parked
+at `BLOCKED`.
+
+```
+blocked = scenario.block(t, lock.acquire)
+tx = blocked[t]
+# tx.state is State.BLOCKED
+```
+
+Use `block` when the next call had better be exactly the call you named.
+Use `park` when you're willing to drive past unrelated work until the
+named call appears.
+
+#### pause
+
+`scenario.pause(*args)` is the strict sibling of `skip` that stops after
+the actual method has run.  It drives the named call to `PAUSED`, so the
+call has committed but the worker thread has not yet resumed ordinary
+Python execution.
+
+```
+paused = scenario.pause(t, event.wait)
+tx = paused[t]
+tx.pause = False       # or tx.unpause()
+```
 
 #### Driver
 
-`scenario.Driver`, `scenario.Chain`, and `scenario.Dispatch` are
-objects used to drive one or more transactions running in one or
-more threads.  They give you direct, manual control over the
-underlying driver state machine. Most tests don't need them, but
-the few that do tend to *really* need them.
+`scenario.Driver`, `scenario.Chain`, and `scenario.Dispatch` are objects
+used to drive one or more transactions running in one or more threads.
+They give you direct, manual control over the underlying driver state
+machine. Most tests don't need them, but the few that do tend to *really*
+need them.
 
-A `Driver` attaches to a single worker thread. You construct one
-with `scenario.Driver(thread)`. Drivers are lazy; nothing really
-happens until you "drive" it, either by calling the object `driver()`,
-or by giving it to a `Dispatch` and iterating over the dispatch.
-(This means two Drivers can be constructed for the same thread
-without immediately conflicting.  But only one `Driver` can drive
-a thread at a time; trying to drive a thread with two `Driver`
-objects at the same time is an error.)
+A `Driver` attaches to a single worker thread. You construct one with
+`scenario.Driver(thread)`, or with `scenario.Driver(thread, base_tx)` to
+drive only descendant transactions under `base_tx`. Drivers are lazy;
+nothing really happens until you "drive" one, either by calling the
+object `driver()`, or by giving it to a `Dispatch` and iterating over the
+dispatch.
 
-A Driver gives you a set of imperatives--`skip()`, `finish()`,
-`block()`, `commit()`, `wait()`, `stall()`, `pause()`--each of
-which requests a state transition or series of transitions.
-Again, this isn't done eagerly; the `Driver` remembers the request,
-then makes it happen the next time it's driven.  You can only call
-one imperative at a time; if you call a second imperative
-before the first one has been driven, the driver raises.
+This is a breaking change in 1.1: a Driver no longer silently skips
+nested transactions by default.  When a nested transaction appears, the
+Driver surfaces it and asks the scheduler for direction.  When the driven
+transaction is running a user callback and that callback asks **blanket**
+for scheduler help, the Driver surfaces that too, in `reentered` state.
+Most high-level imperatives still opt into automatic child skipping where
+that is the right behavior, but code using `Driver` directly should
+expect nested work to be visible.
 
-A `Chain` is an ordered sequence of `Driver` objects.  Adding a
-Chain to a Dispatch activates the chain's first driver; when that
-driver reaches a terminal state, the next driver in the chain
-takes its place; and so on, until the chain is empty.  You can
-also iterate over a Chain directly, or pop drivers off the head
-manually with `chain.promote()`.
+A Driver gives you a set of imperatives--`skip()`, `finish()`, `block()`,
+`commit()`, `wait()`, `stall()`, `pause()`--each of which requests a
+state transition or series of transitions. Again, this isn't done
+eagerly; the `Driver` remembers the request, then makes it happen the
+next time it's driven. You can only call one imperative at a time; if you
+call a second imperative before the first one has been driven, the driver
+raises.
 
-A `Dispatch` is an iterator over drivers that need attention. You
-add drivers (or chains of drivers) to it via `dispatch.add`. Each
-time you call `next(dispatch)`, it returns whichever driver
-needs the scheduler's attention next, having woken via a single
-`scenario.wait` on the union of every driver's signals.
+A `Chain` is an ordered sequence of `Driver` objects. Adding a Chain to a
+Dispatch activates the chain's first driver; when that driver reaches a
+terminal state, the next driver in the chain takes its place; and so on,
+until the chain is empty. You can also iterate over a Chain directly, or
+pop drivers off the head manually with `chain.promote()`.
+
+A `Dispatch` is an iterator over drivers that need attention. You add
+drivers (or chains of drivers) to it via `dispatch.add`. Each time you
+call `next(dispatch)`, it returns whichever driver needs the scheduler's
+attention next, having woken via a single `scenario.wait` on the union of
+every driver's signals.
 
 The typical pattern looks something like this:
 
@@ -824,9 +881,8 @@ with scenario:
         ...
 ```
 
-Note that if you only need to interact with one driver,
-you can skip the `Dispatch` object.  Calling the driver
-object drives it in isolation:
+Note that if you only need to interact with one driver, you can skip the
+`Dispatch` object.  Calling the driver object drives it in isolation:
 
 ```
 with scenario:
@@ -836,9 +892,8 @@ with scenario:
     # d has been driven and you can now inspect it
 ```
 
-`park`, `skip`, `finish`, and everything in the high-level API
+`park`, `skip`, `block`, `pause`, and everything in the high-level API
 are all implemented using `Driver` objects.
-
 
 ### The High-Level API
 
@@ -856,7 +911,8 @@ They are tailor-made idiomatic shortcuts that handle common
 usage patterns with that primitive in multithreaded code.
 
 - **`assign(thread, acquirer=None, *, pause=False)`** -
-  available on `Lock` and `RLock` API objects. Manages one
+  available on `Lock` and `RLock` API objects, and on `Condition`
+  API objects for the condition's underlying lock. Manages one
   `acquire` call, and maybe one `release` call.  With one
   argument, the lock must not be locked, and that thread
   must call `acquire`, which will succeed.  With two
@@ -868,7 +924,7 @@ usage patterns with that primitive in multithreaded code.
   lock through an ordered sequence of threads. The `initial`
   thread can call either `acquire` or both `acquire` followed
   by `release`; every thread after `initial` but before the last
-  one must must call `acquire` followed by `release`, and the
+  one must call `acquire` followed by `release`, and the
   last thread must call `acquire`, at which point `relay` is done.
   Returns an iterator yielding each acquirer thread after
   its `acquire` call succeeds, so you can manage what that
@@ -885,14 +941,29 @@ usage patterns with that primitive in multithreaded code.
   all the method calls have been called, and all the waiters
   are waiting for you to take over.  You can call methods
   on the cycle object to wake or pause them in any order
-  (`wake(thread, ...)`, `pause(thread, ...)`).
+  (`wake(thread, ...)`, `pause(thread, ...)`).  `Condition.cycle` also
+  has `wait(thread, ...)`, for driving false-predicate `wait_for`
+  wakeups back into the waiting phase.
 
 - **`allocate(*threads, pause=False)`** - on `Semaphore` and
-  `BoundedSemaphore` API objects.  Drive an ordered sequence of
-  semaphore acquires and releases. `threads` mixes acquirers and
+  `BoundedSemaphore` API objects.  Drive a script of semaphore
+  `acquire` and `release` calls. `threads` mixes acquirers and
   releasers; **blanket** figures out which is which based on what
-  method the thread calls.  Returns an iterator, yielding each
-  thread after its call has finished.
+  method the thread calls.  Only one semaphore call is actually
+  running at a time; the rest stay parked at `BLOCKED`.  If an
+  `acquire` has to wait for a later `release`, that's fine.  If
+  the script you provide can't make progress, then `allocate`
+  blocks too.  Returns an iterator, yielding each acquirer thread
+  after its acquire has succeeded.
+
+- **`deliver(*threads)`** - on queue API objects.  Drive a sequence
+  of `get`, `put`, `get_nowait`, and `put_nowait` calls on that
+  queue.  `deliver` is strict: every named participant's next queue
+  call must be one of those four methods on that same queue.  Only
+  one queue call is actually running at a time; the rest stay parked
+  at `BLOCKED`.  If the script you provide can't make progress,
+  then `deliver` blocks too.  Returns the queue transactions in the
+  same order as the arguments.
 
 
 In addition to these tailor-made helpers, the API objects
@@ -910,49 +981,57 @@ lock_api.expire(lock.acquire, t1, t2, t3)
 
 ## Signals And wait
 
-The `wait` method on a scenario is the universal blocker. It blocks
-the scheduler until one of the items you give it "signals",
-meaning, the condition it represents becomes true.  The design
-for `wait` borrows heavily from Win32's wonderful
+The `wait` method on a scenario is the universal blocker. It blocks the
+scheduler until one of the items you give it *signals*, meaning, the
+condition it represents becomes true.  The design for `wait` borrows
+heavily from Win32's wonderful
 [`WaitForMultipleObjects`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects)
 function, which does basically the same thing.
 
-The items you can give it cover a lot of conditions:
+In 1.1, signals are self-reporting objects.  A signal implements
+`sample(scenario)`, which returns whether the signal is currently high.
+`scenario.wait` samples its inputs immediately; if nothing is high, it
+parks until **blanket** emits a matching wakeup.  **blanket** no longer
+keeps a long-lived set of every signal that ever fired, so old
+uninteresting signal objects don't stay alive just because they were once
+true.
+
+The items you can give to `wait` cover a lot of conditions:
 
 - A **thread** signals while the thread has an active transaction.
-- A **transaction** Signals once the transaction has completed.
-- A **bound method on a primitive**, e.g. `lock.acquire`. Signals
-  while any thread has an active transaction on that method.
-- A **`Call(thread, method)`** instance. Signals while `thread`
-  is calling `method`.
-- A **`Use(thread, primitive)`** instance. Signals while `thread`
-  is calling any method on `primitive`.
-- A **`Terminated(thread)`** instance. Signals once the thread has
+- A **transaction** signals once the transaction has completed.
+- A **regulated primitive**, e.g. `lock` or `q`, signals while any thread
+  has an active transaction using that primitive.
+- A **bound method on a primitive**, e.g. `lock.acquire`, signals while
+  any thread has an active transaction on that method.
+- A **`Call(thread_or_tuple, method, state=None)`** instance signals
+  while a particular thread is calling `method`.  `thread_or_tuple` may
+  be either a bare thread or `(thread, base_tx)` to restrict the match to
+  descendant transactions under `base_tx`.
+- A **`Use(thread_or_tuple, primitive)`** instance signals while a
+  particular thread is using any method on `primitive`.  It also accepts
+  the `(thread, base_tx)` scoped form.
+- A **`Terminated(thread)`** instance signals once the thread has
   terminated.
-- A **`Not(x)`** instance, where `x` is one of the above. Signals
-  the opposite of the original; `Not(Terminated(x))` signals when
-  the thread has *not* terminated.
-- A **`Nested(transaction)`** instance. Signals while that
-  transaction has a "child" or "nested" transaction.
-  (Relevant for `Condition.wait_for`, which calls `Condition.wait`
-  internally).
-- An **`Action(transaction)`** instance. Signals while that
-  transaction is in its *action phase*--temporarily pushed off
-  its thread's transaction chain so that child transactions
-  created during that window appear as fresh roots rather than
-  children. Currently the only producer is `Barrier.wait`, which
-  pushes itself around the user-supplied action callback.
-- A **`Reached(transaction, state)`** instance. Signals while the
+- A **`Not(x)`** instance signals the opposite of `x`.
+  `Not(Terminated(x))` signals when the thread has *not* terminated;
+  `Not(lock)` signals when no active transaction is using `lock`.
+- A **`Nested(transaction)`** instance signals while that transaction has
+  a child transaction.
+- An **`Action(transaction)`** instance signals while a `Barrier.wait`
+  transaction is running its action callback.
+- A **`Predicate(transaction)`** instance signals while a
+  `Condition.wait_for` transaction is running its predicate callback.
+- A **`Reached(transaction, state)`** instance signals while the
   transaction's state is at or past `state`.
 - A **`TransactionState`** subclass instance: `Blocked(tx)`,
   `Waiting(tx)`, `Stalled(tx)`, `Resumed(tx)`, `Committed(tx)`,
   `Paused(tx)`, `Exiting(tx)`, `Returned(tx)`, `Raised(tx)`,
   `Commit(tx)`. Signals only while that transaction is in that state.
-- The **scenario itself**. Signals while you've entered the scenario.
 
-You can pass in as many of these as you like.  `wait` returns as soon
-as *any* of them signals, and it returns a `set()` containing all the
-items that signaled.  So if you want "either thread A terminates
+You can pass in as many of these as you like.  `wait` returns as soon as
+*any* of them signals, and it returns a `set()` containing all the
+original items that signaled.  So if you want "either thread A terminates
 or thread B reaches `WAITING`," you write:
 
 ```
@@ -961,35 +1040,38 @@ signaled = scenario.wait(Terminated(A), Reached(b_tx, State.WAITING))
 
 and now you can examine `signaled` to see which one signaled.
 
-(What if you want to wait until *all* the items have signaled?
-Just call `wait` multiple times, once for each item.)
+(What if you want to wait until *all* the items have signaled? Just call
+`wait` multiple times, once for each item.)
 
-`wait` also supports a `timeout` keyword-only parameter,
-which if provided is the longest you will wait, specified
-in seconds:
+`wait` also supports a `timeout` keyword-only parameter, which if
+provided is the longest you will wait, specified in seconds:
 
 ```
-scenario.wait(t, timeout=5.0)
+signaled = scenario.wait(t, timeout=5.0)
 ```
 
 By default `timeout` is `None`, which means "no timeout, wait forever".
-If a `wait` call times out, it raises `TimeoutError`.
+If a `wait` call times out, it returns an empty set.
 
+## Other Topics
 
-## Monkey-Patching
+A handful of small things worth knowing.
 
-Sometimes the code you want to test does its threading work via
-`import threading` and references like `threading.Lock`.  Or maybe
-even `from threading import Lock`.  You don't own the source,
-you can't modify it so you pass in a pre-constructed `Lock`,
-and you'd rather not patch each reference by hand.  For that case,
-the scenario has an `inject` method.
+### Monkey-Patching
 
-`scenario.inject(module)` monkey-patches threading-primitive
-references in `module` so that, while the patch is in place,
-calls like `target_module.threading.Lock()` construct **blanket**
-primitives on the scenario instead of real `threading` primitives.
-Example:
+Sometimes the code you want to test does its synchronization work via
+`import threading` or `import queue`, and references like
+`threading.Lock` or `queue.Queue`.  Or maybe even `from threading import
+Lock` and `from queue import Queue`.  You don't own the source, you can't
+modify it so you pass in pre-constructed primitives, and you'd rather not
+patch each reference by hand.  For that case, the scenario has an
+`inject` method.
+
+`scenario.inject(module)` monkey-patches supported `threading` and
+`queue` primitive references in `module` so that, while the patch is in
+place, calls like `target_module.threading.Lock()` and
+`target_module.queue.Queue()` construct **blanket** primitives on the
+scenario instead of real stdlib primitives. Example:
 
 ```
 import target_module
@@ -998,42 +1080,109 @@ scenario = blanket.Scenario()
 with scenario.inject(target_module):
     ...
     # Inside this block, target_module's threading.Lock,
-    # threading.Condition, etc. all construct blanket primitives
-    # bound to scenario.
+    # threading.Condition, queue.Queue, etc. construct blanket
+    # primitives bound to scenario.
     ...
 ```
 
-
 It handles two reference patterns:
 
-- Names bound directly to a threading primitive class, e.g.
-  `from threading import Lock` or `Mutex = threading.Lock`. Each
-  such name is rebound to the corresponding scenario primitive
-  class.  (This is done by examining the value, not the name;
-  something else that happens to be named `Lock` will be left alone.)
-- A module attribute whose value is the `threading` module itself,
-  e.g. `import threading`. That attribute is replaced with a small
-  stand-in object whose `.Lock` / `.RLock` / etc. are the scenario's
-  primitives, and whose other attribute lookups fall through to
-  the real `threading` module.  So `target_module.threading.Lock()`
-  constructs a **blanket** `Lock`, but `target_module.threading.Thread`
-  is still `threading.Thread`.
+- Names bound directly to a primitive class, e.g. `from threading import
+  Lock`, `from queue import Queue`, or `Mutex = threading.Lock`. Each
+  such name is rebound to the corresponding scenario primitive class.
+  (This is done by examining the value, not the name; something else that
+  happens to be named `Lock` will be left alone.)
+- A module attribute whose value is the `threading` or `queue` module
+  itself, e.g. `import threading`. That attribute is replaced with a
+  small stand-in object whose regulated names are the scenario's
+  primitives, and whose other attribute lookups fall through to the real
+  module.  So `target_module.threading.Lock()` constructs a **blanket**
+  `Lock`, but `target_module.threading.Thread` is still
+  `threading.Thread`; similarly, `target_module.queue.Queue()` constructs
+  a **blanket** `Queue`, but `target_module.queue.Empty` is still the
+  real `queue.Empty`.
 
-The injection is returned as a handle, usable as a context manager
-(as above) or closed explicitly with `.close()`. On close, the
-original references are restored.
+The injection is returned as a handle, usable as a context manager (as
+above) or closed explicitly with `.close()`. On close, the original
+references are restored.
 
-If `scenario.inject(module)` can't find anything to patch, it
-raises `ValueError`--almost certainly a sign that you've pointed
-it at the wrong module, or the target imports `threading` lazily
-inside a function (so the import hasn't happened yet at the time
-inject runs).
+If `scenario.inject(module)` can't find anything to patch, it raises
+`ValueError`--almost certainly a sign that you've pointed it at the wrong
+module, or the target imports `threading` / `queue` lazily inside a
+function (so the import hasn't happened yet at the time inject runs).
 
+### Nested Transactions
 
+Most transactions are roots.  A thread calls `lock.acquire`, **blanket**
+creates a transaction for that call, and `scenario.transaction(thread)`
+returns that transaction until it exits.  Simple enough.
 
-## Subtle Behaviors And Tips
+Nested transactions happen when the method **blanket** is regulating calls
+back into user code, and that user code calls another regulated primitive.
+There are two important cases:
 
-A handful of small things worth knowing.
+- `Barrier.wait` can run the barrier's `action` callback.
+- `Condition.wait_for` runs the predicate callback, possibly more than once.
+
+If that callback calls a **blanket** primitive, the new transaction is a
+child of the callback-running transaction.  You can see this directly:
+
+```
+outer = scenario.transaction(thread)
+# Later, while the callback is running and has called another primitive:
+inner = scenario.transaction(thread)
+assert inner.parent is outer
+```
+
+The top transaction on the thread is always the child-est one.  So
+`scenario.transaction(thread)` returns `inner` in the example above.
+The parent chain is how **blanket** remembers that `inner` happened
+inside `outer`, not merely later on the same thread.
+
+This matters because sometimes you want to drive the nested call, not the
+next ordinary call the thread makes after the outer transaction finishes.
+For that, APIs that select a future transaction by thread and method
+also accept a strict two-tuple:
+
+```
+scenario.skip((thread, outer), lock.acquire)
+scenario.block((thread, outer), q.get)
+scenario.api(lock).unblock(lock.acquire, (thread, outer))
+scenario.api(q).deliver((thread, outer), producer)
+```
+
+Read `(thread, outer)` as: look for a matching child, grandchild, etc.
+under `outer`.  Do not select `outer` itself.  The tuple is a scope, not
+a transaction object.
+
+The same idea exists in signals:
+
+```
+scenario.wait(Call((thread, outer), lock.acquire))
+scenario.wait(Use((thread, outer), lock))
+```
+
+And, if you're down at the Driver level, you can construct the scoped
+Driver directly:
+
+```
+driver = scenario.Driver(thread, outer)
+```
+
+A plain `Driver(thread)` no longer silently skips nested transactions in
+1.1.  If it runs into one, it reports back in `nesting` state and waits
+for instructions.  If the transaction currently being driven calls back
+into user code, and that callback asks **blanket** for scheduler help, the
+Driver reports back in `reentered` state.  A scoped Driver that can't
+reach nested work because the base transaction is parked in the wrong
+place, or has already gone away, ends in `impasse`.  That's **blanket**
+saying: with the scope you gave me, there is no transaction here that I
+can drive.
+
+The practical advice: when you're testing callbacks, keep the outer
+transaction in a variable, and use `(thread, outer)` whenever you mean
+"the thing this callback is about to do."
+
 
 ### Parked Threads At Scenario Exit
 
@@ -1064,10 +1213,10 @@ If nothing in your test ever provides that wake, the join hangs.
 
 If you want explicit control over how a particular thread ends--for
 example, driving it through specific final method calls before exit,
-or expiring its timeout instead of waiting for it to fire--you can
-still call `scenario.finish(*threads)` (or use a `Driver` directly)
-inside the scenario, before exit. The auto-unpark at exit is only for
-the "just let the worker finish on its own" case.
+or expiring its timeout instead of waiting for it to fire--use the
+middle-level APIs (`skip`, `block`, `pause`, `park`) or a `Driver`
+directly inside the scenario, before exit. The auto-unpark at exit is
+only for the "just let the worker finish on its own" case.
 
 ### Setup, Teardown, And Raws
 
@@ -1114,8 +1263,8 @@ save you confusion.
 
 There's one more piece to **blanket** that doesn't fit anywhere
 in the scenario story: a bytecode injector, in the
-`blanket.injector` submodule. This part is small, optional, and
-serves a comparatively rare use case--if you need it, you need it,
+`blanket.injector` submodule. This part is small and specialized,
+serving a comparatively rare use case--if you need it, you need it,
 and if you don't need it you can skip this section entirely.
 
 ### What The Injector Is For
@@ -1136,7 +1285,7 @@ runs them, and the test goes back to being nondeterministic.
 
 That's what the injector is for. It lets you take an existing
 Python function and modify it, producing a *new* function that's
-identical to the original except: you've inserted single inserted
+identical to the original except: you've inserted a single
 function call inside the function's bytecode, at a location you
 specify.  You then arrange for that injected call to be a
 **blanket** synchronization point--say, a call to 
@@ -1148,7 +1297,7 @@ In short: with the injector, you insert synchronization points
 control.
 
 If you need to, you can mix injected code with code
-using **blanket** primitives.  The two are orthoganal
+using **blanket** primitives.  The two are orthogonal
 techniques and compose perfectly.
 
 
@@ -1174,10 +1323,10 @@ one of four classmethods:
   Python token. Finds the first occurrence of `token` (a string)
   in the function's tokens. Same `skip` and `after` semantics.
 
-- **`Location.bytecode(function, offset, stop=None)`** - by raw
-  bytecode offset. The escape hatch for when you've built the
-  function with a bytecode-manipulation library and the other
-  methods can't see your source.
+- **`Location.bytecode(function, bytecode, *, skip=0, after=None)`** - by
+  bytecode instruction name, e.g. `"RETURN_VALUE"`.  Same `skip` and
+  `after` semantics as `Location.text` and `Location.token`.  The escape
+  hatch for when source-level locations aren't the right tool.
 
 `Location` objects support equality, hashing, rich comparison
 (`<`, `<=`, etc.) when they're from the same function,
@@ -1489,33 +1638,39 @@ numerical lifecycle position).
 
 `State.terminal_states` is the frozenset `{State.RETURNED, State.RAISED}`.
 
-**`blanket.Signaled`**
+**`blanket.Signaling`**
 
-The marker base class for signal-token objects. All signal tokens
-are subclasses of `Signaled`. Mostly of interest if you're writing
-code that needs to dispatch on whether a given object is a signal
-token; everyday users won't reference it.
+The marker base class for explicit signal objects.  `scenario.wait` also
+accepts public shorthand forms--bare threads, bare regulated primitives,
+and bare bound methods on regulated primitives--and boxes them internally
+before waiting.
 
 **`blanket.Reached(transaction, state)`**
 
-Signal token. Signals while `transaction`'s state is at or past
-`state`. Useful for "wait until the transaction has reached at
-least this point."
+Signal token. Signals while `transaction`'s state is at or past `state`.
+Useful for "wait until the transaction has reached at least this point."
 
-**`blanket.Call(method, thread)`**
+**`blanket.Call(thread_or_tuple, method, state=None)`**
 
-Signal token. Signals while `thread` is in a transaction on
-`method`.
+Signal token. Signals while a particular thread is in a transaction on
+`method`.  `thread_or_tuple` may be either a bare thread or the strict
+two-tuple `(thread, base_tx)`, which scopes the match to descendant
+transactions underneath `base_tx`.  The base transaction itself is not the
+target.
 
-**`blanket.Use(thread, primitive)`**
+**`blanket.Use(thread_or_tuple, primitive)`**
 
-Signal token. Signals while `thread` has any transaction on
-`primitive` in its call chain. ("Use" is the noun form here--it
-rhymes with "moose", not "booze".)
+Signal token. Signals while a particular thread has any transaction on
+`primitive` in its call chain.  It supports the same `(thread, base_tx)`
+scoped form as `Call`.  ("Use" is the noun form here--it rhymes with
+"moose", not "booze".)
 
 **`blanket.Not(token)`**
 
-Signal token. Signals while `token` is *not* signaling.
+Signal token. Signals while `token` is *not* signaling.  `token` may be
+another explicit signal object, or one of the shorthand items accepted by
+`scenario.wait`, such as a thread, a primitive, or a bound primitive
+method.
 
 **`blanket.Terminated(thread)`**
 
@@ -1523,22 +1678,23 @@ Signal token. Signals once `thread` has terminated.
 
 **`blanket.Nested(transaction)`**
 
-Signal token. Signals while `transaction` has a child transaction
-in flight.
+Signal token. Signals while `transaction` has a child transaction in
+flight.
 
 **`blanket.Action(transaction)`**
 
-Signal token. Signals while `transaction` is in its *action phase*
---temporarily pushed off its thread's transaction chain, so that
-any child transactions created during the push window appear as
-fresh roots (parent `None`) to the rest of **blanket**. Currently
-the only producer is `Barrier.wait`, which pushes itself around
-the user-supplied action callback.
+Signal token. Signals while a `Barrier.wait` transaction is running its
+user-supplied action callback.
+
+**`blanket.Predicate(transaction)`**
+
+Signal token. Signals while a `Condition.wait_for` transaction is running
+its predicate callback.
 
 **`blanket.TransactionState(transaction, state)`**
 
 Signal token base class for "transaction is exactly in this state."
-Has the following subclasses, one per non-transit state:
+Has the following subclasses, one per concrete transaction state:
 
 ```
 Blocked(tx)
@@ -1563,12 +1719,12 @@ timeout state of a transaction: the user's specified timeout value
 the deadline-time it computes to, and whether the timeout has
 fired. Returned by various transaction APIs.
 
-**`blanket.TransactionAPI`**
+**`Scenario.Transaction`** / **`scenario.Transaction`**
 
 The class of the transaction-wrapper objects returned by the
 scheduler-facing API (e.g. `scenario.transaction(t)`). Useful
-for `isinstance` checks. The methods on a `TransactionAPI` are
-documented in the *Transactions* subsection of `Scenario` below.
+for `isinstance` checks. The methods on transaction objects are
+documented in the *TransactionAPI* subsection of `Scenario` below.
 
 ### Scenario
 
@@ -1580,12 +1736,24 @@ Construct a new scenario.
 
 The scenario's name (a string), used in `repr()`. Settable.
 
+**`scenario.threading`**
+
+A scenario-bound impersonator for the `threading` module.  Regulated
+primitive names are replaced with this scenario's primitives; everything
+else falls through to the real module.
+
+**`scenario.queue`**
+
+A scenario-bound impersonator for the `queue` module.  Queue classes
+available in the running Python's stdlib are replaced with this
+scenario's regulated queue classes; everything else, such as `Empty`,
+`Full`, and `ShutDown` where present, falls through to the real module.
+
 **`scenario.reset()`**
 
-Clear accumulated working state from the scenario--terminated
-transactions, the waiters reverse index, the log. Leaves structural
-state alone (primitives, threads, family signal sets). Safe to
-call repeatedly. Called automatically on scenario entry.
+Clear the completed-transaction log.  Structural state is left alone:
+registered primitives, raw handles, managed threads, and live waiters are
+not reset.  Called automatically on scenario entry.
 
 **`scenario.apis`**
 
@@ -1606,7 +1774,8 @@ Equivalent to `scenario.raws[primitive]`.
 **`scenario.log`**
 
 A read-only list-like view of completed transactions, in completion
-order.
+order.  It supports `clear()` but not list mutation methods such as
+`append` or item assignment.
 
 **`scenario.managed`**
 
@@ -1630,155 +1799,223 @@ if the thread has no active transaction.
 
 **`scenario.wait(*items, timeout=None)`**
 
-Block until any of `items` signals. See the *Signals And wait*
-section for the supported item types. Raises `TimeoutError` if
-`timeout` expires.
+Block until any of `items` signals. See the *Signals And wait* section
+for the supported item types. If `timeout` expires, returns an empty set.
 
-**`scenario.park(*args, wait=False)`**
+**`scenario.park(*args)`**
 
-Drive named threads to specified methods, parking each at the
-scheduler block. Arguments come in `(thread, method)` pairs:
+Leniently drive named threads to specified methods, parking each at the
+scheduler block. Arguments come in `(thread_spec, method)` pairs, where a
+thread spec is either a thread or `(thread, base_tx)`:
 
 ```
 scenario.park(A, lock.acquire, B, lock.release)
+scenario.park((A, parent_tx), lock.locked)
 ```
 
-Each thread may appear at most once. Returns a dict mapping
-thread to the transaction at the scheduler block. With `wait=True`,
-also drives each call through to completion and returns the
-completed transactions.
+Each thread may appear at most once. Returns a dict mapping thread to the
+transaction at the scheduler block.
 
-**`scenario.skip(*args, wait=False)`**
+**`scenario.skip(*args)`**
 
-Drive named threads *through* specified methods. Arguments are
-flat: thread, then one or more methods for that thread, then
-optionally another thread, etc.:
+Strictly drive named threads *through* specified methods. Arguments are
+flat: thread spec, then one or more methods for that thread, then
+optionally another thread spec, etc.:
 
 ```
 scenario.skip(A, lock.acquire, lock.release, B, lock.acquire)
+scenario.skip((A, parent_tx), lock.locked)
 ```
 
-Returns a dict mapping thread to the last transaction. With
-`wait=True`, waits for the last method on every thread to finish.
+Returns a dict mapping thread to the last transaction.
 
-**`scenario.finish(*threads)`**
+**`scenario.block(*args)`**
 
-Best-effort drive each named thread to a terminal state. Loops
-until every named thread has terminated. May deadlock if a thread
-is parked on something the test never provides.
+Strictly drive named threads to specified methods and leave each matching
+transaction parked at `BLOCKED`.
+
+**`scenario.pause(*args)`**
+
+Strictly drive named threads through specified methods and leave each
+matching transaction parked at `PAUSED`.
 
 **`scenario.__enter__()` / `scenario.__exit__(...)`**
 
-Enter and exit the scenario context. Inside the context, the
-calling thread takes the role of the scheduler.
+Enter and exit the scenario context. Inside the context, the calling
+thread takes the role of the scheduler.
 
-On exit, in order: any still-active `Driver` is closed; the
-scenario flips to unregulated (subsequent calls on the primitives
-pass straight through to the underlying real primitives); every
-transaction currently parked at a blanket-controlled park
-(`BLOCKED`, `STALLED`, `PAUSED`) is released, so its worker can
-resume and finish natively; every managed worker thread is
-`join()`ed; transient state is reset.
+On exit, in order: any still-active `Driver` is closed; the scenario
+flips to unregulated (subsequent calls on the primitives pass straight
+through to the underlying real primitives); every transaction currently
+parked at a blanket-controlled park (`BLOCKED`, `STALLED`, `PAUSED`) is
+released, so its worker can resume and finish natively; every managed
+worker thread is `join()`ed.  Completed transactions remain in the log
+for post-mortem inspection until the next scenario entry or explicit
+`reset()`.
 
-### The Seven Primitives
+### The Primitives
 
-Each is constructed as a method on the scenario, e.g.
-`scenario.Lock()`. All faithfully implement the public surface of
-the corresponding `threading` type:
+Each is constructed as a method on the scenario, e.g. `scenario.Lock()`.
+All faithfully implement the public surface of the corresponding stdlib
+type on the Python version you're running.
+
+Threading primitives:
 
 **`scenario.Lock()`** - `acquire(blocking=True, timeout=-1)`,
 `release()`, `locked()`, `__enter__`/`__exit__`.
 
 **`scenario.RLock()`** - `acquire(blocking=True, timeout=-1)`,
-`release()`, `locked()` (where supported), `__enter__`/`__exit__`.
+`release()`, `locked()` where supported, `__enter__`/`__exit__`.
 
 **`scenario.Condition(lock=None)`** - `acquire(...)`, `release()`,
-`wait(timeout=None)`, `wait_for(predicate, timeout=None)`,
-`notify(n=1)`, `notify_all()`, `__enter__`/`__exit__`.
+`locked()` where supported, `wait(timeout=None)`,
+`wait_for(predicate, timeout=None)`, `notify(n=1)`, `notify_all()`,
+`__enter__`/`__exit__`.
 
 **`scenario.Semaphore(value=1)`** - `acquire(blocking=True, timeout=None)`,
-`release(n=1)`, `__enter__`/`__exit__`.
+`release(n=1)` on Python versions whose stdlib supports `n` and
+`release()` on older versions, `__enter__`/`__exit__`.
 
-**`scenario.BoundedSemaphore(value=1)`** - same as Semaphore;
-`release` raises if it would exceed initial value.
+**`scenario.BoundedSemaphore(value=1)`** - same as Semaphore; `release`
+raises if it would exceed initial value.
 
 **`scenario.Event()`** - `is_set()`, `set()`, `clear()`,
 `wait(timeout=None)`.
 
-**`scenario.Barrier(parties, action=None, timeout=None)`** - `wait(timeout=None)`,
-`reset()`, `abort()`, plus the `parties`, `n_waiting`, `broken` properties.
+**`scenario.Barrier(parties, action=None, timeout=None)`** -
+`wait(timeout=None)`, `reset()`, `abort()`, plus the `parties`,
+`n_waiting`, `broken` properties.  If you provide `action`, **blanket**
+calls it with the opener's `Barrier.wait` transaction API object.
+
+Queue primitives:
+
+**`scenario.SimpleQueue()`** - where supported by the stdlib:
+`put(item, block=True, timeout=None)`, `put_nowait(item)`,
+`get(block=True, timeout=None)`, `get_nowait()`, `qsize()`, `empty()`.
+`SimpleQueue` is implemented in C in the stdlib, so **blanket** cannot
+observe its internal wait state; it regulates the method calls but does
+not expose the richer `WAITING` / `STALLED` transitions available on the
+Python-level queues.
+
+**`scenario.Queue(maxsize=0)`**, **`scenario.LifoQueue(maxsize=0)`**,
+and **`scenario.PriorityQueue(maxsize=0)`** - `put`, `put_nowait`,
+`get`, `get_nowait`, `task_done`, `join`, `qsize`, `empty`, `full`, and
+`shutdown(immediate=False)` where supported by the stdlib.
 
 In addition, every primitive has a `name` property (settable).
 
 ### Per-Primitive API Objects
 
 Each primitive has a corresponding API object available via
-`scenario.api(primitive)`. The API object has these methods:
+`scenario.api(primitive)`. The API object is the scheduler-facing side
+of the primitive.  It has a better `repr`, a settable `name`, a `raw`
+property for the raw handle, transaction lookup helpers, and a handful
+of methods for driving transactions on that primitive.
 
-Every API object:
+Every API object has:
 
-- **`api.unblock(method, *threads, pause=False)`** - unblock the
-  named threads' transactions on `method`. `method` is the bound
-  method on the primitive.
-- **`api.unstall(method, *threads)`** - release the named threads'
-  transactions on `method` from the `STALLED` park. Used after a
-  notify on a `Condition.wait` transaction that's stalled mid-commit,
-  to let the worker proceed into the internal lock re-acquire.
-- **`api.unpause(method, *threads)`** - decrement the pause counter
-  on the named threads' transactions; transactions whose counter
-  reaches zero unpark from `PAUSED`.
-- **`api.expire(method, *threads)`** - expire the named threads'
-  transactions on `method` (only meaningful for timeout-bearing
-  methods).
-- **`api.disregard(method, *threads)`** - disregard the named threads'
-  timeouts on `method`.
-- **`api.revert(method, *threads)`** - undo any prior `expire` or
-  `disregard` on the named threads' transactions, restoring the
-  user's original timeout. Operates on transactions in `BLOCKED`.
+- **`api.name`** - the primitive's diagnostic name.  Setting this also
+  switches the primitive's `repr` from stdlib masquerade mode to
+  **blanket**'s fancy named `repr`.
+- **`api.raw`** - the raw, unregulated handle for the primitive.
+- **`api.transactions`** - read-only mapping from thread to current
+  transaction on this primitive.  This is a plain mapping keyed by bare
+  thread; it deliberately does not accept `(thread, base_tx)` tuples.
+- **`api.transaction(thread)`** - equivalent to
+  `api.transactions.get(thread)`. Returns `None` if the thread has no
+  current transaction on this primitive.
+- **`api.unblock(method, *thread_specs, pause=False)`** - unblock the
+  named threads' transactions on `method`. `method` is the bound method
+  on the primitive.
+- **`api.unpause(method, *thread_specs)`** - decrement the pause counter
+  on the named threads' transactions; transactions whose counter reaches
+  zero unpark from `PAUSED`.
+
+Every current primitive API object also has timeout helpers.  They only
+make sense for timeout-bearing methods, and the transaction itself raises
+if you ask for timeout surgery on a method that can't time out.
+
+- **`api.expire(method, *thread_specs)`** - expire the named threads'
+  transactions on `method`.
+- **`api.disregard(method, *thread_specs)`** - disregard the named
+  threads' timeouts on `method`.
+- **`api.revert(method, *thread_specs)`** - undo any prior `expire` or
+  `disregard`, restoring the user's original timeout. Operates on
+  transactions in `BLOCKED`.
+
+A *thread spec* is either a bare thread or the strict two-tuple
+`(thread, base_tx)`.  The tuple scopes that participant to descendant
+transactions under `base_tx`; the base transaction itself is not driven.
+This thread-spec grammar is accepted by the API methods above and by the
+higher-level helpers below.
+
+`Condition` API objects also have:
+
+- **`api.unstall(method, *thread_specs)`** - release the named threads'
+  transactions on `method` from the `STALLED` park.  This is mainly used
+  after a notify on a `Condition.wait` transaction that's stalled
+  mid-commit, to let the worker proceed into the internal lock
+  re-acquire.
+- **`api.assign(thread_spec, acquirer=None, *, pause=False)`** - the same
+  high-level lock assignment helper exposed by `Lock` and `RLock`,
+  applied to the condition's underlying lock.
 
 Lock and RLock API objects also have:
 
-- **`api.assign(thread, acquirer=None, *, pause=False)`** - assign
-  the lock to `thread`. With one argument, `thread` simply acquires.
-  With two arguments, `thread` releases and `acquirer` acquires.
-- **`api.relay(initial, *acquirers, pause=False)`** - chain the
-  lock through the named threads. `initial` may be either the
-  current holder (parked at release/BLOCKED) or an acquirer on an
-  unheld lock (parked at acquire/BLOCKED); each `acquirer` takes
-  the lock in turn after `initial`. Returns an iterator yielding
-  each acquirer as it takes the lock.
+- **`api.assign(thread_spec, acquirer=None, *, pause=False)`** - assign
+  the lock to `thread_spec`. With one argument, that participant simply
+  acquires. With two arguments, the first participant releases and the
+  second acquires.
+- **`api.relay(initial, *acquirers, pause=False)`** - chain the lock
+  through the named participants. `initial` may be either the current
+  holder (parked at release/BLOCKED) or an acquirer on an unheld lock
+  (parked at acquire/BLOCKED); each `acquirer` takes the lock in turn
+  after `initial`. Returns an iterator yielding each acquirer as it takes
+  the lock.
 
 Semaphore and BoundedSemaphore API objects also have:
 
-- **`api.allocate(*threads, pause=False)`** - drive an ordered
-  sequence of semaphore acquires and releases.
+- **`api.allocate(*thread_specs, pause=False)`** - drive the named
+  participants through semaphore traffic. Each participant's next
+  semaphore call must be `acquire` or `release` on that semaphore.
+  `allocate` runs only one of those calls at a time; the others remain
+  at `BLOCKED` until chosen. Duplicate thread specs are allowed; a
+  thread's later occurrence is not surfaced until the earlier occurrence
+  has finished its semaphore transaction. The returned iterator yields
+  each acquirer thread after its acquire has succeeded.
+
+Queue, LifoQueue, PriorityQueue, and SimpleQueue API objects also have:
+
+- **`api.deliver(*thread_specs)`** - drive the named participants through
+  queue traffic. Each participant's next queue call must be `get`, `put`,
+  `get_nowait`, or `put_nowait` on that queue.  `deliver` runs only one
+  of those calls at a time; the others remain at `BLOCKED` until chosen.
+  Duplicate thread specs are allowed; a thread's later occurrence is not
+  surfaced until the earlier occurrence has finished its queue
+  transaction. Returns a tuple of transaction API objects, in the same
+  order as the arguments.
 
 Condition, Event, and Barrier API objects also have:
 
-- **`api.cycle(*threads)`** - construct a `Cycle` over
-  the named threads.  All the threads except the last thread
-  should be making `wait` or `wait_for` calls.  The last thread
-  is the "opener", and should be calling some sort of *notify*
-  function: `Condition.notify`, `Condition.notify_all`, `Event.set`,
-  or in the case of `Barrier` it should be the last `waiter`, which
-  opens the barrier.
+- **`api.cycle(*thread_specs)`** - construct a `Cycle` over the named
+  participants.  All participants except the last should be making
+  `wait` or `wait_for` calls.  The last participant is the "opener", and
+  should be calling some sort of *notify* function: `Condition.notify`,
+  `Condition.notify_all`, `Event.set`, or in the case of `Barrier` it
+  should be the last `waiter`, which opens the barrier.
 
-  The cycle is a context manager and exposes
-  `wake`, `pause`, `iter`, `close`, and is callable for
-  wake-and-close shorthand. `wake` and `pause` are polymorphic on
-  argument count: with at least one thread named, they drive those
-  threads and return a tuple; with no arguments, they drive the
-  first remaining waiter (per spec order) and return that single
-  thread, raising `ValueError` if the cycle is empty.
+  The cycle is a context manager and exposes `wake`, `pause`, `iter`,
+  `close`, and is callable for wake-and-close shorthand.  `Condition`
+  cycles also expose `wait`, which drives selected `wait_for` waiters
+  back into the waiting phase after a false predicate.
 
-  `Barrier.cycle` actually takes one keyword-only parameter,
-  `barrier_api.cycle(*threads, scheduler=None)`.  If specified,
-  `scheduler` should be a callable; it will be called after
-  allowing the last `wait` call to execute, which runs the
-  barrier's "action" if any.  If the "action" calls methods
-  on **blanket**-regulated primitives, you'll need to run
-  scheduler code to control the execution of those primitives;
-  this `scheduler` callback is the right place to run that code.
+  `Barrier.cycle` and `Condition.cycle` accept a keyword-only
+  `scheduler` callback in the cases where user callbacks can reenter
+  **blanket**: a barrier action or a `Condition.wait_for` predicate.
+  The callback is called as `scheduler(tx)`, where `tx` is the
+  `Barrier.wait` or `Condition.wait_for` transaction running the callback.
+  Use `tx.thread` to disambiguate which waiter/action is asking for
+  scheduler help.
 
 ### TransactionAPI
 
@@ -1823,14 +2060,22 @@ Properties:
 
 Methods:
 
+- **`tx.wait(state=None)`** - block the scheduler until the transaction
+  reaches `state`, or until it terminates if `state` is omitted. Returns
+  the transaction's current state.
 - **`tx.unblock()`** - unblock the transaction from the scheduler
   block.
 - **`tx.unpause()`** - equivalent to `tx.pause = False`, but also,
-  unparks the transaction if the scheduler pause if you were the
-  only party requesting **`PAUSING`** state.  (**blanket** can turn
-  on pausing state too, and a transaction parked in **`PAUSING`**
-  state won't unblock until all parties give it permission to resume.)
+  unparks the transaction from the scheduler pause if you were the
+  only party requesting the `PAUSED` park.  (**blanket** can request
+  that park too, and a transaction parked at `PAUSED` won't unblock
+  until all parties give it permission to resume.)
 - **`tx.unstall()`** - unblock the transaction from a stall.
+- **`tx.unpark()`** - release the transaction from whatever
+  scheduler-controlled parking state it's currently in: `BLOCKED`,
+  `STALLED`, or `PAUSED`.  This is the blunt instrument; prefer the
+  specific operation when you already know where the transaction is
+  parked.
 - **`tx.expire()`** - force the transaction to time out, when it runs.
   Can only be called on transactions that can time out,
   while the transaction is in `BLOCKED` state.
@@ -1841,116 +2086,94 @@ Methods:
   overriding an `expire` or `disregard` call.
   Can only be called on transactions that can time out,
   while the transaction is in `BLOCKED` state.
-- **`tx.push()`** - temporarily remove this transaction from its
-  thread's transaction chain.  The push happens at the time of
-  the call; the returned object is callable, and calling it
-  (or using it as a context manager and exiting it) pops.
-  Preconditions: the transaction must be a chain root
-  (`tx.parent` is `None`) and not already pushed.  While pushed,
-  any child transactions appear as fresh roots rather than
-  children, and `Action(tx)` signals high.  Currently used by
-  `Barrier.wait` around its action callback to hide the barrier
-  transaction from any primitive calls inside the action.
 
 ### Scenario.Driver
 
-**`scenario.Driver(thread)`**
+**`scenario.Driver(thread, base_tx=None)`**
 
-Construct a Driver attached to `thread`.  A Driver
-"drives" a thread, which is to say, it causes method
-calls made on primitives by the thread to make progress.
-You can tell the Driver what you want the thread, or the
-tx running on the thread, to do, and the Driver will make
-it happen and report back when it's successful--or if
-some unexpected thing happened (the thread terminated!)
-and it can no longer make progress on your request.
+Construct a Driver attached to `thread`.  If `base_tx` is provided, the
+Driver is scoped to descendant transactions under that base transaction.
+A Driver "drives" a thread, which is to say, it causes method calls made
+on primitives by the thread to make progress. You can tell the Driver
+what you want the thread, or the tx running on the thread, to do, and the
+Driver will make it happen and report back when it's successful--or if
+some unexpected thing happened and it can no longer make progress on your
+request.
+
+Drivers are lazy and acquire their active driving slot only when they are
+actually driven.  Constructing more than one Driver for a thread is okay;
+trying to drive the same thread with two active Drivers at the same time
+raises `CompetingDriversError`.
+
+Breaking change in 1.1: Driver no longer silently auto-skips nested
+transactions by default.  If a child transaction appears, the Driver
+surfaces it in `nesting` state and waits for scheduler direction.  If the
+driven transaction is running a user callback and that callback asks
+**blanket** for scheduler help, the Driver surfaces that in `reentered`
+state.  The high-level imperatives still opt into autoskip where
+appropriate.
 
 Properties:
 
 - **`driver.thread`** - the thread.
-- **`driver.state`** - the driver state (`None` until first
-  driven).
+- **`driver.base_tx`** - the base transaction, or `None`.
+- **`driver.state`** - the driver state (`None` until first driven).
 - **`driver.tx`** - the current transaction (`None` if none).
 - **`driver.txs`** - tuple of all transactions seen so far.
 - **`driver.done`** - `True` if in a terminal driver state.
 
 Driver has these states:
 
-- `idle`, no tx is observed on the thread.
-- `active`, a tx is observed on the thread, and the driver hasn't
-  been instructed to drive it.
-- `skipping`, driver has been instructed to "skip" (drive to
-  completion) the tx on the thread.  driver will automatically
-  unpark the tx from any scheduler-controlled park state.
-  after the tx finishes, driver transitions back to `idle`.
-- `parking`, driver has been instructed to "park" the tx in a
-  particular tx state.  driver will automatically unpark the
-  tx from any scheduler-controlled park state, until either it
-  reaches the requested tx state, or it overshoots it or finishes,
-  in which case driver raises an error.  if tx parks in the desired
-  state, driver transitions to `parked`.
-- `nesting`, driver has been instructed to drive the tx until
-  a nested transaction springs into existence on top of it
-  (the parent has a child).  driver transitions back to `idle`
-  when this happens, leaving the nested tx as the new current
-  tx on the thread.
-- `finishing`, driver has been instructed to drive the tx until
-  it finishes (reaches a terminal state).  when the tx transitions
-  to `RETURNED` state, driver transitions to `finished`.
-- `parked`, terminal state driver transitions to after successfully `parking`.
-- `finished`, terminal state driver transitions to after successfully `finishing`.
-- `raised`, terminal state driver transitions to if the tx transitions
-   to `RAISED` state.
-- `terminated`, terminal state driver transitions to if the thread terminates.
+- `idle`, no selected tx is observed on the thread.
+- `active`, a selected tx is observed on the thread, and the driver
+  hasn't been instructed to drive it.
+- `skipping`, driver has been instructed to drive the tx to completion.
+- `parking`, driver has been instructed to park the tx in a particular tx
+  state.
+- `finishing`, driver has been instructed to drive the tx until it reaches
+  a terminal state.
+- `nesting`, a nested transaction has surfaced and requires direction.
+- `reentered`, the transaction being driven is running a user callback
+  that has asked **blanket** for scheduler help--for example, a
+  `Condition.wait_for` predicate that calls a regulated primitive.  This
+  normally matters only to code using a `scheduler=` callback.
+- `parked`, terminal state after successfully parking.
+- `finished`, terminal state after successfully finishing.
+- `raised`, terminal state if the tx transitions to `RAISED`.
+- `terminated`, terminal state if the thread terminates.
+- `impasse`, terminal state used when a scoped driver cannot reach its
+  target because the base transaction is parked or gone.
 
-If Driver is in a terminal state, you can reuse it.  If there is no
-tx on the thread, it will transition back to `idle` and wait for a tx
-to spring into existence; if a tx is active on the thread, it will transition
-to `active` and return immediately.  If you call an imperative then
-drive it again, it will transition back into the appropriate driving
-state (`finishing` or `parking`) and continue from there.
-
-Driver also publishes the sets `driving_states`, `active_states`,
-and `terminal_states`, which are `frozenset` objects containing
-those states.
+Driver also publishes the sets `driving_states`, `active_states`, and
+`terminal_states`, which are `frozenset` objects containing those states.
 
 Driver supports several "imperatives"; these are instructions for what
 you want the driver to accomplish when driving the thread.  Note that
 these simply set internal state, instructing Driver what you want done;
-Driver doesn't change any state on a transaction until you let it
-start driving:
+Driver doesn't change any state on a transaction until you let it start
+driving:
 
-- **`driver.skip()`** - let the current transaction complete normally.
-- **`driver.finish()`** - drive the worker to a terminal driver state.
-- **`driver.block()`** - park the worker at the scheduler block,
-  without unblocking.
+- **`driver.skip(autoskip=False)`** - let the current transaction
+  complete normally.
+- **`driver.finish(autoskip=False)`** - drive the worker to a terminal
+  driver state.
+- **`driver.block()`** - park the worker at the scheduler block, without
+  unblocking.
 - **`driver.commit()`** - drive the current transaction to `COMMIT`
   (timeout-bearing only).
 - **`driver.wait()`** - drive the current transaction to `WAITING`
   (waiting-supporting only).
 - **`driver.stall()`** - drive the current transaction to `STALLED`
   (stalling-supporting only).
-- **`driver.pause()`** - drive the current transaction to `PAUSED`.
-- **`driver.nested()`** - drive the current transaction until a
-  nested (child) transaction is created on top of it; used to
-  wait through a transaction's "action" phase, e.g. the user-
-  supplied action callback on `Barrier.wait`.
+- **`driver.pause(autoskip=False)`** - drive the current transaction to
+  `PAUSED`.
 
 Other methods:
 
-- Calling the driver itself (a la `driver()`) drives the driver until
-  the driver needs further instructions: it has succeeded in your
-  requested imperative, it can no longer succeed with your
-  requested imperative, or a new transaction has started and it doesn't
-  know what you want done.
-- **`driver.close()`** tells the driver to stop managing that thread.
-
-A driver only actively manages a thread while it's driving.  When
-you call the driver--or add it to a Chain or Dispatch, and iterate over
-that object--it "owns" the thread, and you can't attach a second Driver
-to the same thread.  You can't drive one thread from two Driver objects
-at once.
-
+- Calling the driver itself (a la `driver()`) drives the driver until the
+  driver needs further instructions: it has succeeded in your requested
+  imperative, it can no longer succeed with your requested imperative, or
+  a new transaction has started and it doesn't know what you want done.
 
 ### Scenario.Chain
 
@@ -2001,9 +2224,9 @@ Methods:
 
 **`scenario.inject(module)`**
 
-Monkey-patch threading-primitive references in `module`. Returns
-an `Injection` handle, which is also a context manager. Raises
-`ValueError` if no patchable references are found.
+Monkey-patch supported `threading` and `queue` primitive references in
+`module`. Returns an `Injection` handle, which is also a context manager.
+Raises `ValueError` if no patchable references are found.
 
 `Injection.close()` restores the pre-inject references.
 
@@ -2035,9 +2258,9 @@ Find an injection location by source text match.
 
 Find an injection location by Python token.
 
-**`Location.bytecode(function, offset, stop=None)`**
+**`Location.bytecode(function, bytecode, *, skip=0, after=None)`**
 
-Find an injection location by raw bytecode offset.
+Find an injection location by bytecode instruction name.
 
 **`inject_call(injected_function, location, *, name='')`**
 
@@ -2054,9 +2277,9 @@ call, and will only resume when you call `ev.set()`.
 
 This is the full state-by-state and method-by-method reference for
 **blanket** transactions.  Most users will only need the breezy
-overview in *Threads And Transactions* near the top of the document;
-this section is for when you want to know exactly what each state
-means and which states a given method visits.
+overview in *Terminology* and *The Three Layers Of The API* near the top
+of the document; this section is for when you want to know exactly what
+each state means and which states a given method visits.
 
 ### Transaction States
 
@@ -2146,10 +2369,12 @@ The same as `Lock`, with reentrancy handled by the underlying real
   the internal lock re-acquire is allowed to proceed.  The lock
   re-acquire is a nested transaction; while it's running,
   `Nested(wait_tx)` signals high.
-- `wait_for(predicate, timeout=None)`: timeout-bearing.  Always
-  nests at least one `Condition.wait` transaction inside.  If the
-  user-supplied `predicate` calls primitive methods, those become
-  nested transactions too.
+- `wait_for(predicate, timeout=None)`: timeout-bearing.  Calls the
+  predicate first.  If the predicate is already true, there is no
+  nested `Condition.wait` at all.  If the predicate is false, it nests
+  `Condition.wait` transactions until the predicate succeeds or the
+  wait times out.  If the user-supplied `predicate` calls primitive
+  methods, those become nested transactions too.
 - `notify(n=1)`, `notify_all()`: pass through after the scheduler
   block.
 
@@ -2157,7 +2382,8 @@ The same as `Lock`, with reentrancy handled by the underlying real
 
 - `acquire(blocking=True, timeout=None)`: timeout-bearing.  Has
   a real `WAITING` when the semaphore counter is zero.
-- `release(n=1)`: passes through.
+- `release(n=1)` where the stdlib supports `n`, otherwise `release()`:
+  passes through.
 
 #### BoundedSemaphore
 
@@ -2175,23 +2401,191 @@ exceed the initial value.
 - `wait(timeout=None)`: timeout-bearing.  Has a real `WAITING`
   for the first `parties - 1` arrivers, until the last party
   arrives.  If the barrier was constructed with an `action`
-  callback, the final arrival's transaction (the *opener*)
-  pushes itself off its thread's transaction chain before running
-  the action.  While pushed, `Action(opener_tx)` signals high,
-  and any primitive calls made by the action appear as fresh
-  root transactions rather than children of the opener.  This
-  means signal tokens like `Nested(opener_tx)` do *not* fire
-  during the action--use `Action(opener_tx)` instead.
+  callback, the final arrival's transaction (the *opener*) runs
+  the action.  **blanket** calls the action with the opener's
+  transaction API object, and `Action(opener_tx)` signals high
+  while that callback is running.  Primitive calls made inside the
+  action become nested transactions under the opener; see *Nested
+  Transactions* above.
+
+  If code inside the action calls a regulated primitive and asks
+  **blanket** for scheduler help, `Barrier.cycle(...,
+  scheduler=scheduler)` calls `scheduler(opener_tx)`.  Use
+  `opener_tx.thread` to tell which thread is doing the asking.
 
   Cycle validation: constructing a `Cycle` on a `Barrier` with
-  a `scheduler` argument (asking the cycle to drive an
-  externally-supplied scheduler-cycle for the action) requires
-  the barrier to have been built with an `action`.  Without one,
-  the constructor raises.
+  a `scheduler` argument requires the barrier to have been built
+  with an `action`.  Without one, the constructor raises.
 - `reset()`, `abort()`: pass through.
+
+
+## Running The Tests
+
+**blanket**'s tests are plain old `unittest` tests.  The standard
+workflow is to run the test-suite driver directly from the repository
+root:
+
+```
+python tests/test_all.py
+```
+
+`test_all.py` is the human-friendly runner.  It runs the common test
+modules plus the version-specific test files that make sense on the
+Python you're currently using.
+
+For coverage, run that same driver.  Pick the config for the Python
+version you're running, and make sure that config is used for `run`,
+`html`, and `report`--otherwise the report step will fall back to the
+generic `.coveragerc` and you'll wonder why the numbers changed.
+
+For example, on Python 3.13:
+
+```
+export COVERAGE_RCFILE=.coveragerc.py313
+coverage erase
+coverage run tests/test_all.py
+coverage html
+coverage report -m
+```
+
+On Python 3.14, use `.coveragerc.py314`.  There are configs for Python
+3.10 through 3.14.  They measure both **blanket** and the tests, and set
+`fail_under = 100`.  The version-specific configs omit test files that
+`test_all.py` correctly doesn't run on that interpreter; for example,
+the Python 3.10 config omits the Python 3.11+ injector tests and the
+Python 3.13+ queue-shutdown tests.
+
+If you want to use coverage's `sysmon` core on a Python that supports it,
+set `COVERAGE_CORE=sysmon` too.  That's a coverage implementation detail,
+not a **blanket** requirement.
+
+You can also run discovery as a sanity check:
+
+```
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+But the official test and coverage path is `tests/test_all.py`.
+
 
 ## Changelog
 
-**0.1** *2026/05/14*
+**1.1**
+
+- Added regulated `queue` support.  `Scenario` now supplies
+  `Queue`, `LifoQueue`, and `PriorityQueue`, and `SimpleQueue` on 3.7+.
+  These are real stdlib queues underneath, with
+  **blanket** regulation wrapped around their public methods.
+    - `scenario.inject()` now supports `queue` as well as `threading`.
+    - The high-level API for queue objects is `deliver()`.  It's something
+      like the `allocate` API for semaphores; you pass in a sequence of
+      thread handles, where each one will next call `get` or `put` (or
+      an equivalent call like a `nowait` version), and `deliver` orchestrates
+      the calls together.
+
+- Added "base_tx" support.  For all APIs where you pass in a thread handle,
+  you can now also pass in a `(thread, base_tx)` tuple.  The tuple form
+  means the API will operate strictly on child transactions of the `base_tx`
+  transaction.  This works with `park`, `skip`,
+  `block`, `pause`, `assign`, `relay`, `allocate`, `deliver`, `cycle`,
+  the per-primitive transaction helpers (`unblock`, `unpause`, `expire`,
+  `disregard`, `revert`, and `ConditionAPI.unstall`), and the `Call` and
+  `Use` signal tokens.
+
+- Changes to `Driver`:
+
+    - Changed `Driver` semantics: nested transactions are no longer automatically
+      silently skipped by default.  Now, when the driver detects a nested
+      transaction, it transitions to `nesting` state and returns to the scheduler
+      for further instructions.  Driver also supports a new `reentered` state,
+      which it enters when the transaction being driven runs a callback; this
+      facilitates using the driver to react to / drive nested transactions on
+      that thread.
+
+    - `Driver` is now more relaxed about multiple drivers operating on the
+      same thread.  You can now have as many as you like, provided that only
+      one is active at a time.
+
+- Changes to `cycle`:
+
+    - Majorly reworked `Condition.cycle()`.  It now handles plain `wait()` and
+      `wait_for()` more carefully, including the case where the first
+      `wait_for` predicate call succeeds immediately and no nested wait ever
+      occurs.  It exposes ready waiters, supports `cycle.wait()` for driving
+      false-predicate `wait_for` wakeups back into the waiting phase, and
+      manages predicate reentry via `scheduler(tx)`.
+
+    - `Barrier.cycle()` and `Condition.cycle()` scheduler callbacks now receive
+      the transaction being reentered: `scheduler(tx)`.  This matters when one
+      cycle object is managing multiple `wait_for` calls or a barrier action;
+      `tx.thread` tells you which thread is asking for scheduler help.
+
+- Changes to other high-level APIs:
+
+    - Reworked `SemaphoreAPI.allocate()`.  It now uses the same traffic-script
+      model as `deliver()`: each participant's next semaphore operation must
+      be `acquire` or `release`, duplicate threads are allowed, and only one
+      semaphore transaction runs at a time.  The old preflight "prove this
+      batch can complete" check is no longer viable; an impossible script
+      now blocks, just like the program you're modeling would block.
+
+    - Removed `scenario.finish()`.  It was too vague--"finish whatever this
+      thread has left to do" sounds convenient, but it overlaps badly with
+      the more explicit Driver and middle-level APIs.
+
+    - Removed the old `wait=` parameter from `scenario.park()` and
+      `scenario.skip()`.  Added the explicit `scenario.block()` and
+      `scenario.pause()` helpers instead.  `park()` is the lenient one
+      (skip unrelated work until the named call appears); `block()` is the
+      strict one (the named call must be next).  `skip()` drives the
+      transaction to a terminal state;
+      `pause()` drives the transaction to `PAUSED` state.
+
+- Changes to `scenario.wait` and signals:
+
+    - Reworked signal handling.  Signals are now self-reporting objects with
+      `sample(scenario)`.  **blanket** no longer keeps references to signaled
+      objects forever, so old signal objects that go out of scope will be
+      collected normally.
+
+    - Removed external wrappers for objects like `Primitive` or `BoundMethod`
+      or `Thread` when working with `scenario.wait()`  These objects are now
+      accepted directly as aggregate signals, by `scenario.wait`, `Not`, etc.
+
+    - `Not(...)` now works with the normal signal forms, including bare
+      threads, bound primitive methods, and bare primitives.  Raw handles and
+      raw bound methods normalize to their corresponding regulated handles.
+
+    - Added `Action(tx)` and `Predicate(tx)` signal support for user callbacks:
+      `Action(tx)` is high while a `Barrier.wait` transaction is running the
+      barrier action, and `Predicate(tx)` is high while a `Condition.wait_for`
+      transaction is running its predicate.
+
+- Tightened stdlib fidelity.  Version-specific APIs such as
+  `queue.SimpleQueue`, `queue.Queue.shutdown`, `queue.ShutDown`,
+  `threading.Condition.locked`, `threading.RLock.locked`,
+  `threading.Semaphore.release(n=...)`, and CPython's old `Lock` legacy
+  aliases appear on **blanket** objects only when the running stdlib has
+  the corresponding feature.
+
+- Added public scenario-side API aliases for `isinstance` checks, including
+  `scenario.Transaction`, `scenario.LockAPI`, `scenario.ConditionAPI`,
+  `scenario.QueueAPI`, and the rest of the primitive API wrapper types.
+
+- `scenario.log` is again read-only, apart from `clear()`.  Scenario exit
+  now leaves the completed transaction log available for post-mortem
+  inspection; the log is cleared on the next scenario entry or explicit
+  `reset()`.
+
+- Updated the injector for newer CPython bytecode shapes while preserving
+  the Python 3.10-and-earlier line-only source-location behavior.
+  `Location.bytecode()` now documents the instruction-name API, and the
+  old line/column behavior is covered by version-specific tests.
+
+- Updated the test suite substantially.  The project now has
+  version-specific coverage configs for CPython 3.10 through 3.14, using
+  `tests/test_all.py` as the official test driver.
+
+**1.0** *2026/05/14*
 
 - Initial release!

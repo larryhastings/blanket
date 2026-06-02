@@ -44,206 +44,239 @@ def export(o):
     return o
 
 
-version_info = sys.version_info[0:2]
-
-# Version detection for feature availability
-_python_3_8_plus  = sys.version_info >= (3,  8)
+# Version detection for feature availability.
 _python_3_11_plus = sys.version_info >= (3, 11)
 _python_3_12_plus = sys.version_info >= (3, 12)
-_python_3_13_plus = sys.version_info >= (3, 13)
 
 
-# Version-specific implementations
+# Version-specific implementations.
+#
+# Define both sides of compatibility branches where the implementation
+# can run on modern Python, then bind the public helper name once at
+# module import time.  This keeps the hot path free of per-call version
+# checks, preserves the public helper's __name__ for introspection, and
+# lets tests call the old implementation directly when it is not tied to
+# old-interpreter bytecode opcodes.
 
-if _python_3_11_plus:
-    # Python 3.11+ implementations
-    
-    def _instr_line_column(function):
-        """Yield (instruction, line, column) tuples for Python 3.11+.
 
-        Closures' prologue instructions (COPY_FREE_VARS, MAKE_CELL)
-        have no source position; emit None for line/column on those
-        so callers can skip them.  The code object is considered
-        corrupt only if NO instruction has position info."""
-        line = function.__code__.co_firstlineno
+def _instr_line_column(function):
+    """
+    Yield (instruction, line, column) tuples for Python 3.10-.
 
-        if line < 1:
-            raise ValueError(f"Function has corrupt code object: co_firstlineno={line}")
+    Provides accurate line information but column is always 0.
+    Line numbers are carried forward when an instruction doesn't have
+    starts_line.
+    """
+    line = function.__code__.co_firstlineno
 
-        # Validate the code object has at least one instruction with
-        # position info.  A closure's prologue (COPY_FREE_VARS, etc.)
-        # has no source position, which is normal; but a fabricated
-        # function with no positions anywhere is what this check
-        # guards against.
-        for instr in dis.get_instructions(function):
-            positions = instr.positions
-            if positions.lineno is not None and positions.col_offset is not None:
-                break
-        else:
-            raise ValueError(
-                f"Function has corrupt code object: no instruction has position information. "
-                f"If you created this function using a library like bytecode, use Location.bytecode() "
-                f"instead of Location.text(), Location.token(), or Location.position()."
-            )
+    for instr in dis.get_instructions(function):
+        starts_line = instr.starts_line
+        if isinstance(starts_line, bool):
+            # Python 3.13 changed starts_line from a line-number-or-None
+            # value to a boolean, with the actual line in line_number.
+            # Preserve the Python 3.10-style carry-forward semantics when
+            # this old helper is tested on modern Python.
+            if starts_line:
+                line = instr.line_number
+        elif starts_line is not None:
+            line = starts_line
+        yield (instr, line, 0)
 
-        # Yield every instruction (including prologue ones with None
-        # positions) so caller indices align with Bytecode.from_code
-        # list order.  Callers skip None-positioned entries when
-        # checking against source ranges.
-        for instr in dis.get_instructions(function):
-            positions = instr.positions
-            yield (instr, positions.lineno, positions.col_offset)
-    
-    def _validate_match_at_line_start(source_line, column, search_string, caller_name, search_type):
-        """Validate match position for Python 3.11+ (no restrictions)."""
-        pass
-    
-    def _text_position_to_search_start_position(absolute_line, function_start_line, match_start_col, containing_token):
-        """Convert text match position to bytecode search start position for Python 3.11+."""
-        return (absolute_line, match_start_col)
-    
-    def _find_bytecode_range_for_source_range(function, start_line, start_col, end_line, end_col):
-        """
-        Find bytecode instructions whose source positions fall within the given source range,
-        and return the span from the earliest to the latest such instruction.
-        
-        Python 3.11+ version with precise column checking.
-        
-        Args:
-            function: The function
-            start_line: Starting line (absolute)
-            start_col: Starting column
-            end_line: Ending line (absolute)
-            end_col: Ending column (exclusive)
-        
-        Returns (first_offset, stop_offset) where:
-            first_offset: offset of first instruction in the range
-            stop_offset: offset after the last instruction in the range
-        
-        Returns (None, None) if no instructions found in range.
-        """
-        bc = _instr_line_column(function)
-        matching_offsets = []
-        
-        for i, (instr, instr_line, instr_col) in enumerate(bc):
-            # Prologue instructions (COPY_FREE_VARS, etc.) carry no
-            # source position; they can't be part of any source range.
-            if instr_line is None or instr_col is None:
-                continue
-            # Check if instruction position is within source range
-            # Position (line, col) is in range if:
-            # start <= position < end (lexicographically)
-            if start_line < instr_line < end_line:
-                in_range = True
-            elif instr_line == start_line and instr_line == end_line:
-                in_range = start_col <= instr_col < end_col
-            elif instr_line == start_line:
-                in_range = instr_col >= start_col
-            elif instr_line == end_line:
-                in_range = instr_col < end_col
-            else:
-                continue  # in_range = False
-                
-            if in_range:
-                matching_offsets.append(i)
-        
-        if not matching_offsets:
-            return (None, None)
-        
-        return (min(matching_offsets), max(matching_offsets) + 1)
-    
-    if _python_3_12_plus:
-        def _insert_call_bytecode(bc, offset, func_name, line_info):
-            """Insert function call bytecode for Python 3.12+ (PRECALL removed in 3.12)"""
-            bc.insert(offset, Instr("LOAD_GLOBAL", (True, func_name), lineno=line_info))
-            bc.insert(offset + 1, Instr("CALL", 0, lineno=line_info))
-            bc.insert(offset + 2, Instr("POP_TOP", lineno=line_info))
+_instr_line_column_py310_minus = _instr_line_column
+
+
+def _instr_line_column(function):
+    """Yield (instruction, line, column) tuples for Python 3.11+.
+
+    Closures' prologue instructions (COPY_FREE_VARS, MAKE_CELL)
+    have no source position; emit None for line/column on those so
+    callers can skip them.  The code object is considered corrupt only
+    if NO instruction has position info.
+    """
+    line = function.__code__.co_firstlineno
+
+    if line < 1:
+        raise ValueError(f"Function has corrupt code object: co_firstlineno={line}")
+
+    # Validate the code object has at least one instruction with
+    # position info.  A closure's prologue (COPY_FREE_VARS, etc.) has
+    # no source position, which is normal; but a fabricated function
+    # with no positions anywhere is what this check guards against.
+    for instr in dis.get_instructions(function):
+        positions = instr.positions
+        if positions.lineno is not None and positions.col_offset is not None:
+            break
     else:
-        def _insert_call_bytecode(bc, offset, func_name, line_info):
-            """Insert function call bytecode for Python 3.11 only (PRECALL+CALL pair)"""
-            bc.insert(offset, Instr("LOAD_GLOBAL", (True, func_name), lineno=line_info))
-            bc.insert(offset + 1, Instr("PRECALL", 0, lineno=line_info))
-            bc.insert(offset + 2, Instr("CALL", 0, lineno=line_info))
-            bc.insert(offset + 3, Instr("POP_TOP", lineno=line_info))
+        raise ValueError(
+            f"Function has corrupt code object: no instruction has position information. "
+            f"If you created this function using a library like bytecode, use Location.bytecode() "
+            f"instead of Location.text(), Location.token(), or Location.position()."
+        )
 
-else:  # pragma: nocover
-    # Python 3.10- implementations
-    
-    def _instr_line_column(function):
-        """
-        Yield (instruction, line, column) tuples for Python 3.10-.
-        
-        Provides accurate line information but column is always 0.
-        Line numbers are carried forward when an instruction doesn't have starts_line.
-        """
-        line = function.__code__.co_firstlineno
-        
-        for instr in dis.get_instructions(function):
-            if instr.starts_line is not None:
-                line = instr.starts_line
-            column = 0
-            yield (instr, line, column)
-    
-    def _validate_match_at_line_start(source_line, column, search_string, caller_name, search_type):
-        """Validate that match is at line start for Python 3.10-."""
-        # Find first non-whitespace column
-        stripped = source_line.lstrip()
-        if not stripped:
-            # Empty line or whitespace-only
-            return
-        first_non_ws_col = len(source_line) - len(stripped)
-        
-        if column != first_non_ws_col:
-            raise ValueError(
-                f"On Python 3.10 and earlier, {caller_name}() "
-                f"can only search for {search_type} at the beginning of a line (after indentation). "
-                f"Searching for '{search_string}' at column {column} is not supported. "
-                f"Use Python 3.11+ for fine-grained column matching."
-            )
-    
-    def _text_position_to_search_start_position(absolute_line, function_start_line, match_start_col, containing_token):
-        """Convert text match position to bytecode search start position for Python 3.10-."""
-        search_start_line = function_start_line + containing_token.start[0] - 1
-        search_start_col = containing_token.start[1]
-        return (search_start_line, search_start_col)
-    
-    def _find_bytecode_range_for_source_range(function, start_line, start_col, end_line, end_col):
-        """
-        Find bytecode instructions whose source positions fall within the given source range,
-        and return the span from the earliest to the latest such instruction.
-        
-        Python 3.10- version with line-level only checking.
-        
-        Args:
-            function: The function
-            start_line: Starting line (absolute)
-            start_col: Starting column (ignored, line-level only)
-            end_line: Ending line (absolute)
-            end_col: Ending column (ignored, line-level only)
-        
-        Returns (first_offset, stop_offset) where:
-            first_offset: offset of first instruction in the range
-            stop_offset: offset after the last instruction in the range
-        
-        Returns (None, None) if no instructions found in range.
-        """
-        bc = _instr_line_column(function)
-        matching_offsets = []
-        
-        for i, (instr, instr_line, instr_col) in enumerate(bc):
-            if start_line <= instr_line <= end_line:
-                matching_offsets.append(i)
-        
-        if not matching_offsets:
-            return (None, None)
-        
-        return (min(matching_offsets), max(matching_offsets) + 1)
-    
-    def _insert_call_bytecode(bc, offset, func_name, line_info):
-        """Insert function call bytecode for Python 3.10 and earlier"""
-        bc.insert(offset, Instr("LOAD_GLOBAL", func_name, lineno=line_info))
-        bc.insert(offset + 1, Instr("CALL_FUNCTION", 0, lineno=line_info))
-        bc.insert(offset + 2, Instr("POP_TOP", lineno=line_info))
+    # Yield every instruction (including prologue ones with None
+    # positions) so caller indices align with Bytecode.from_code list
+    # order.  Callers skip None-positioned entries when checking
+    # against source ranges.
+    for instr in dis.get_instructions(function):
+        positions = instr.positions
+        yield (instr, positions.lineno, positions.col_offset)
+
+_instr_line_column_py311_plus = _instr_line_column
+_instr_line_column = (_instr_line_column_py311_plus
+                      if _python_3_11_plus else
+                      _instr_line_column_py310_minus)
+
+
+def _validate_match_at_line_start(source_line, column, search_string, caller_name, search_type):
+    """Validate that match is at line start for Python 3.10-."""
+    stripped = source_line.lstrip()
+    if not stripped:
+        # Empty line or whitespace-only.
+        return
+    first_non_ws_col = len(source_line) - len(stripped)
+
+    if column != first_non_ws_col:
+        raise ValueError(
+            f"On Python 3.10 and earlier, {caller_name}() "
+            f"can only search for {search_type} at the beginning of a line (after indentation). "
+            f"Searching for '{search_string}' at column {column} is not supported. "
+            f"Use Python 3.11+ for fine-grained column matching."
+        )
+
+_validate_match_at_line_start_py310_minus = _validate_match_at_line_start
+
+
+def _validate_match_at_line_start(source_line, column, search_string, caller_name, search_type):
+    """Validate match position for Python 3.11+ (no restrictions)."""
+
+_validate_match_at_line_start_py311_plus = _validate_match_at_line_start
+_validate_match_at_line_start = (_validate_match_at_line_start_py311_plus
+                                 if _python_3_11_plus else
+                                 _validate_match_at_line_start_py310_minus)
+
+
+def _text_position_to_search_start_position(absolute_line, function_start_line, match_start_col, containing_token):
+    """Convert text match position to bytecode search start position for Python 3.10-."""
+    search_start_line = function_start_line + containing_token.start[0] - 1
+    search_start_col = containing_token.start[1]
+    return (search_start_line, search_start_col)
+
+_text_position_to_search_start_position_py310_minus = _text_position_to_search_start_position
+
+
+def _text_position_to_search_start_position(absolute_line, function_start_line, match_start_col, containing_token):
+    """Convert text match position to bytecode search start position for Python 3.11+."""
+    return (absolute_line, match_start_col)
+
+_text_position_to_search_start_position_py311_plus = _text_position_to_search_start_position
+_text_position_to_search_start_position = (_text_position_to_search_start_position_py311_plus
+                                           if _python_3_11_plus else
+                                           _text_position_to_search_start_position_py310_minus)
+
+
+def _find_bytecode_range_for_source_range(function, start_line, start_col, end_line, end_col):
+    """
+    Find bytecode instructions whose source positions fall within the
+    given source range, and return the span from the earliest to the
+    latest such instruction.
+
+    Python 3.10- version with line-level only checking.  Columns are
+    intentionally ignored.
+    """
+    bc = _instr_line_column_py310_minus(function)
+    matching_offsets = []
+
+    for i, (instr, instr_line, instr_col) in enumerate(bc):
+        if start_line <= instr_line <= end_line:
+            matching_offsets.append(i)
+
+    if not matching_offsets:
+        return (None, None)
+
+    return (min(matching_offsets), max(matching_offsets) + 1)
+
+_find_bytecode_range_for_source_range_py310_minus = _find_bytecode_range_for_source_range
+
+
+def _find_bytecode_range_for_source_range(function, start_line, start_col, end_line, end_col):
+    """
+    Find bytecode instructions whose source positions fall within the
+    given source range, and return the span from the earliest to the
+    latest such instruction.
+
+    Python 3.11+ version with precise column checking.
+    """
+    bc = _instr_line_column_py311_plus(function)
+    matching_offsets = []
+
+    for i, (instr, instr_line, instr_col) in enumerate(bc):
+        # Prologue instructions (COPY_FREE_VARS, etc.) carry no source
+        # position; they can't be part of any source range.
+        if instr_line is None or instr_col is None:
+            continue
+        # Position (line, col) is in range if:
+        # start <= position < end (lexicographically)
+        if start_line < instr_line < end_line:
+            in_range = True
+        elif instr_line == start_line and instr_line == end_line:
+            in_range = start_col <= instr_col < end_col
+        elif instr_line == start_line:
+            in_range = instr_col >= start_col
+        elif instr_line == end_line:
+            in_range = instr_col < end_col
+        else:
+            continue
+
+        if in_range:
+            matching_offsets.append(i)
+
+    if not matching_offsets:
+        return (None, None)
+
+    return (min(matching_offsets), max(matching_offsets) + 1)
+
+_find_bytecode_range_for_source_range_py311_plus = _find_bytecode_range_for_source_range
+_find_bytecode_range_for_source_range = (_find_bytecode_range_for_source_range_py311_plus
+                                         if _python_3_11_plus else
+                                         _find_bytecode_range_for_source_range_py310_minus)
+
+
+# The injected-call bytecode is genuinely interpreter-specific: old
+# opcodes are not valid for the current bytecode package on new Python.
+# Keep these helpers in the same binding-time shape.  Unit tests can
+# verify their instruction shapes with fake Instr objects, but full
+# integration coverage still belongs on the interpreters whose bytecode
+# actually supports those opcodes.
+def _insert_call_bytecode(bc, offset, func_name, line_info):
+    """Insert function call bytecode for Python 3.10 and earlier."""
+    bc.insert(offset, Instr("LOAD_GLOBAL", func_name, lineno=line_info))
+    bc.insert(offset + 1, Instr("CALL_FUNCTION", 0, lineno=line_info))
+    bc.insert(offset + 2, Instr("POP_TOP", lineno=line_info))
+
+_insert_call_bytecode_py310_minus = _insert_call_bytecode
+
+
+def _insert_call_bytecode(bc, offset, func_name, line_info):
+    """Insert function call bytecode for Python 3.11 only."""
+    bc.insert(offset, Instr("LOAD_GLOBAL", (True, func_name), lineno=line_info))
+    bc.insert(offset + 1, Instr("PRECALL", 0, lineno=line_info))
+    bc.insert(offset + 2, Instr("CALL", 0, lineno=line_info))
+    bc.insert(offset + 3, Instr("POP_TOP", lineno=line_info))
+
+_insert_call_bytecode_py311 = _insert_call_bytecode
+
+
+def _insert_call_bytecode(bc, offset, func_name, line_info):
+    """Insert function call bytecode for Python 3.12+ (PRECALL removed)."""
+    bc.insert(offset, Instr("LOAD_GLOBAL", (True, func_name), lineno=line_info))
+    bc.insert(offset + 1, Instr("CALL", 0, lineno=line_info))
+    bc.insert(offset + 2, Instr("POP_TOP", lineno=line_info))
+
+_insert_call_bytecode_py312_plus = _insert_call_bytecode
+
+_insert_call_bytecode_options = (_insert_call_bytecode_py310_minus, _insert_call_bytecode_py311, _insert_call_bytecode_py312_plus)
+_insert_call_bytecode = _insert_call_bytecode_options[int(_python_3_11_plus) + int(_python_3_12_plus)]
+del _insert_call_bytecode_options
 
 
 def _find_statement_end(tokens):
@@ -318,44 +351,61 @@ class Location:
     @classmethod
     def position(cls, function, line, column=1):
         """
-        Find injection location by line and column position.
-        
-        Args:
-            function: The function to inject into
-            line: Relative line number within the function (1-based)
-            column: Column within the line (1-based, default 1)
-        
-        Returns:
-            Location object representing the single instruction at that position
+        Find injection location by line position on Python 3.10 and earlier.
+
+        Python 3.10 and earlier expose line information but not useful
+        source columns, so only column 1 is supported.
         """
-        # Validate line is within function
         source_lines = inspect.getsource(function).splitlines()
         if not (1 <= line <= len(source_lines)):
             raise ValueError(f"Line {line} is outside function range (1-{len(source_lines)})")
-        
-        # On Python 3.10-, only column=1 is supported
-        if not _python_3_11_plus and column != 1:  # pragma: no cover
+
+        if column != 1:
             raise ValueError(
                 f"On Python 3.10 and earlier, Location.position() only supports column=1. "
                 f"Column {column} is not supported. Use Python 3.11+ for fine-grained column positioning."
             )
-        
-        # Convert relative line to absolute line
+
         absolute_line = function.__code__.co_firstlineno + line - 1
-        
-        # Find bytecode at this position
-        bc = list(_instr_line_column(function))
-        for i, (instr, instr_line, instr_col) in enumerate(bc):
+        for i, (instr, instr_line, instr_col) in enumerate(_instr_line_column_py310_minus(function)):
+            if instr_line >= absolute_line:
+                return cls(function, i, i + 1)
+
+        raise ValueError(f"No bytecode was compiled from text at line {line}, column {column}")
+
+    _position_py310_minus = position
+
+    @classmethod
+    def position(cls, function, line, column=1):
+        """
+        Find injection location by line and column position.
+
+        Args:
+            function: The function to inject into
+            line: Relative line number within the function (1-based)
+            column: Column within the line (1-based, default 1)
+
+        Returns:
+            Location object representing the single instruction at that position
+        """
+        source_lines = inspect.getsource(function).splitlines()
+        if not (1 <= line <= len(source_lines)):
+            raise ValueError(f"Line {line} is outside function range (1-{len(source_lines)})")
+
+        absolute_line = function.__code__.co_firstlineno + line - 1
+        for i, (instr, instr_line, instr_col) in enumerate(_instr_line_column_py311_plus(function)):
             # Prologue instructions (closure setup) carry no source
             # position; they can't satisfy a line/column query.
             if instr_line is None or instr_col is None:
                 continue
             if (instr_line == absolute_line and instr_col >= column) or (instr_line > absolute_line):
                 return cls(function, i, i + 1)
-        
-        # No instruction found
+
         raise ValueError(f"No bytecode was compiled from text at line {line}, column {column}")
-    
+
+    _position_py311_plus = position
+    position = _position_py311_plus if _python_3_11_plus else _position_py310_minus
+
     @classmethod
     def text(cls, function, text, *, skip=0, after=None):
         """
@@ -386,7 +436,7 @@ class Location:
         # Tokenize the source
         try:
             tokens = deque(tokenize.tokenize(io.BytesIO(source.encode('utf-8')).readline))
-        except tokenize.TokenError as e:  # pragma: nocover
+        except tokenize.TokenError as e:
             raise tokenize.TokenError(
                 f"Tokenization failed for {function.__code__.co_filename}. "
                 f"Did you change the file while this test was running? "
@@ -418,11 +468,14 @@ class Location:
                     if tok_line < absolute_line or (tok_line == absolute_line and tok_end_col <= match_start_col):
                         # Token is before our match, discard it
                         tokens.popleft()
-                    elif tok_line > absolute_line:
-                        # Token is on a future line, leave it for later
+                    elif tok_line > absolute_line or tok_start_col > match_start_col:
+                        # Token is after our match; the match is not inside a token.
                         break
-                    elif tok_line == absolute_line and tok_start_col <= match_start_col < tok_end_col:
-                        # Found the containing token!
+                    else:
+                        # The earlier branches rejected tokens before or after
+                        # the match; whatever remains must contain it.
+                        assert tok_line == absolute_line
+                        assert tok_start_col <= match_start_col < tok_end_col
                         containing_token = tokens.popleft()
                         break
                 
@@ -498,7 +551,7 @@ class Location:
         
         try:
             tokens = deque(tokenize.tokenize(io.BytesIO(source.encode('utf-8')).readline))
-        except tokenize.TokenError as e:  # pragma: nocover
+        except tokenize.TokenError as e:
             raise tokenize.TokenError(
                 f"Tokenization failed for {function.__code__.co_filename}. "
                 f"Did you change the file while this test was running? "

@@ -26,6 +26,7 @@ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 from collections import defaultdict, deque, Counter
+import inspect
 import math
 import queue
 import threading
@@ -50,7 +51,18 @@ delete('base')
 
 
 _current_time = time.perf_counter
+
+_lock_provides_legacy_aliases = hasattr(threading.Lock(), 'acquire_lock')
 _rlock_provides_locked = hasattr(threading.RLock(), 'locked')
+_condition_provides_locked = hasattr(threading.Condition(), 'locked')
+_queue_provides_simplequeue = hasattr(queue, 'SimpleQueue')
+_queue_provides_shutdown = hasattr(queue.Queue, 'shutdown')
+_semaphore_release_accepts_n = 'n' in inspect.signature(threading.Semaphore.release).parameters
+
+if _queue_provides_simplequeue:
+    _queue_primitive_names = ('SimpleQueue', 'Queue', 'LifoQueue', 'PriorityQueue')
+else:
+    _queue_primitive_names = ('Queue', 'LifoQueue', 'PriorityQueue')
 
 
 
@@ -80,23 +92,21 @@ class unlock:
         return False
 
 
-def _do_nothing():
-    pass  # pragma: no cover -- sentinel; callers do `is _do_nothing` checks
+def _do_nothing(tx):
+    pass
+
+
+class _Raw:
+    "Mixin class for raw handles."
+    pass
+
 
 
 class ImmutableSequence(tuple):
     """Base class for blanket's immutable sequence types.  Subclass of tuple.
 
-    tuple's built-in __eq__ and __hash__ basically ignores the instance's type.
-    It just does what's internally called a "fast subclass check", and since
-    ImmutableSequence and its descendents are subclasses of tuple, that passes,
-    and so tuple ignores the fact that the types don't actually match and just
-    compares the elements.  This means distinct subclasses with identical
-    element values would compare equal, and hash the same (e.g. Terminated(t)
-    and Nested(t) are both the tuple (t,)).  ImmutableSequence fixes this by
-    implementing its own hash and equality tests.  (We have to implement all
-    six rich compare operators, lest one falls through the cracks and gets
-    handled by our base class, tuple.)
+    Implements rich comparison and hash, because otherweise we get the
+    tuple base class versions which ignore the type.
     """
     __slots__ = ()
 
@@ -193,27 +203,32 @@ class ImmutableTransactionSignalToken(ImmutableSignalToken):
 
 @export
 class Signaling:
-    """Marker base class for self-reporting signals.
+    """Base class for self-reporting signals.
 
-    Every** signaling item in blanket is a subclass of Signaling.
-    Signaling has a `signal` attribute returning True when the
-    signal is currently high, False otherwise.
+    Every custom signaling object in blanket is
+    a subclass of Signaling. It only defines two methods:
 
-    - scenario.wait queries o.signal when it's fist called.  If
-      o.signal is True, we return it immediately, otherwise we wait.
-    - score.signal(o) confirms o.sample is True at call time, then
-      wakes any waiters parked on o.
+        Signaling.sample(scenario)
 
-    Notably, blanket no longer tracks o anywhere between calls.
-    No reference to o is kept in the score; the next call to wait(o)
-    re-queries o.signal.  This means we don't keep lingering
-    references to old Signaling things (Terminated(ancient_thread),
-    prehistoric_tx).  When the user drops their references, the
-    objec
+            Returns True when the signal is currently high,
+            False otherwise.
 
-    ** Thread objects and bound method objects obviously aren't
-    subclasses of Signaling.  For a handful of exceptions like
-    these, scenario.wait auto-boxes and unboxes 'em.
+        Signaling.normalizaed()
+
+            Returns the "normalized" form of this signal,
+            converting raw handles (and bound method objects
+            referencing them) into their "cooked" primitive
+            equivalents.
+
+
+    This design means the scenario doesn't need to retain references
+    to signaled objects.  (In older versions of blanket, objects
+    that remained signaled forever lived forever in a dict called
+    score.signaled.)
+
+    Thread objects, bound method objects, and primitives
+    are obviously not subclasses of Signaling.  Those are automatically
+    boxed/unboxed by scenario.wait.
     """
     __slots__ = ()
 
@@ -222,152 +237,219 @@ class Signaling:
         raise NotImplementedError
 
     def normalized(self):
-        """Return the normalized form of this signal: raw primitive
-        and raw bound-method references are normalized to their
-        cooked-primitive equivalents.  The default is identity;
-        signals that wrap a primitive or bound method override.
-        """
+        "Returns the normalized (not raw) form of this signaling object."
         return self
-
-
-def _normalize_method(method):
-    """Normalize a bound method to its normalized form: a Condition's
-    lock-shared method (acquire/release/locked) collapses to the
-    underlying lock's cooked method, and any raw-handle method
-    collapses to its cooked-primitive method.  Condition-only methods
-    (wait/wait_for/notify...) have no lock counterpart and just cook.
-    """
-    core = method.__self__._core
-    underlying = getattr(core, 'underlying', None)
-    if underlying is not None:
-        # Condition: collapse to the lock's same-named method if it
-        # has one.  getattr probes the lock so only genuinely shared
-        # methods (acquire/release/locked) collapse; the rest fall
-        # through and cook on the condition.
-        lock_method = getattr(underlying.primitive, method.__name__, None)
-        if lock_method is not None:
-            return lock_method
-    primitive = core.primitive
-    if method.__self__ is primitive:
-        return method
-    return getattr(primitive, method.__name__)
-
-
-def _normalize_primitive(primitive):
-    "Normalize a raw handle to its cooked primitive; cooked stays put."
-    return primitive._core.primitive
 
 
 @export
 class Use(Signaling, ImmutableThreadSignalToken):
     """A level signal that goes high whenever a thread uses a primitive.
 
-    A Use signals while its 'thread' has any transaction on
-    'primitive' in its call chain.
+    A Use signals while its thread has any transaction on ``primitive``
+    in its call chain.  Passing ``(thread, base_tx)`` as the first
+    argument scopes the signal to descendant transactions under
+    ``base_tx``; the base transaction itself is not selected.
 
     ("Use" is the noun form here--Use rhymes with "moose", not "booze".)
     """
     __slots__ = ()
 
-    def __new__(cls, thread, primitive):
-        if not isinstance(thread, threading.Thread):
-            raise TypeError(f"Use expected a thread, got {thread!r}")
-        return tuple.__new__(cls, (thread, primitive))
+    def __new__(cls, thread_or_tuple, primitive):
+        thread, base_tx = _parse_thread_scope(thread_or_tuple, "Use")
+        if not isinstance(primitive, Scenario.Primitive):
+            raise TypeError(
+                f"Use expected a primitive, got {primitive!r}")
+        return tuple.__new__(cls, (thread, base_tx, primitive))
+
+    @property
+    def base_tx(self):
+        return self[1]
 
     @property
     def primitive(self):
-        return self[1]
+        return self[2]
+
+    @property
+    def thread_scope(self):
+        base_tx = self.base_tx
+        if base_tx is None:
+            return self.thread
+        return (self.thread, base_tx)
+
+    def matching_tx(self, scenario):
+        """Return a transaction selected by this Use, or None.
+
+        For an unscoped Use, this is the innermost active transaction
+        using the primitive.  For a scoped Use, only descendants of the
+        base transaction are considered.
+        """
+        outer = self.primitive._core.primitive
+        tx = scenario._core.transactions.get(self.thread)
+        base_tx = self.base_tx
+        if base_tx is None:
+            while tx is not None:
+                if outer in tx.use_primitives:
+                    return tx
+                tx = tx.parent
+            return None
+
+        base_core = base_tx._core
+        while tx is not None and tx is not base_core:
+            if outer in tx.use_primitives:
+                return tx
+            tx = tx.parent
+        return None
 
     def sample(self, scenario):
-        # Walks thread's tx chain looking for any tx whose
-        # use_primitives set contains our (normalized) primitive.
-        core = self.primitive._core
-        outer = core.primitive
-        score = scenario._core
-        tx = score.transactions.get(self.thread)
-        while tx is not None:
-            if outer in tx.use_primitives:
-                return True
-            tx = tx.parent
-        return False
+        return self.matching_tx(scenario) is not None
 
     def __repr__(self):
-        return f"Use({self.thread.name!r}, {self.primitive!r})"
+        base_tx = self.base_tx
+        if base_tx is None:
+            scope_repr = repr(self.thread.name)
+        else:
+            scope_repr = f"({self.thread.name!r}, {base_tx!r})"
+        return f"Use({scope_repr}, {self.primitive!r})"
 
     def normalized(self):
-        cooked = _normalize_primitive(self.primitive)
+        core = self.primitive._core
+        cooked = core.normalize(self.primitive)
         if cooked is self.primitive:
             return self
-        return Use(self.thread, cooked)
+        return Use(self.thread_scope, cooked)
+
+
+def _parse_thread_scope(scope, caller):
+    """Parse a signal thread scope.
+
+    Public signal APIs accept either a bare thread, or a strict two-tuple
+    ``(thread, base_tx)``.  The tuple form scopes the signal to descendant
+    transactions underneath ``base_tx``.
+    """
+    if isinstance(scope, threading.Thread):
+        return (scope, None)
+
+    if type(scope) is not tuple:
+        raise TypeError(f"{caller} expected a thread or (thread, base_tx), got {scope!r}")
+    if len(scope) != 2:
+        raise TypeError(
+            f"{caller} thread/base spec must be a 2-tuple "
+            f"(thread, base_tx), got {scope!r}")
+
+    thread, base_tx = scope
+    if not isinstance(thread, threading.Thread):
+        raise TypeError(
+            f"{caller} first item in thread/base spec must be a thread, "
+            f"got {thread!r}")
+    if not isinstance(base_tx, Scenario._ScenarioCore.TransactionAPI):
+        raise TypeError(
+            f"{caller} second item in thread/base spec must be a transaction, "
+            f"got {base_tx!r}")
+    base_core = base_tx._core
+    if base_core.thread is not thread:
+        raise ValueError(
+            f"{caller} base tx belongs to thread "
+            f"{base_core.thread.name!r}, not {thread.name!r}")
+    return scope
 
 
 @export
 class Call(Signaling, ImmutableThreadSignalToken):
     """A level signal that goes high whenever a thread is calling a method.
 
-    A Call signals while its 'thread' is calling 'method', optionally only
-    while in transaction state 'state'.  (If 'state' is None, signals while
-    the method call is in any state.)  'depth' distinguishes recursive calls
-    to the same method on the same thread; the lowest one on the stack is
-    at depth 0.  (The only possible *recursive* call is Condition.wait_for.)
+    A Call signals while its thread is calling ``method``, optionally only
+    while in transaction state ``state``.  Passing ``(thread, base_tx)`` as
+    the first argument scopes the signal to descendant transactions under
+    ``base_tx``; the base transaction itself is not selected.
     """
     __slots__ = ()
 
-    def __new__(cls, thread, method, state=None, *, depth=0):
-        if not isinstance(thread, threading.Thread):
-            raise TypeError(f"Call expected a thread, got {thread!r}")
+    def __new__(cls, thread_or_tuple, method, state=None):
+        thread, base_tx = _parse_thread_scope(thread_or_tuple, "Call")
         if not callable(method):
             raise TypeError(f"Call expected a callable method, got {method!r}")
-        if not isinstance(depth, int):
-            raise TypeError(f"Call expected an integer depth, got {depth!r}")
-        if depth < 0:
-            raise ValueError(f"Call depth must be >= 0, got {depth!r}")
         primitive = getattr(method, '__self__', None)
         if primitive is None or not hasattr(primitive, '_core'):
             raise TypeError(
                 f"Call expected a bound method on a regulated "
                 f"primitive, got {method!r}")
-        return tuple.__new__(cls, (thread, method, state, depth))
+        return tuple.__new__(cls, (thread, base_tx, method, state))
 
     @property
-    def method(self):
+    def base_tx(self):
         return self[1]
 
     @property
-    def state(self):
+    def method(self):
         return self[2]
 
     @property
-    def depth(self):
+    def state(self):
         return self[3]
 
-    def sample(self, scenario):
-        thread, method, state, depth = self
-        score = scenario._core
-        # Walk the thread's chain from leaf to root looking for a tx
-        # calling this method (or a cooked alias) at recursion `depth`.
-        # tx.depth is the per-method recursion depth (set at open as
-        # method_parent.depth + 1), so we match on (method, depth).
-        tx = score.transactions.get(thread)
-        while tx is not None:
-            if depth == tx.depth and method in tx.call_methods():
-                if state is None:
-                    return True
-                return tx.state == state
-            tx = tx.parent
+    @property
+    def thread_scope(self):
+        base_tx = self.base_tx
+        if base_tx is None:
+            return self.thread
+        return (self.thread, base_tx)
+
+    @staticmethod
+    def _scoped_tx_selected(tx, base_core, method):
+        """Return True if tx is selected by (thread, base_tx), method.
+
+        The base transaction is a scope, not a target.  Recursive calls to
+        the same method shadow older same-method ancestors, preserving the
+        useful part of the old public ``depth`` argument.
+        """
+        cur = tx.parent
+        while cur is not None:
+            if cur is base_core:
+                return True
+            if method in cur.call_methods():
+                return False
+            cur = cur.parent
         return False
+
+    def matching_tx(self, scenario):
+        """Return the transaction this Call currently selects, or None.
+
+        For an unscoped Call, this is the innermost active matching
+        transaction.  For a scoped Call, same-method descendants shadow
+        older same-method descendants inside the base transaction.
+        """
+        thread, base_tx, method, state = self
+        tx = scenario._core.transactions.get(thread)
+        base_core = None if base_tx is None else base_tx._core
+        while tx is not None:
+            if method in tx.call_methods():
+                if base_core is None or self._scoped_tx_selected(tx, base_core, method):
+                    if state is None or tx.state == state:
+                        return tx
+                    if base_core is not None:
+                        return None
+            tx = tx.parent
+        return None
+
+    def sample(self, scenario):
+        return self.matching_tx(scenario) is not None
 
     def __repr__(self):
         method_name = getattr(self.method, '__name__', repr(self.method))
         state_repr = "" if self.state is None else f" state={self.state.name}"
-        depth_repr = "" if self.depth == 0 else f" depth={self.depth}"
-        return f"Call({self.thread.name!r}, {method_name}{state_repr}{depth_repr})"
+        base_tx = self.base_tx
+        if base_tx is None:
+            scope_repr = repr(self.thread.name)
+        else:
+            scope_repr = f"({self.thread.name!r}, {base_tx!r})"
+        return f"Call({scope_repr}, {method_name}{state_repr})"
 
     def normalized(self):
-        cooked = _normalize_method(self.method)
+        core = self.method.__self__._core
+        cooked = core.normalize(self.method)
         if cooked is self.method:
             return self
-        return Call(self.thread, cooked, self.state, depth=self.depth)
+        return Call(self.thread_scope, cooked, self.state)
 
 
 @export
@@ -410,9 +492,10 @@ class Not(Signaling, ImmutableSignalToken):
         if isinstance(signal, Not):
             return signal.wrapped
         if not isinstance(signal, (Signaling, threading.Thread, MethodType)):
-            raise TypeError(
-                f"Not expected a thread, a bound method, or a signal, "
-                f"got {signal!r}")
+            if not isinstance(signal, Scenario.Primitive):
+                raise TypeError(
+                    f"Not expected a thread, a primitive, a bound method, "
+                    f"or a signal, got {signal!r}")
         return tuple.__new__(cls, (signal,))
 
     @property
@@ -429,27 +512,27 @@ class Not(Signaling, ImmutableSignalToken):
         return self[0]
 
     def sample(self, scenario):
-        wrapped = self.wrapped
-        # A bare thread or bound method inside Not is interpreted the
-        # same way the top-level boxing layer would: a bare thread
-        # means "has an active tx", a bare bound method means "any
-        # thread is calling this method".  We invert that.
-        if isinstance(wrapped, Signaling):
-            return not wrapped.sample(scenario)
-        if isinstance(wrapped, threading.Thread):
-            return wrapped not in scenario._core.transactions
-        # bare bound method: aggregate "anyone calling?" -> invert.
-        return not scenario._core.BoundMethod(wrapped).sample(scenario)
+        score = scenario._core
+        signal = score.box_signal(self[0])
+        return not signal.sample(scenario)
 
     def normalized(self):
         wrapped = self.wrapped
         if isinstance(wrapped, Signaling):
             return Not(wrapped.normalized())
-        # bare thread normalizes to itself; bare bound method
-        # normalizes raw -> cooked.
+        # Bare thread normalizes to itself.  Bare bound methods and bare
+        # primitives normalize raw -> cooked, but stay bare native objects
+        # inside Not; Thread/BoundMethod/_Primitive are only top-level
+        # scenario.wait boxes.
         if isinstance(wrapped, threading.Thread):
             return self
-        return Not(_normalize_method(wrapped))
+        if isinstance(wrapped, MethodType):
+            core = wrapped.__self__._core
+            cooked = core.normalize(wrapped)
+            return self if cooked is wrapped else Not(cooked)
+        core = wrapped._core
+        cooked = core.normalize(wrapped)
+        return self if cooked is wrapped else Not(cooked)
 
     def __repr__(self):
         wrapped = self.wrapped
@@ -468,7 +551,7 @@ class Nested(Signaling, ImmutableTransactionSignalToken):
     __slots__ = ()
 
     def __new__(cls, tx):
-        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TransactionAPI):
             raise TypeError(f"Nested argument must be a Transaction, not {tx!r}")
         return tuple.__new__(cls, (tx,))
 
@@ -480,61 +563,12 @@ class Nested(Signaling, ImmutableTransactionSignalToken):
 
 
 @export
-class Primitive(Signaling, ImmutableSignalToken):
-    """An aggregate level signal: high while ANY thread has an active
-    tx using the wrapped primitive (or its raw alias).
-
-    Self-reporting: Primitive(p).signal walks all txs in p's score
-    and returns True if any has p in its use_primitives set.
-
-    Both Primitive(p) and Primitive(raw) signal together; the
-    primitive form is normalized via p._core.primitive at signal
-    read.  scenario.wait() auto-boxes bare primitives into
-    Primitive(p) and unboxes the returned set.
-    """
-    __slots__ = ()
-
-    def __new__(cls, primitive):
-        # HEY API: do isinstance(Scenario.Primitive) here.
-        # the _core attr check sucks, dude.
-        if not hasattr(primitive, '_core'):
-            raise TypeError(
-                f"Primitive expected a regulated primitive (or raw), "
-                f"got {primitive!r}")
-        return tuple.__new__(cls, (primitive,))
-
-    @property
-    def primitive(self):
-        return self[0]
-
-    def sample(self, scenario):
-        outer = self.primitive._core.primitive
-        score = scenario._core
-        for tx in score.transactions.values():
-            cur = tx
-            while cur is not None:
-                if outer in cur.use_primitives:
-                    return True
-                cur = cur.parent
-        return False
-
-    def normalized(self):
-        cooked = _normalize_primitive(self.primitive)
-        if cooked is self.primitive:
-            return self
-        return Primitive(cooked)
-
-    def __repr__(self):
-        return f"Primitive({self.primitive!r})"
-
-
-@export
 class Reached(Signaling, ImmutableSignalToken):
     """A level signal that goes high once tx.state has reached
     (or surpassed) `state`.
 
-    Self-reporting: Reached(tx, state).signal returns
-    tx.state >= state on demand.  Two Reached(tx, state)
+    Self-reporting: Reached(tx, state).sample(scenario) returns
+    true when tx.state >= state.  Two Reached(tx, state)
     instances compare equal and hash equal (tuple semantics),
     so they interoperate as a single key in score.waiters
     without any normalization machinery.
@@ -542,7 +576,7 @@ class Reached(Signaling, ImmutableSignalToken):
     __slots__ = ()
 
     def __new__(cls, tx, state):
-        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TransactionAPI):
             raise TypeError(f"Reached tx must be a transaction, not {tx!r}")
         if not isinstance(state, State):
             raise TypeError(f"Reached state must be a State, not {state!r}")
@@ -581,7 +615,7 @@ class Action(Signaling, ImmutableTransactionSignalToken):
     __slots__ = ()
 
     def __new__(cls, tx):
-        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TransactionAPI):
             raise TypeError(f"Action argument must be a Transaction, not {tx!r}")
         return tuple.__new__(cls, (tx,))
 
@@ -605,7 +639,7 @@ class Predicate(Signaling, ImmutableTransactionSignalToken):
     __slots__ = ()
 
     def __new__(cls, tx):
-        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TransactionAPI):
             raise TypeError(f"Predicate argument must be a Transaction, not {tx!r}")
         return tuple.__new__(cls, (tx,))
 
@@ -653,8 +687,8 @@ State.by_index = {s.index: s for s in State.states.values()}
 class TransactionState(Signaling, ImmutableTransactionSignalToken):
     """A level signal that goes high while a transaction is in a state.
 
-    Self-reporting (Signaling): TransactionState(tx, X).signal returns
-    tx._core.state is X on demand.  No cache; instances are cheap
+    Self-reporting: TransactionState(tx, X).sample(scenario) returns
+    true when tx._core.state is X.  No cache; instances are cheap
     tuple subclasses, equal/hashable via tuple semantics so two
     Blocked(tx) constructions interoperate as a single key in
     score.waiters.
@@ -667,7 +701,7 @@ class TransactionState(Signaling, ImmutableTransactionSignalToken):
     _subclass_for_state = {}
 
     def __new__(cls, tx, state):
-        if not isinstance(tx, Scenario._ScenarioCore.TxAPI):
+        if not isinstance(tx, Scenario._ScenarioCore.TransactionAPI):
             raise TypeError(f"tx must be a transaction, not {tx!r}")
         if not isinstance(state, State):
             raise TypeError(f"state must be a State, not {state!r}")
@@ -816,7 +850,7 @@ class Scenario:
     def threading(self):
         """A drop-in for the threading module, bound to this scenario:
         its Lock / RLock / Condition / Semaphore / BoundedSemaphore /
-        Event / Barrier are this scenario's regulated primitives, and
+        Event / Barrier are this scenario's primitives, and
         every other attribute falls through to the real threading
         module.  This is the handle inject installs for `import
         threading` references."""
@@ -824,10 +858,11 @@ class Scenario:
 
     @property
     def queue(self):
-        """A drop-in for the queue module, bound to this scenario: its
-        SimpleQueue is this scenario's regulated primitive, and every
-        other attribute falls through to the real queue module.  This
-        is the handle inject installs for `import queue` references."""
+        """A drop-in for the queue module, bound to this scenario:
+        queue classes available in this Python version are replaced
+        with this scenario's primitives, and every other
+        attribute falls through to the real queue module.  This is the
+        handle inject installs for `import queue` references."""
         return self._impersonator(queue)
 
     def _impersonator(self, module):
@@ -840,19 +875,16 @@ class Scenario:
         return imp
 
     def reset(self):
-        """Clear accumulated working state from the scenario.
+        """Clear the completed-transaction log.
 
-        Drops the waiters reverse index and the completed-tx log.
-        Leaves structural state alone (registered primitives, raws,
-        managed threads, family signal sets).
+        Structural scenario state is left alone: registered primitives,
+        raw handles, managed threads, and live waiters are not reset.
+        Waiter bookkeeping now cleans itself up as waits finish, and
+        signals are self-reporting, so there is no score-level
+        "currently high" signal set to drain.
 
-        Every wait item is Signaling (self-reporting), so there is
-        no per-score "currently high" set to drain -- terminated
-        txs continue to read True via their own .signal property
-        without holding any score-level reference.
-
-        Safe to call multiple times.  Auto-called when exiting a
-        scenario context manager.
+        Safe to call multiple times.  Also called when entering a
+        scenario context manager so each run starts with an empty log.
         """
         with self._core.lock:
             self._core.reset()
@@ -873,8 +905,13 @@ class Scenario:
 
     @property
     def log(self):
-        """A list of completed transactions."""
-        return self._core.log
+        """Read-only list-like view of completed transactions.
+
+        The view supports ``clear()`` so callers may explicitly discard
+        the accumulated log, but does not expose list mutation methods
+        such as append/extend/item assignment.
+        """
+        return self._core.log_proxy
 
     @property
     def managed(self):
@@ -907,8 +944,8 @@ class Scenario:
         Supported items:
             bound method object on a primitive
                 signals while any thread is inside a call to that method
-            Scenario
-                signals while a thread has entered the scenario
+            primitive
+                signals while any thread is using that primitive
             Thread
                 signals while the thread has an active visible blanket
                 transaction.  Thread termination is represented separately
@@ -945,8 +982,8 @@ class Scenario:
         The named call must be a top-level transaction: a matching call
         that appears as a child of another transaction is skipped over,
         not parked.  To park in a child tx, drive the thread into the
-        parent, get the parent tx, and pass it as a base tx --
-        park(A, parent_tx, child_method).
+        parent, get the parent tx, and pass ``(thread, parent_tx)`` as
+        the thread spec: ``park((A, parent_tx), child_method)``.
 
         Returns a dict mapping each thread to the parked transaction
         (left at BLOCKED).  Raises RuntimeError if a thread terminates
@@ -982,9 +1019,10 @@ class Scenario:
         unexpected call raises RuntimeError.  Threads are driven
         concurrently, so interdependent threads won't deadlock.
 
-        A thread may be followed by a base tx, in which case the named
-        calls must appear as consecutive children of that base tx
-        (skip never touches base, and base exiting first is an error).
+        A thread spec may be a strict ``(thread, base_tx)`` tuple, in
+        which case the named calls must appear as consecutive children
+        of that base tx (skip never touches base, and base exiting first
+        is an error).
 
         Returns a dict mapping each thread to its last matched
         transaction (already terminal).
@@ -1011,9 +1049,9 @@ class Scenario:
         release it later (via the transaction's pause property).
         Threads are driven concurrently.
 
-        A thread may be followed by a base tx, in which case the named
-        call must be base's next child (pause never touches base, and
-        base exiting first is an error).
+        A thread spec may be a strict ``(thread, base_tx)`` tuple, in
+        which case the named call must be base's next child (pause never
+        touches base, and base exiting first is an error).
 
         Returns a dict mapping each thread to the paused transaction.
         Raises RuntimeError on a divergence or if a thread terminates
@@ -1044,9 +1082,9 @@ class Scenario:
         requires the named call to be next.  Threads are driven
         concurrently.
 
-        A thread may be followed by a base tx, in which case the named
-        call must be base's next child (block never touches base, and
-        base exiting first is an error).
+        A thread spec may be a strict ``(thread, base_tx)`` tuple, in
+        which case the named call must be base's next child (block never
+        touches base, and base exiting first is an error).
 
         Returns a dict mapping each thread to the blocked transaction.
         Raises RuntimeError on a divergence or if a thread terminates
@@ -1097,13 +1135,13 @@ class Scenario:
             self.entered = False
             # thread-as-signal: handled by score.Thread(t) self-reporter
             # which reads score.transactions; no per-(score, thread)
-            # SignalMinder dict needed.  Use signals likewise self-report
-            # by walking the chain, so no use_minders dict either.
+            # stored-signal dict needed.  Use signals likewise self-report
+            # by walking the chain, so no use-minder dict either.
             self.monitors = {}
             self.serial_number = 1
             # Every wait-item is Signaling (self-reporting); there is
             # no persistent "currently high" set.  signal() and wait()
-            # both consult item.signal directly.
+            # both consult sample(scenario) directly.
             self.threads = set()
             self.transactions = {}
             self.drivers = weakref.WeakValueDictionary()  # thread -> Driver (current Driver for the thread)
@@ -1113,9 +1151,25 @@ class Scenario:
             self.transaction_apis_proxy = self.LockedDictProxy(transaction_apis)
             self.raws_proxy = self.CoreAttrMapProxy('raw')
             self.waiters = defaultdict(set)
+            # Scoped Call wakeups only pay for base transactions someone
+            # is actually sleeping on: (thread, cooked_method) ->
+            # Counter({base_tx_core: parked-waiter-count}).
+            self.scoped_call_bases = defaultdict(Counter)
+            # Scoped Use wakeups mirror scoped Call wakeups: only base
+            # transactions someone is actually sleeping on are tested.
+            # (thread, cooked_primitive) -> Counter({base_tx_core: count}).
+            self.scoped_use_bases = defaultdict(Counter)
+            # Parked Not(Call(...)) and Not(Use(...)) keys need low-edge
+            # wakeups when the selected item goes away or changes state.
+            # Refcounted for multiple simultaneous waiters on the same
+            # normalized key.
+            self.sleeping_not_calls = Counter()
+            self.sleeping_not_uses = Counter()
+            self.sleeping_not_nested = Counter()
+            self.sleeping_not_transaction_states = Counter()
             # Aggregate usage refcount: cooked primitive / cooked bound
             # method -> number of threads currently using it.  Drives
-            # Primitive(p) / BoundMethod(m) (and their Nots) wakeups
+            # _Primitive(p) / BoundMethod(m) (and their Nots) wakeups
             # without an O(threads) poll at tx close.  See incref_usage.
             self.usage_counter = Counter()
 
@@ -1175,11 +1229,20 @@ class Scenario:
                     key = boxed.normalized()
 
                     # Any thread-bearing signal (Thread, Terminated,
-                    # Use, Call) needs its thread started, non-monitor,
-                    # and registered -- registration starts the monitor
-                    # that strobes Terminated(thread).
-                    if isinstance(key, ImmutableThreadSignalToken):
-                        thread = key.thread
+                    # Use, Call, native Not(thread), and Not(...) wrapped
+                    # around thread-bearing signals) needs its thread
+                    # started, non-monitor, and registered -- registration
+                    # starts the monitor that strobes Terminated(thread).
+                    thread_signal = key
+                    if isinstance(thread_signal, Not):
+                        thread_signal = thread_signal.wrapped
+                    if isinstance(thread_signal, threading.Thread):
+                        thread = thread_signal
+                    elif isinstance(thread_signal, ImmutableThreadSignalToken):
+                        thread = thread_signal.thread
+                    else:
+                        thread = None
+                    if thread is not None:
                         if thread in monitors:
                             raise ValueError(
                                 f"can't wait on monitor thread {thread.name!r}")
@@ -1224,15 +1287,23 @@ class Scenario:
                     self.blocker = blocker.release
 
                     waiters = score.waiters
+                    undo = []
                     for key in self.keys:
                         waiters[key].add(self)
+                        score.register_wait_interest(key, undo)
 
-                    with unlock(score.lock):
-                        timeout = -1 if timeout is None else timeout
-                        blocker.acquire(timeout)
-
-                    for key in self.keys - self.signaled:
-                        waiters[key].discard(self)
+                    try:
+                        with unlock(score.lock):
+                            timeout = -1 if timeout is None else timeout
+                            blocker.acquire(timeout=timeout)
+                    finally:
+                        for key in self.keys:
+                            bucket = waiters.get(key)
+                            if bucket is not None:
+                                bucket.discard(self)
+                                if not bucket:
+                                    waiters.pop(key, None)
+                        score.unregister_wait_interests(undo)
 
                     signaled |= self.signaled
 
@@ -1288,22 +1359,21 @@ class Scenario:
                 del self.monitors[thread]
                 self.managed.pop(thread, None)
                 self.signal(Terminated(thread))
-                # Not(Terminated(t)) goes low automatically (its
-                # .signal = not Terminated(t).signal = t.is_alive());
-                # no wakeup needed since Signaling high->low is silent.
+                # Not(Terminated(t)) goes low automatically because
+                # Terminated(t).sample(...) is now true; no wakeup is
+                # needed for a high->low transition.
 
                 # Stuck-tx cleanup: if the thread died with an active tx,
                 # walk the chain and abort each so observers fire and
                 # Not(thread) goes high.
                 tx = self.transactions.get(thread)
                 if tx is not None:
-                    tx.aborted()  # pragma: no cover -- defensive: workers normally exit cleanly after their last tx terminates
+                    tx.aborted()
 
 
         @base()
         @BoundInnerClass
         class Driver:
-            # these are Driver states, not tx states
             idle       = State(11, 'IDLE')
             active     = State(12, 'ACTIVE')
             skipping   = State(13, 'SKIPPING')
@@ -1313,61 +1383,22 @@ class Scenario:
             finished   = State(17, 'FINISHED')
             raised     = State(18, 'RAISED')
             terminated = State(19, 'TERMINATED')
-            # NESTING is the post-Nested-fire yield point: when a child
-            # tx appears under the driven tx, the signal handler (by
-            # default, autoskip=False) rotates self.tx to the child,
-            # pushes the parent context onto self.stack, and transitions
-            # here.  state_signals[nesting] is empty so the Driver yields
-            # immediately; the caller can drive the child via another
-            # imperative on the same Driver, or leave the Driver alone
-            # for the cycle code to re-pursue.  Semantically equivalent
-            # to ACTIVE for pursue's state checks; distinct so callers
-            # can tell "child surfaced" apart from "fresh active driver."
             nesting    = State(20, 'NESTING')
-            # REENTERED is the yield point for "the driven tx is running
-            # a user callback".  A cond.wait_for running its predicate is
-            # the producer today (it raises Predicate(tx) while it sits at
-            # COMMIT); a barrier.wait running its action is the same shape
-            # (Action(tx)) and could route here too.  The signal handler
-            # yields here with self.tx UNCHANGED -- still the wait_for,
-            # which stays at COMMIT throughout; the predicate spawns its
-            # children as nested txs, observed via Nested(tx).  Like
-            # NESTING, state_signals is empty so the Driver yields
-            # immediately and a cycle scheduler can drive whatever the
-            # callback spawns, then resume the drive.  Only reachable when
-            # listen_predicate is set (the cycle's scheduler= path).
-            # Active-equivalent for pursue's checks.
-            reentered = State(22, 'REENTERED')
-            # IMPASSE is a terminal state distinct from TERMINATED: the
-            # thread is NOT dead and base may yet make progress via
-            # something outside this Driver -- base is simply out of the
-            # Driver's purview and frozen, so given its parameters the
-            # Driver has no path forward.  See stuck_base_states.
+            reentered  = State(22, 'REENTERED')
             impasse    = State(21, 'IMPASSE')
 
             driving_states  = frozenset((skipping, parking, finishing))
             active_states   = frozenset((active, nesting, reentered)) | driving_states
             terminal_states = frozenset((parked, finished, raised, terminated, impasse))
 
-            # base_tx parking states from which a base_tx Driver can
-            # make no progress.  These are the blanket-controlled parks:
-            # the tx only leaves them via unblock / unstall / unpause,
-            # and a base_tx Driver never touches base.  So a base handed
-            # to a Driver while parked in one of these can never surface
-            # a child or end on its own -- from the Driver's view base is
-            # frozen and out of its purview, so the Driver lands IMPASSE
-            # (not TERMINATED: the thread lives, base may move later via
-            # someone else).  Method-controlled parks (COMMIT, WAITING)
-            # are excluded: there the real primitive / peer threads can
-            # still surface a child or end base, so the Driver waits.
-            stuck_base_states = frozenset(
+            base_impasse_states = frozenset(
                 (State.BLOCKED, State.STALLED, State.PAUSED))
 
             # Canary states are the tx states past target that the tx
             # might reach if it overshoots its intended park.  Named
             # after the canary in the coal mine: when one is signaled
-            # while Driver is in PARKING, the tx walked past where we
-            # wanted it and Driver raises.
+            # while Driver is in PARKING, the tx transitioned past where
+            # we wanted it and Driver raises.
             canaries = {
                 State.BLOCKED: frozenset((State.COMMIT, State.COMMITTED)),
                 State.COMMIT:  frozenset((State.COMMITTED,)),
@@ -1382,11 +1413,6 @@ class Scenario:
 
                 self.score = score
                 self.thread = thread
-                # base_tx scopes this Driver to one tx's subtree: when
-                # set, the Driver observes Nested(base_tx) for the child
-                # to drive (rather than the thread-presence signal) and
-                # treats base_tx going terminal as "Driver done".  None
-                # is the original whole-thread behavior.
                 self.base_tx = tx
 
                 self.owner = None
@@ -1404,15 +1430,10 @@ class Scenario:
                     self.parked:     frozenset(),
                     self.finished:   frozenset(),
                     self.nesting:    frozenset(),
-                    self.reentered: frozenset(),
+                    self.reentered:  frozenset(),
                     self.terminated: frozenset(),
                 }
 
-                # base_tx mode: idle waits on a child appearing under
-                # base_tx (Nested), on base_tx going terminal (Driver
-                # done), or on the thread dying -- not on the raw
-                # thread-presence signal, which would latch onto base_tx
-                # itself (the parent callback's tx) and choke.
                 self._base_nested = None
                 if tx is not None:
                     self._base_nested = Nested(tx.api)
@@ -1421,12 +1442,6 @@ class Scenario:
                 self.txs_seen = {}
                 self.txs = []
 
-                # Lazy initialization: don't claim the score's slot
-                # or cache the current tx at construction time.  Two
-                # Drivers for the same thread can be constructed
-                # without competing -- they only compete when one of
-                # them actually tries to drive (via an imperative or
-                # an explicit drive()).  See initialize.
                 self.initialized = False
                 self.state = None
                 self.tx = None
@@ -1569,7 +1584,7 @@ class Scenario:
                     # end on its own -- nothing to drive, so we hit an
                     # impasse (base is out of our purview, not dead).
                     if (self.base_tx is not None
-                            and self.base_tx.state in self.stuck_base_states):
+                            and self.base_tx.state in self.base_impasse_states):
                         self.to(self.impasse)
                         return
                     self.to(self.idle)
@@ -1994,30 +2009,6 @@ class Scenario:
                 # Nested-fire handler reads self.autoskip to decide
                 # surface (default) vs auto-skip each child.
                 self.autoskip = autoskip
-                # NESTING is treated like ACTIVE here: pursue continues
-                # the user's driving of the child without losing the
-                # parent context on self.stack.  Reactivate would clear
-                # the stack -- and besides, reactivate only works from
-                # a terminal state.
-
-                # Refresh self.tx: while the score lock was released
-                # in a prior score.wait (e.g. inside settle), the
-                # worker may have completed and unregistered our
-                # cached tx.  If so, the cached pointer is stale --
-                # tx.state has advanced past anything Driver handles.
-                # Transition to FINISHED so the dispatch cycle moves
-                # us through reactivate -> IDLE -> Terminated cleanly,
-                # instead of looping on a stale terminal tx.
-                #
-                # CONTRACT: pursue is currently the only external
-                # entry point on Driver that fires after a window
-                # in which the score lock was released.  If you add
-                # another such entry point (an imperative that
-                # doesn't funnel through pursue), it must perform
-                # the same self.cache_tx() + transition-on-None
-                # refresh before reading self.tx -- otherwise the
-                # cached pointer may be stale and the state machine
-                # will misbehave.
                 if self.state in (self.active, self.nesting, self.reentered):
                     self.cache_tx()
                     if self.tx is None:
@@ -2027,8 +2018,6 @@ class Scenario:
 
                 if self.state not in (self.active, self.nesting, self.reentered):
                     raise RuntimeError(f"can't {verb}, currently in {self.state}")
-                if tx is None:
-                    raise RuntimeError(f"can't {verb}, no current tx")  # pragma: no cover -- defensive: active state implies non-None tx
                 if tx_cls and not isinstance(tx, tx_cls):
                     raise RuntimeError(
                         f"can't {verb}, tx doesn't park in {target.name} state, tx={tx!r}")
@@ -2042,7 +2031,7 @@ class Scenario:
                 # transit handler.  We only refuse if the tx is past
                 # any state Driver can handle.
                 if tx.state not in (State.BLOCKED, State.COMMIT, State.WAITING, State.STALLED, State.PAUSED):
-                    raise RuntimeError(f"can't {verb}, tx currently in {tx.state}")  # pragma: no cover -- defensive: pursue only reachable while tx is in a driver-handleable state
+                    raise RuntimeError(f"can't {verb}, tx currently in {tx.state}")
 
                 # Eagerly advance past BLOCKED -- saves one round of
                 # wake-up-and-analyze-signals when the cascade kicks
@@ -2599,49 +2588,72 @@ class Scenario:
                     c.close()
 
 
+        def parse_thread_or_base_tuple(self, arg, caller):
+            """Parse one thread spec.
+
+            Public high-level APIs accept either a bare thread, or a
+            strict two-tuple ``(thread, base_tx)``.  The tuple form scopes
+            the operation to descendant transactions under ``base_tx``.
+            """
+            if isinstance(arg, threading.Thread):
+                return arg, None
+
+            if type(arg) is tuple:
+                if len(arg) != 2:
+                    raise TypeError(
+                        f"{caller}: thread/base spec must be a 2-tuple "
+                        f"(thread, base_tx), got {arg!r}")
+                thread, base_tx = arg
+                if not isinstance(thread, threading.Thread):
+                    raise TypeError(
+                        f"{caller}: first item in thread/base spec must "
+                        f"be a thread, got {thread!r}")
+                if not isinstance(base_tx, self.api.Transaction):
+                    raise TypeError(
+                        f"{caller}: second item in thread/base spec must "
+                        f"be a transaction, got {base_tx!r}")
+                base_core = base_tx._core
+                if base_core.thread is not thread:
+                    raise ValueError(
+                        f"{caller}: base tx belongs to thread "
+                        f"{base_core.thread.name!r}, not {thread.name!r}")
+                return thread, base_core
+
+            return None
+
         def parse_park_skip_args(self, args, caller):
-            """Parse park/skip args into (thread, base_tx_or_None, [method+])
-            tuples.  A thread may be immediately followed by an optional
-            base tx (a Transaction) scoping the operation to that thread's
-            subtree under base; the method(s) follow.  base must come
-            before any method for that thread."""
+            """Parse park/skip/pause/block args into
+            (thread, base_tx_or_None, [method+]) tuples.
+
+            A thread spec is either a bare thread, or a strict two-tuple
+            ``(thread, base_tx)`` scoping the operation to that thread's
+            subtree under base.  Methods follow the thread spec.
+            """
             if not args:
                 raise ValueError(f"{caller}: no thread specified")
 
             single = caller in ('park', 'pause', 'block')
             plan = []
             seen = set()
-            current = None   # methods list for the current thread
+            current = None   # methods list for the current thread spec
             thread = None
 
             for arg in args:
-                if isinstance(arg, threading.Thread):
-                    thread = arg
+                spec = self.parse_thread_or_base_tuple(arg, caller)
+                if spec is not None:
+                    thread, base_tx = spec
                     if single:
                         if thread in seen:
                             raise ValueError(f"{caller}: thread {thread.name!r} specified more than once")
                         seen.add(thread)
                     current = []
-                    plan.append([thread, None, current])
+                    plan.append([thread, base_tx, current])
                     continue
 
-                if isinstance(arg, self.api.Transaction):
-                    if thread is None:
-                        raise ValueError(f"{caller}: base tx given before any thread")
-                    if current:
-                        raise ValueError(
-                            f"{caller}: base tx for thread {thread.name!r} must "
-                            f"come before its method(s)")
-                    if plan[-1][1] is not None:
-                        raise ValueError(
-                            f"{caller}: thread {thread.name!r} given two base txs")
-                    plan[-1][1] = arg._core
-                    continue
-
-                # method (anything that isn't a thread or a base tx)
+                # method (anything that isn't a thread spec)
                 if not isinstance(arg, MethodType):
                     raise TypeError(
-                        f"{caller}: expected thread, base tx, or method, got {arg!r}")
+                        f"{caller}: expected thread, (thread, base_tx), or method, got {arg!r}")
                 if not thread:
                     raise ValueError(f"{caller}: first argument must be a thread")
                 method = arg
@@ -2664,31 +2676,148 @@ class Scenario:
             return [tuple(entry) for entry in plan]
 
         def parse_thread_base_pairs(self, args, caller):
-            """Parse interleaved (thread, optional base tx) args into a
-            list of (thread, base_tx_or_None) tuples.  Each thread may be
-            immediately followed by a Transaction giving that thread's
-            base tx (scoping the operation to that thread's subtree under
-            base); the next thread begins a new pair.  Used by the
-            multi-thread drivers (assign / relay / allocate / cycle),
-            whose participants don't name methods -- they drive each
-            thread's acquire/release of this primitive.
+            """Parse participant args into (thread, base_tx_or_None) tuples.
+
+            Each participant is either a bare thread or a strict two-tuple
+            ``(thread, base_tx)`` scoping that participant to that thread's
+            subtree under base.  Used by assign / relay / allocate / deliver / cycle.
             """
             pairs = []
             for arg in args:
-                if isinstance(arg, threading.Thread):
-                    pairs.append([arg, None])
-                    continue
-                if isinstance(arg, self.api.Transaction):
-                    if not pairs:
-                        raise ValueError(f"{caller}: base tx given before any thread")
-                    if pairs[-1][1] is not None:
-                        raise ValueError(
-                            f"{caller}: thread {pairs[-1][0].name!r} given two base txs")
-                    pairs[-1][1] = arg._core
-                    continue
-                raise TypeError(
-                    f"{caller}: expected thread or base tx, got {arg!r}")
+                spec = self.parse_thread_or_base_tuple(arg, caller)
+                if spec is None:
+                    raise TypeError(
+                        f"{caller}: expected thread or (thread, base_tx), got {arg!r}")
+                pairs.append(list(spec))
             return [tuple(pair) for pair in pairs]
+
+        def drive_queue_deliver(self, core, pairs):
+            """Drive queue get/put traffic for QueueAPI.deliver.
+
+            All participants are strict thread specs.  Each active
+            participant's next transaction must be one of the queue's
+            get / put / get_nowait / put_nowait calls, and it must still
+            be at BLOCKED when deliver first sees it.
+
+            deliver may surface many participants, but it runs only one
+            queue transaction on this queue at a time.  The rest remain
+            parked at BLOCKED.  Whenever possible it chooses a pending
+            transaction that can complete with the queue's current size.
+            If none can be proven runnable, it drives the oldest pending
+            transaction; if that call blocks forever, deliver blocks
+            forever too.
+            """
+            if not pairs:
+                raise ValueError("deliver requires at least one thread")
+
+            class Entry:
+                def __init__(self, index, thread, base_tx):
+                    self.index = index
+                    self.thread = thread
+                    self.base_tx = base_tx
+                    self.driver = None
+                    self.tx = None
+                    self.role = None
+
+            entries = [Entry(i, thread, base_tx)
+                       for i, (thread, base_tx) in enumerate(pairs)]
+            by_thread = defaultdict(deque)
+            thread_order = []
+            for entry in entries:
+                if entry.thread not in by_thread:
+                    thread_order.append(entry.thread)
+                by_thread[entry.thread].append(entry)
+
+            active = {}
+            pending = []
+            drivers = []
+            results = [None] * len(entries)
+
+            def start(entry):
+                d = self.Driver(entry.thread, entry.base_tx)
+                entry.driver = d
+                drivers.append(d)
+                d()
+                if d.state is d.impasse:
+                    raise RuntimeError(
+                        f"deliver: thread {entry.thread.name!r} base tx is "
+                        f"blanket-parked, can't reach its queue call")
+                if d.state is d.terminated:
+                    if entry.base_tx is not None:
+                        raise RuntimeError(
+                            f"deliver: thread {entry.thread.name!r} base tx ended "
+                            f"before pushing a queue call")
+                    raise RuntimeError(
+                        f"deliver: thread {entry.thread.name!r} terminated "
+                        f"before pushing a queue call")
+                if d.state is not d.active:
+                    raise RuntimeError(
+                        f"deliver: thread {entry.thread.name!r} stopped in "
+                        f"unexpected Driver state {d.state.name}")
+
+                tx = d.tx
+                role = core.deliver_role(tx)
+                if role is None:
+                    raise ValueError(
+                        f"deliver: thread {entry.thread.name!r} should be "
+                        f"calling get, put, get_nowait, or put_nowait on "
+                        f"this queue, but is calling {tx.method}")
+                if tx.state is not State.BLOCKED:
+                    raise RuntimeError(
+                        f"deliver: thread {entry.thread.name!r} {role} tx "
+                        f"must be at BLOCKED, got {tx.state.name}")
+                entry.tx = tx
+                entry.role = role
+                active[entry.thread] = entry
+                pending.append(entry)
+
+            try:
+                for thread in thread_order:
+                    start(by_thread[thread][0])
+
+                size = core.deliver_size()
+                remaining = len(entries)
+                while remaining:
+                    for i, entry in enumerate(pending):
+                        if core.deliver_can_run(entry.role, size):
+                            pending.pop(i)
+                            break
+                    else:
+                        # No pending queue operation can be proven to
+                        # complete immediately.  Drive the oldest one
+                        # anyway; for a blocking get/put this may block
+                        # forever, which mirrors the user's deadlocked
+                        # traffic script.  For a nowait call it will
+                        # usually raise the stdlib queue exception.
+                        entry = pending.pop(0)
+
+                    d = entry.driver
+                    d.finish(autoskip=True)
+                    d()
+                    tx = entry.tx
+                    if tx.state is State.RAISED:
+                        raise tx.result
+                    if d.state is not d.finished:
+                        raise RuntimeError(
+                            f"deliver: thread {entry.thread.name!r} stopped "
+                            f"in unexpected Driver state {d.state.name}")
+                    results[entry.index] = tx
+                    size = core.deliver_adjust_size(entry.role, size)
+                    remaining -= 1
+
+                    active.pop(entry.thread)
+                    thread_entries = by_thread[entry.thread]
+                    assert thread_entries[0] is entry
+                    thread_entries.popleft()
+                    if thread_entries:
+                        start(thread_entries[0])
+
+                return tuple(tx.api for tx in results)
+            finally:
+                for d in drivers:
+                    if not d.done:
+                        d.close()
+
 
         def _drive_named(self, plan, caller):
             """Shared engine for skip / park / pause.  Drives the named
@@ -2779,7 +2908,13 @@ class Scenario:
                         continue
 
                     assert state is d.active
-                    if d.tx.method == method:
+                    d_tx_method_matches = d.tx.method == method
+                    if not d_tx_method_matches:
+                        core = method.__self__._core
+                        method = core.normalize(method)
+                        d_tx_method_matches = d.tx.normalized_method == method
+
+                    if d_tx_method_matches:
                         result[thread] = d.tx
                         if caller == 'skip':
                             d.finish(autoskip=True)
@@ -2827,9 +2962,10 @@ class Scenario:
             thread may be named more than once; its methods accumulate
             in order.  Threads are driven concurrently.
 
-            A thread may be followed by a base tx; then the named calls
-            must appear as consecutive children of base (skip never
-            touches base, and base exiting first is an error).
+            A thread spec may be a strict ``(thread, base_tx)`` tuple;
+            then the named calls must appear as consecutive children of
+            base (skip never touches base, and base exiting first is an
+            error).
 
             Called with score.lock held.  Returns a dict mapping each
             thread to its last matched transaction (already terminal).
@@ -2849,12 +2985,14 @@ class Scenario:
             The named call must be a top-level transaction: a matching
             call appearing as a *child* of another transaction is
             skipped over, not parked.  To park in a child, name the
-            parent as a base tx -- park(A, parent, child) -- after
-            driving the thread into the parent.
+            parent with ``(thread, base_tx)`` --
+            ``park((A, parent), child)`` -- after driving the thread into
+            the parent.
 
-            A thread may be followed by a base tx; then park skips over
-            base's children until the named call appears (never
-            touching base; base exiting first is an error).
+            A thread spec may be a strict ``(thread, base_tx)`` tuple;
+            then park skips over base's children until the named call
+            appears (never touching base; base exiting first is an
+            error).
 
             Called with score.lock held.  Returns a dict mapping each
             thread to the parked transaction (left at BLOCKED).  See
@@ -2871,9 +3009,9 @@ class Scenario:
             instead of driving it to a terminal state.  Exactly one
             method per thread; threads are driven concurrently.
 
-            A thread may be followed by a base tx; then the named call
-            must be base's next child (never touching base; base
-            exiting first is an error).
+            A thread spec may be a strict ``(thread, base_tx)`` tuple;
+            then the named call must be base's next child (never touching
+            base; base exiting first is an error).
 
             Called with score.lock held.  Returns a dict mapping each
             thread to the paused transaction.  See Scenario.pause for
@@ -3408,11 +3546,160 @@ class Scenario:
             for item in items:
                 self.signal(item)
 
+        def register_wait_interest(self, key, undo):
+            """Register auxiliary indexes for a parked wait key.
+
+            score.waiters is the authoritative waiter store.  These private
+            indexes are only optimizations / low-edge helpers, and are
+            refcounted for the exact duration the WaitTransaction is parked.
+            """
+            if isinstance(key, Call):
+                base_tx = key.base_tx
+                if base_tx is not None:
+                    interest_key = (key.thread, key.method)
+                    base_core = base_tx._core
+                    self.scoped_call_bases[interest_key][base_core] += 1
+                    undo.append(('scoped_call', interest_key, base_core))
+                return
+
+            if isinstance(key, Use):
+                base_tx = key.base_tx
+                if base_tx is not None:
+                    interest_key = (key.thread, key.primitive)
+                    base_core = base_tx._core
+                    self.scoped_use_bases[interest_key][base_core] += 1
+                    undo.append(('scoped_use', interest_key, base_core))
+                return
+
+            if isinstance(key, Not):
+                wrapped = key.wrapped
+                if isinstance(wrapped, Call):
+                    self.sleeping_not_calls[key] += 1
+                    undo.append(('not_call', key))
+                elif isinstance(wrapped, Use):
+                    self.sleeping_not_uses[key] += 1
+                    undo.append(('not_use', key))
+                elif isinstance(wrapped, Nested):
+                    self.sleeping_not_nested[key] += 1
+                    undo.append(('not_nested', key))
+                elif isinstance(wrapped, TransactionState):
+                    self.sleeping_not_transaction_states[key] += 1
+                    undo.append(('not_transaction_state', key))
+
+        def unregister_wait_interests(self, undo):
+            """Undo register_wait_interest calls, deleting zero counts."""
+            for item in undo:
+                kind = item[0]
+                if kind == 'scoped_call':
+                    _, interest_key, base_core = item
+                    counter = self.scoped_call_bases[interest_key]
+                    count = counter[base_core] - 1
+                    if count:
+                        counter[base_core] = count
+                    else:
+                        del counter[base_core]
+                        if not counter:
+                            del self.scoped_call_bases[interest_key]
+                elif kind == 'scoped_use':
+                    _, interest_key, base_core = item
+                    counter = self.scoped_use_bases[interest_key]
+                    count = counter[base_core] - 1
+                    if count:
+                        counter[base_core] = count
+                    else:
+                        del counter[base_core]
+                        if not counter:
+                            del self.scoped_use_bases[interest_key]
+                elif kind == 'not_call':
+                    _, key = item
+                    count = self.sleeping_not_calls[key] - 1
+                    if count:
+                        self.sleeping_not_calls[key] = count
+                    else:
+                        del self.sleeping_not_calls[key]
+                elif kind == 'not_use':
+                    _, key = item
+                    count = self.sleeping_not_uses[key] - 1
+                    if count:
+                        self.sleeping_not_uses[key] = count
+                    else:
+                        del self.sleeping_not_uses[key]
+                elif kind == 'not_nested':
+                    _, key = item
+                    count = self.sleeping_not_nested[key] - 1
+                    if count:
+                        self.sleeping_not_nested[key] = count
+                    else:
+                        del self.sleeping_not_nested[key]
+                elif kind == 'not_transaction_state':
+                    _, key = item
+                    count = self.sleeping_not_transaction_states[key] - 1
+                    if count:
+                        self.sleeping_not_transaction_states[key] = count
+                    else:
+                        del self.sleeping_not_transaction_states[key]
+                else:
+                    raise AssertionError(f"unknown wait-interest kind {kind!r}")
+
+        def signal_sleeping_not_calls(self):
+            """Re-sample parked Not(Call(...)) keys after Call low edges.
+
+            A Call can go low when a transaction leaves a state or when it
+            leaves the active transaction chain.  Re-sampling the parked
+            negated keys centralizes the selection semantics in Call.sample.
+            """
+            for key in tuple(self.sleeping_not_calls):
+                if key.sample(self.api):
+                    self.signal(key)
+
+        def signal_sleeping_not_uses(self):
+            """Re-sample parked Not(Use(...)) keys after Use low edges.
+
+            A Use can go low when a transaction leaves the active
+            transaction chain.  Re-sampling keeps scoped and unscoped
+            Use semantics centralized in Use.sample.
+            """
+            for key in tuple(self.sleeping_not_uses):
+                if key.sample(self.api):
+                    self.signal(key)
+
+        def signal_sleeping_not_nested(self):
+            """Re-sample parked Not(Nested(...)) keys after child removal."""
+            for key in tuple(self.sleeping_not_nested):
+                if key.sample(self.api):
+                    self.signal(key)
+
+        def signal_sleeping_not_transaction_states(self):
+            """Re-sample parked Not(TransactionState(...)) keys after state changes."""
+            for key in tuple(self.sleeping_not_transaction_states):
+                if key.sample(self.api):
+                    self.signal(key)
+
+        def use_signals(self, thread, primitive, tx):
+            """Return unscoped and currently-interesting scoped Use signals.
+
+            ``primitive`` must already be a cooked primitive from
+            ``tx.use_primitives``.  Scoped Use only tests base
+            transactions with sleeping waiters, avoiding one signal per
+            ancestor transaction.
+            """
+            signals = {Use(thread, primitive)}
+            bases = self.scoped_use_bases.get((thread, primitive))
+            if not bases:
+                return signals
+            for base_core in tuple(bases):
+                cur = tx.parent
+                while cur is not None and cur is not base_core:
+                    cur = cur.parent
+                if cur is base_core:
+                    signals.add(Use((thread, base_core.api), primitive))
+            return signals
+
         def incref_usage(self, *items):
             """Increment the usage refcount for each item (a cooked
             primitive or a cooked bound method).  When an item's count
             goes 0->1 it just became used by some thread, so we signal
-            its aggregate signal (Primitive(item) or BoundMethod(item))
+            its aggregate signal (BoundMethod(item) or _Primitive(item))
             to wake any waiters parked on it.
 
             Items must already be cooked (normalized); callers pass the
@@ -3426,21 +3713,65 @@ class Scenario:
         def decref_usage(self, *items):
             """Decrement the usage refcount for each item.  When an
             item's count reaches 0 it's no longer used by any thread,
-            so we drop the key and signal Not(aggregate) to wake any
-            waiters parked on "nobody is using this"."""
+            so we drop the key and signal Not(item), where item is the
+            normalized native method or primitive, to wake waiters parked
+            on "nobody is using this"."""
             for item in items:
                 count = self.usage_counter[item] - 1
                 if count:
                     self.usage_counter[item] = count
                 else:
                     del self.usage_counter[item]
-                    self.signal(Not(self._aggregate_signal(item)))
+                    self.signal(Not(item))
 
-        def _aggregate_signal(self, item):
-            "The aggregate Signaling for a cooked primitive or method."
-            if isinstance(item, MethodType):
-                return self.BoundMethod(item)
-            return Primitive(item)
+        class Primitive(Signaling, ImmutableSignalToken):
+            """An aggregate level signal: high while ANY thread has an active
+            tx using the wrapped primitive (or its raw alias).
+
+            NOT the base class for primitives; that's on the Scenario (API),
+            this is the score.
+
+            Self-reporting: _Primitive(p).sample walks all txs in p's score
+            and returns True if any has p in its use_primitives set.
+
+            Both _Primitive(p) and _Primitive(raw) signal together; the
+            primitive form is normalized via p._core.primitive at signal
+            read.  scenario.wait() auto-boxes bare primitives into
+            _Primitive(p) and unboxes the returned set.
+            """
+            __slots__ = ()
+
+            def __new__(cls, primitive):
+                if not isinstance(primitive, Scenario.Primitive):
+                    raise TypeError(
+                        f"internal primitive signal expected a primitive "
+                        f"(or raw), got {primitive!r}")
+                return tuple.__new__(cls, (primitive,))
+
+            @property
+            def primitive(self):
+                return self[0]
+
+            def sample(self, scenario):
+                outer = self.primitive._core.primitive
+                score = scenario._core
+                for tx in score.transactions.values():
+                    cur = tx
+                    while cur is not None:
+                        if outer in cur.use_primitives:
+                            return True
+                        cur = cur.parent
+                return False
+
+            def normalized(self):
+                core = self.primitive._core
+                cooked = core.normalize(self.primitive)
+                if cooked is self.primitive:
+                    return self
+                return self.__class__(cooked)
+
+            def __repr__(self):
+                return f"_Primitive({self.primitive!r})"
 
         class Thread(Signaling, ImmutableThreadSignalToken):
             """A private level signal: high while a thread has any
@@ -3503,7 +3834,8 @@ class Scenario:
                 return False
 
             def normalized(self):
-                cooked = _normalize_method(self.method)
+                core = self.method.__self__._core
+                cooked = core.normalize(self.method)
                 if cooked is self.method:
                     return self
                 return type(self)(cooked)
@@ -3512,16 +3844,30 @@ class Scenario:
                 name = getattr(self.method, '__name__', repr(self.method))
                 return f"BoundMethod({name})"
 
+        def _aggregate_signal(self, item):
+            "The aggregate Signaling for a cooked primitive or method."
+            if isinstance(item, MethodType):
+                return self.BoundMethod(item)
+            return self.Primitive(item)
+
         def box_signal(self, o):
-            """Box a bare top-level thread or bound method into its
-            Signaling form.  Already-Signaling objects pass through.
-            Signals are inert, so no scenario is stored."""
+            """Box a bare top-level thread, primitive, or bound method
+            into its Signaling form.  Already-Signaling objects pass
+            through.  Signals are inert, so no scenario is stored.
+
+            Only naked top-level thread / bound-method / primitive inputs
+            are boxed.  Signals such as Not(thread), Call(...), and Use(...)
+            already define their own native-object semantics and are not
+            opened up recursively.
+            """
             if isinstance(o, Signaling):
                 return o
             if isinstance(o, threading.Thread):
                 return self.Thread(o)
             if isinstance(o, MethodType):
                 return self.BoundMethod(o)
+            if isinstance(o, Scenario.Primitive):
+                return self.Primitive(o)
             raise TypeError(f"{o!r} is not signalable")
 
         def wait(self, items, timeout=None):
@@ -3559,12 +3905,7 @@ class Scenario:
                 'Event',
                 'Barrier',
                 ),
-            queue: (
-                'SimpleQueue',
-                'Queue',
-                'LifoQueue',
-                'PriorityQueue',
-                ),
+            queue: _queue_primitive_names,
             }
 
         @BoundInnerClass
@@ -3572,7 +3913,7 @@ class Scenario:
             """Monkey-patches a module.  Used by scenario.inject.
 
             Safely overwrites module attributes containing references to
-            either the threading module or a synchronization primitve
+            either the threading module or a synchronization primitive
             with equivalents that use blanket synchronization primitives
             from this scenario.  On close (or exit), safely restores
             the original values.
@@ -3714,8 +4055,8 @@ class Scenario:
                 self._name = self.default_name
                 self.use_fancy_repr = False
 
-                # Aggregate signals (BoundMethod/Primitive) and Call
-                # matching key on normalized forms
+                # Aggregate signals (BoundMethod/_Primitive) and Call
+                # matching key on normalized native forms
                 # (raw->cooked, condition->lock), so no per-core alias
                 # set is maintained here anymore.
 
@@ -3763,9 +4104,9 @@ class Scenario:
                 in any state listed in its tx-class parking_states.
                 For Transaction that's {BLOCKED, PAUSED}; subclasses
                 widen the set (TimeoutTransaction adds COMMIT, etc.)
-                so an unblock of an OS-blocking commit returns as soon
+                so unblocking a native-blocking commit returns as soon
                 as the worker hits its blocking call."""
-                threads, txs = self.threads_to_txs(threads, caller='unblock')
+                threads, txs = self.threads_to_txs(threads, 'unblock')
                 for tx in txs:
                     tx.validate(method=method, state=State.BLOCKED, caller='unblock')
                 for tx in txs:
@@ -3797,7 +4138,7 @@ class Scenario:
                 pausing > 0 after the user decref the tx stays at
                 PAUSED -- which is in parking_states for every tx
                 class, so the wait returns immediately."""
-                threads, txs = self.threads_to_txs(threads, caller='unpause')
+                threads, txs = self.threads_to_txs(threads, 'unpause')
                 for tx in txs:
                     tx.validate(method=method, state=State.PAUSED, caller='unpause')
                 for tx in txs:
@@ -3811,7 +4152,7 @@ class Scenario:
                 the API as a sanity check that the user knows what
                 method they're targeting.  Score lock must be held by
                 the caller.  Returns the tuple of threads acted on."""
-                threads, txs = self.threads_to_txs(threads, caller='expire')
+                threads, txs = self.threads_to_txs(threads, 'expire')
                 for tx in txs:
                     tx.validate(method=method, state=State.BLOCKED, caller='expire')
                 for tx in txs:
@@ -3822,7 +4163,7 @@ class Scenario:
                 """Disregard timeout on the BLOCKED tx of each named
                 thread.  Score lock must be held by the caller.
                 Returns the tuple of threads acted on."""
-                threads, txs = self.threads_to_txs(threads, caller='disregard')
+                threads, txs = self.threads_to_txs(threads, 'disregard')
                 for tx in txs:
                     tx.validate(method=method, state=State.BLOCKED, caller='disregard')
                 for tx in txs:
@@ -3834,20 +4175,34 @@ class Scenario:
                 of each named thread, restoring the user's original
                 timeout.  Score lock must be held by the caller.
                 Returns the tuple of threads acted on."""
-                threads, txs = self.threads_to_txs(threads, caller='revert')
+                threads, txs = self.threads_to_txs(threads, 'revert')
                 for tx in txs:
                     tx.validate(method=method, state=State.BLOCKED, caller='revert')
                 for tx in txs:
                     tx.revert()
                 return threads
 
+            def normalize(self, o):
+                scenario = self.score.api
+                if isinstance(o, scenario.Primitive):
+                    assert (o is self.primitive) or (o is self.raw)
+                    return self.primitive
 
-            def threads_to_txs(self, threads, *, caller=None):
-                """Translate user-facing thread handles into top tx cores.
+                bound = o.__self__
+                name = o.__func__.__name__
+                if bound is self.primitive:
+                    return o
+                assert bound is self.raw
+                return getattr(self.primitive, name)
+
+            def threads_to_txs(self, threads, caller):
+                """Translate user-facing thread specs into active tx cores.
 
                 Called by API methods while score.lock is already held.
-                This helper only boxes threads to the current top active tx;
-                validation of method/state happens separately.
+                Each spec is either a bare thread, meaning the thread's
+                current top transaction, or a strict ``(thread, base_tx)``
+                tuple, meaning the current descendant transaction under
+                ``base_tx``.  Validation of method/state happens separately.
                 """
                 try:
                     threads = tuple(threads)
@@ -3863,27 +4218,59 @@ class Scenario:
                 score = self.score
                 current_thread = threading.current_thread()
 
-                for thread in threads:
-                    if not isinstance(thread, threading.Thread):
+                def selected_base_tx(thread, base_tx):
+                    tx = score.transactions.get(thread)
+                    cur = tx
+                    while cur is not None:
+                        if cur is base_tx:
+                            return None if tx is base_tx else tx
+                        cur = cur.parent
+                    return None
+
+                for thread_spec in threads:
+                    spec = score.parse_thread_or_base_tuple(thread_spec, caller)
+                    if spec is None:
                         raise TypeError(
-                            f"{prefix}expected a thread, got {thread!r}")
+                            f"{prefix}expected a thread or (thread, base_tx), "
+                            f"got {thread_spec!r}")
+                    thread, base_tx = spec
                     if thread is current_thread:
                         raise ValueError(
                             f"{prefix}thread {thread.name!r} is the calling thread; "
                             f"cannot wait on self")
 
                     terminated = Terminated(thread)
-                    signaled = score.wait({thread, terminated})
-                    if terminated in signaled:
-                        raise ValueError(f"{prefix}thread {thread.name!r} has exited")
-                    append(score.transactions[thread])
+                    if base_tx is None:
+                        signaled = score.wait({thread, terminated})
+                        if terminated in signaled:
+                            raise ValueError(f"{prefix}thread {thread.name!r} has exited")
+                        append(score.transactions[thread])
+                        continue
+
+                    while True:
+                        tx = selected_base_tx(thread, base_tx)
+                        if tx is not None:
+                            append(tx)
+                            break
+                        if base_tx.done:
+                            raise RuntimeError(
+                                f"{prefix}thread {thread.name!r} base tx ended "
+                                f"before pushing a child transaction")
+                        if base_tx.state in score.Driver.base_impasse_states:
+                            raise RuntimeError(
+                                f"{prefix}thread {thread.name!r} base tx is "
+                                f"blanket-parked, can't reach a child transaction")
+
+                        base_api = base_tx.api
+                        signaled = score.wait({Nested(base_api), base_api, terminated})
+                        if terminated in signaled:
+                            raise ValueError(f"{prefix}thread {thread.name!r} has exited")
+                        if base_api in signaled:
+                            raise RuntimeError(
+                                f"{prefix}thread {thread.name!r} base tx ended "
+                                f"before pushing a child transaction")
 
                 return (threads, txs)
-
-            def thread_to_tx(self, thread, *, caller=None):
-                """Translate one user-facing thread handle into its top tx core."""
-                threads, txs = self.threads_to_txs((thread,), caller=caller)
-                return txs[0]
 
 
             @base()
@@ -3891,7 +4278,7 @@ class Scenario:
             class Transaction(Signaling):
                 """Base class for all transactions.
 
-                Self-reporting (Signaling): tx.signal returns tx.done.
+                Self-reporting: tx.sample(scenario) returns tx.done.
                 Goes high once tx.state has reached a terminal_state
                 (RETURNED, RAISED, etc.); stays high forever (tx state
                 is monotonic).  Both the tx core and tx.api are
@@ -3905,7 +4292,7 @@ class Scenario:
                 # any tx: BLOCKED (initial park) and PAUSED (user
                 # pause).  Subclasses extend this for the additional
                 # states they visit -- TimeoutTransaction adds COMMIT
-                # (where commit() may OS-block in actual.X with score
+                # (where commit() may block natively in actual.X with score
                 # lock released), WaitingTransaction adds WAITING, etc.
                 parking_states = (State.BLOCKED, State.PAUSED)
 
@@ -3928,17 +4315,18 @@ class Scenario:
                     self.in_predicate = False
                     self.kwargs = kwargs = {}
                     self.kwargs_proxy = score.LockedDictProxy(kwargs)
-                    # method is the exact bound method the call arrived
-                    # on -- raw or cooked, condition or lock -- so the
-                    # user-facing tx.method shows what they actually
-                    # called.  normalized_method is the normalized form
-                    # used internally for Call/BoundMethod matching:
-                    # raw->cooked, and a Condition's acquire/release/
-                    # locked collapsed to the underlying lock's method.
+                    # method is the bound method this core was asked
+                    # to regulate.  Usually that's the method the user
+                    # called; Condition.acquire/release/locked delegate to
+                    # the underlying lock core, so those arrive here as
+                    # lock methods while entry_primitive records the
+                    # condition.  normalized_method is the internal
+                    # matching key: raw->cooked, and Condition lock-family
+                    # methods collapse to the underlying lock's method.
                     # method is never invoked (commit runs core.actual),
-                    # so the two can differ harmlessly.
+                    # so these aliases can differ harmlessly.
                     self.method = method
-                    self.normalized_method = _normalize_method(method)
+                    self.normalized_method = core.normalize(method)
                     self.pause = False
                     self.pausing = 0
                     self.raised = False
@@ -3991,7 +4379,8 @@ class Scenario:
 
                     p = core.primitive
                     api = core.api
-                    cls = getattr(api.__class__, method.__func__.__name__)
+                    api_method = self.normalized_method
+                    cls = getattr(api.__class__, api_method.__func__.__name__)
                     self.api = cls(api, self)
 
                     # Pre-built set of items settle() passes to
@@ -4029,8 +4418,8 @@ class Scenario:
                     """Return True if `child` is a nested tx that
                     represents delegated work this tx wants the Driver
                     to drive as if it were a top-level tx.  Default
-                    False: nested children are transient work the
-                    Driver passes through (skipping).
+                    False: nested children are surfaced to the caller
+                    unless the active Driver imperative enabled autoskip.
 
                     Override on parent tx classes whose children are
                     operationally significant -- the children visit
@@ -4061,6 +4450,25 @@ class Scenario:
                     # because tx.state is monotonic.
                     return self.state in State.terminal_states
 
+                def wait(self, state=None):
+                    """Wait until this transaction reaches ``state``.
+
+                    Called with the score lock held.  ``state=None`` waits
+                    for the transaction's sticky terminal signal.  A State
+                    waits for the corresponding Reached(tx, state) level
+                    signal, i.e. state or later.  Returns the current
+                    state after the wait completes.
+                    """
+                    if state is None:
+                        signal = self.api
+                    else:
+                        if not isinstance(state, State):
+                            raise TypeError(f"state must be a State or None, not {state!r}")
+                        signal = Reached(self.api, state)
+                    if not signal.sample(self.score.api):
+                        self.score.wait((signal,))
+                    return self.state
+
                 @property
                 def failed(self):
                     if self.succeeded is None:
@@ -4089,8 +4497,18 @@ class Scenario:
 
                 def call_signals(self, state):
                     thread = self.thread
-                    depth = self.depth
-                    return {Call(thread, method, state, depth=depth) for method in self.call_methods()}
+                    signals = set()
+                    score = self.score
+                    for method in self.call_methods():
+                        signals.add(Call(thread, method, state))
+                        interest_key = (thread, method)
+                        bases = score.scoped_call_bases.get(interest_key)
+                        if not bases:
+                            continue
+                        for base_core in tuple(bases):
+                            if Call._scoped_tx_selected(self, base_core, method):
+                                signals.add(Call((thread, base_core.api), method, state))
+                    return signals
 
                 def observe(self, state, callback):
                     if state <= self.state:
@@ -4108,18 +4526,16 @@ class Scenario:
                     self.log.append((_current_time(), state))
 
                     # Wake waiters parked on the new state's
-                    # Call(t, m, state, depth) signals (going-high
-                    # transition) and the TransactionState(api, state)
-                    # signal.  The previous state's Calls go low
-                    # silently -- Call.signal walks the chain and now
-                    # sees the new state, so anyone querying after
-                    # this transition gets the truth; waiters parked
-                    # on the OLD state's Call missed their window when
-                    # the tx left that state and don't need a wake.
+                    # Call(t, m, state) signals (going-high transition)
+                    # and the TransactionState(api, state) signal.
+                    # The previous state's Calls just went low; parked
+                    # Not(Call(...)) waiters are re-sampled below.
                     if self.score.transactions.get(self.thread) is self:
                         score = self.score
                         score.signals(self.call_signals(state))
                         score.signal(TransactionState(self.api, state))
+                        score.signal_sleeping_not_calls()
+                        score.signal_sleeping_not_transaction_states()
                         # Signal Reached(self.api, X) for every state X
                         # we've just crossed.  See last_reached_state
                         # docstring at __init__.
@@ -4337,7 +4753,7 @@ class Scenario:
                             f"scheduler-controlled parking state "
                             f"(in {state.name})")
 
-                def validate(self, method=None, state=None, method_description=None, caller=None):
+                def validate(self, *, method=None, state=None, method_description=None, caller):
                     """Validate a tx's method/state.
 
                     Called with score.lock held.  Returns tx for convenient
@@ -4355,10 +4771,8 @@ class Scenario:
                         mine = self.normalized_method
                         method_matches = False
                         for candidate in methods:
-                            try:
-                                cooked = _normalize_method(candidate)
-                            except (AttributeError, TypeError):
-                                cooked = candidate
+                            core = candidate.__self__._core
+                            cooked = core.normalize(candidate)
                             if self.method == candidate or mine == cooked:
                                 method_matches = True
                                 break
@@ -4452,18 +4866,20 @@ class Scenario:
                         # if that's a Condition, its underlying lock.
                         # Using a condition uses its lock (cond -> ul),
                         # never the reverse and never a sibling.
-                        # Primitive(cond) and Primitive(ul) stay distinct
+                        # _Primitive(cond) and _Primitive(ul) stay distinct
                         # signals; both fire from membership here.
-                        caller = _normalize_primitive(self.entry_primitive)
+                        core = self.entry_primitive._core
+                        caller = core.normalize(self.entry_primitive)
                         use = {self.core.primitive, caller}
                         underlying = getattr(caller._core, 'underlying', None)
                         if underlying is not None:
                             use.add(underlying.primitive)
                         self.use_primitives = use
                         # Per-(thread, primitive) Use is self-reporting;
-                        # strobe each cooked form to wake its waiters.
+                        # strobe each cooked form, including scoped Use
+                        # forms someone is currently sleeping on.
                         for p in self.use_primitives:
-                            score.signal(Use(thread, p))
+                            score.signals(score.use_signals(thread, p, self))
                         # Aggregate primitive-usage via the counter.
                         score.incref_usage(*self.use_primitives)
 
@@ -4564,19 +4980,20 @@ class Scenario:
                     parent_obj = self.parent
                     if parent_obj is not None and parent_obj.child is self:
                         parent_obj.child = None
+                        score.signal_sleeping_not_nested()
 
                     if self.regulated:
                         assert score.transactions.get(thread) is self, \
                             f"close: active tx on {thread.name!r} is not self; active={score.transactions.get(thread)!r}; self={self!r}"
 
                         # Update score.transactions BEFORE signaling
-                        # Not(Thread(t)): Not(Thread(t)).signal reads
+                        # Not(thread): Not(thread).sample reads
                         # `t not in score.transactions`, so the
                         # transaction-removal must precede the signal
-                        # so the assertion in score.signal (item.signal
+                        # so the assertion in score.signal (item.sample
                         # is True) holds.  Likewise the chain change
                         # silently takes Method(m), Use(t, p),
-                        # Primitive(p), and Nested(parent) low; those
+                        # _Primitive(p), and Nested(parent) low; those
                         # don't need decrement wakeups.
                         parent = self.parent
                         if parent is None:
@@ -4593,8 +5010,14 @@ class Scenario:
                             else:
                                 core.transactions[thread] = self.core_parent
 
+                        # The active transaction chain just changed, so
+                        # stateless Call(...) and Use(...) signals may
+                        # have gone low.
+                        score.signal_sleeping_not_calls()
+                        score.signal_sleeping_not_uses()
+
                         # Drop aggregate usage counts.  decref_usage
-                        # signals Not(BoundMethod(m)) / Not(Primitive(p))
+                        # signals Not(method) / Not(primitive)
                         # for any item whose count just reached 0.  We
                         # decref exactly what open increfed (stored on
                         # the tx) so a mid-tx family growth can't
@@ -4603,17 +5026,17 @@ class Scenario:
                         score.decref_usage(*self.use_primitives)
 
                         if self.signals_thread:
-                            # Not(Thread(t)) high transition needs a
-                            # wakeup; the chain change above already took
-                            # Thread(t) low so the assertion holds.
-                            score.signal(Not(score.Thread(thread)))
+                            # Not(thread) high transition needs a wakeup;
+                            # the chain change above already took Thread(t)
+                            # low so the assertion holds.
+                            score.signal(Not(thread))
 
             @base()
             @BoundInnerClass
             class TimeoutTransaction(Transaction):
                 # Commits of TimeoutTransaction subclasses typically do
                 # actual.X() with score.lock released, where the worker
-                # may OS-block indefinitely.  Treat COMMIT as a parking
+                # may block natively indefinitely.  Treat COMMIT as a parking
                 # state for settle-wait purposes: the worker handed off,
                 # blanket has nothing more to drive until either the OS
                 # call returns or the wait is told to give up.
@@ -4761,7 +5184,7 @@ class Scenario:
                 class TransactionAPI(Signaling):
                     """User-facing tx wrapper.
 
-                    Self-reporting (Signaling): api.signal returns
+                    Self-reporting: api.sample(scenario) returns
                     self._core.done.  Mirrors the tx core's Signaling
                     contract -- either form (api or core) can be passed
                     to scenario.wait.
@@ -4883,6 +5306,13 @@ class Scenario:
                             return self._core.timeout_state
 
                     def wait(self, state=None):
+                        """Block until this transaction reaches a state.
+
+                        With no state, wait until the transaction reaches
+                        a terminal state.  With a State, wait until the
+                        transaction has reached or passed that state.
+                        Returns the transaction's current state.
+                        """
                         with self._lock:
                             return self._core.wait(state)
 
@@ -4958,14 +5388,24 @@ class Scenario:
                 raw = raw_cls(self)
 
                 scenario = score.api
-                method_names = ('acquire', 'release', 'locked')
-                if isinstance(p, scenario.RLock) and (not _rlock_provides_locked): method_names = method_names[:-1]
+                if isinstance(p, scenario.RLock) and (not _rlock_provides_locked):
+                    method_names = ('acquire', 'release')
+                else:
+                    method_names = ('acquire', 'release', 'locked')
 
                 methods = {}
                 for method_name in method_names:
                     impl = getattr(self, method_name)
                     methods[getattr(p, method_name)] = impl
                     methods[getattr(raw, method_name)] = impl
+
+                if isinstance(p, scenario.Lock) and _lock_provides_legacy_aliases:
+                    methods[p.acquire_lock] = self.acquire
+                    methods[raw.acquire_lock] = self.acquire
+                    methods[p.release_lock] = self.release
+                    methods[raw.release_lock] = self.release
+                    methods[p.locked_lock] = self.locked
+                    methods[raw.locked_lock] = self.locked
 
                 super().__init__(primitive, api_cls, raw, methods)
 
@@ -5258,9 +5698,8 @@ class Scenario:
                 score = self.score
                 primitive = self.primitive
                 try:
-                    if not locked:
-                        lock.acquire()
-                        locked = True
+                    lock.acquire()
+                    locked = True
 
                     # Drive initial validate its role.  ACTIVE Driver:
                     # drain_recent yields it immediately, no drive.
@@ -5350,9 +5789,8 @@ class Scenario:
                             f"relay: thread {acquirer.thread.name!r} "
                             f"{primitive.acquire} returned False after disregard")
 
-                        if locked:
-                            lock.release()
-                            locked = False
+                        lock.release()
+                        locked = False
                         yield acquirer.thread
 
                         # This iter's acquirer becomes next iter's
@@ -5405,11 +5843,11 @@ class Scenario:
                         lock.assign(releaser, acquirer)   # hand off
                         lock.assign(acquirer)             # take an unheld lock
 
-                    Each thread may be immediately followed by a base tx
-                    scoping that thread's driver to its subtree under
-                    base; the release / acquire must then be base's next
-                    surfaced child:
-                        lock.assign(releaser, baseR, acquirer, baseA)
+                    A participant may be a strict ``(thread, base_tx)``
+                    tuple scoping that thread's driver to its subtree
+                    under base; the release / acquire must then be
+                    base's next surfaced child:
+                        lock.assign((releaser, baseR), (acquirer, baseA))
 
                     With a releaser the lock must currently be held;
                     without one it must be unheld.  pause=True leaves the
@@ -5449,13 +5887,12 @@ class Scenario:
                     yields -- so the caller can run code between hops
                     without holding the score's lock.
 
-                    Arguments are the participant threads in order: the
-                    first is `initial`, the rest are the acquirers.  Each
-                    thread may be immediately followed by a base tx
-                    scoping that thread's driver to its subtree under base
-                    (its release / acquire must then surface as base's
-                    children):
-                        lock.relay(initial, baseI, acq1, base1, acq2)
+                    Arguments are participant specs in order: the first
+                    is `initial`, the rest are the acquirers.  A spec may
+                    be a strict ``(thread, base_tx)`` tuple scoping that
+                    thread's driver to its subtree under base (its release
+                    / acquire must then surface as base's children):
+                        lock.relay((initial, baseI), (acq1, base1), acq2)
 
                     initial:   the lead thread.  May be either:
                                - the current lock holder, parked at
@@ -5491,6 +5928,26 @@ class Scenario:
         class LockCore(LockBaseCore):
             def __init__(self, score, primitive):
                 super().__init__(primitive, self.LockAPI, score.api.RawLock, threading.Lock())
+
+                self.normalized_method_names = {
+                    "acquire_lock": "acquire",
+                    "release_lock": "release",
+                    "locked_lock": "locked",
+                }
+
+            def normalize(self, o):
+                scenario = self.score.api
+                if isinstance(o, scenario.Primitive):
+                    assert (o is self.primitive) or (o is self.raw)
+                    return self.primitive
+
+                bound = o.__self__
+                assert (bound is self.primitive) or (bound is self.raw)
+                name = o.__func__.__name__
+                normalized_name = self.normalized_method_names.get(name, name)
+                if (bound is self.primitive) and (normalized_name is name):
+                    return o
+                return getattr(self.primitive, normalized_name)
 
             def actual_held(self):
                 """True iff the underlying threading.Lock is currently
@@ -5549,8 +6006,8 @@ class Scenario:
 
             def actual_held(self):
                 """True iff the underlying threading.RLock is currently
-                held.  threading.RLock didn't gain a .locked() method
-                until CPython 3.13, so we probe via ._is_owned().
+                held.  On runtimes where threading.RLock doesn't
+                expose .locked(), we probe via ._is_owned().
 
                 CAVEAT: ._is_owned() is thread-relative -- it reports
                 whether the *calling* thread owns the lock, not whether
@@ -5648,7 +6105,7 @@ class Scenario:
             def add(self, cond_core):
                 # The condition->lock relationship lives on
                 # cond_core.underlying (set at condition-core init) and
-                # is consulted by _normalize_method and the tx's
+                # is consulted by core.normalize and the tx's
                 # use_primitives computation.  Nothing else needs a
                 # cross-alias set anymore, so add() just records the
                 # condition as a member of the family.
@@ -5898,6 +6355,9 @@ class Scenario:
                         return tuple(d.thread for d in paused)
                     return paused[0].thread
 
+                def wait(self, threads):
+                    raise TypeError("wait() is only supported by Condition cycles")
+
                 def next_thread(self):
                     """Wake the first remaining waiter and return its
                     thread, or return None if there's nothing to wake
@@ -6005,10 +6465,11 @@ class Scenario:
 
                     def __init__(self, api, *args, **kwargs):
                         # BIC passes the outer API instance as 'api' automatically.
-                        # args are the participant threads, each optionally
-                        # followed by a base tx scoping that thread's driver to
-                        # its subtree under base.  kwargs (e.g. scheduler= for
-                        # Barrier/Condition) pass through to the core Cycle.
+                        # args are participant specs: either bare threads or
+                        # strict (thread, base_tx) tuples scoping that thread's
+                        # driver to its subtree under base.  kwargs (e.g.
+                        # scheduler= for Barrier/Condition) pass through to
+                        # the core Cycle.
                         self._lock = api._lock
                         with self._lock:
                             pairs = api._core.score.parse_thread_base_pairs(
@@ -6093,6 +6554,15 @@ class Scenario:
                         (raises ValueError if remaining is empty)."""
                         with self._lock:
                             return self._core.pause(threads)
+
+                    def wait(self, *threads):
+                        """For Condition cycles, drive wait_for waiters
+                        through a predicate-false wakeup so they wait again.
+                        With no threads named, acts on the first ready waiter;
+                        with threads named, returns those threads as a tuple.
+                        Other cycle types raise TypeError."""
+                        with self._lock:
+                            return self._core.wait(threads)
 
                     def iter(self, *threads):
                         if threads:
@@ -6208,6 +6678,22 @@ class Scenario:
                     self.raw.notify_all,
                     )
 
+                self.lock_methods = {'acquire', 'locked', 'release'}
+
+            def normalize(self, o):
+                scenario = self.score.api
+                if isinstance(o, scenario.Primitive):
+                    assert (o is self.primitive) or (o is self.raw)
+                    return self.primitive
+
+                bound = o.__self__
+                assert (bound is self.primitive) or (bound is self.raw)
+                name = o.__func__.__name__
+                if name in self.lock_methods:
+                    return getattr(self.underlying.primitive, name)
+                if bound is self.primitive:
+                    return o
+                return getattr(self.primitive, name)
 
 
             def fancy_repr(self, cls_name):
@@ -6433,6 +6919,13 @@ class Scenario:
                                 assert d.state is d.parked
                                 assert d.tx.state is State.PAUSED
                                 return 'ready'
+                            # Nested(wf) can go high as soon as the
+                            # child object is attached, just before it is
+                            # published as the thread's current tx.  Wait
+                            # for the actual cond.wait child to reach
+                            # BLOCKED before asking the Driver to park it
+                            # at WAITING.
+                            score.wait((Call(d.thread, core.primitive.wait, State.BLOCKED),))
                             d.listen_predicate = False
                             d.wait()
                             d()
@@ -6636,16 +7129,21 @@ class Scenario:
                     the wait_for's predicate to re-wait at WAITING."""
                     core = self.core
                     score = core.score
-                    self.ready.remove(d)
                     is_wait_for = d in self.wait_for_drivers
+                    if verb == 'wait':
+                        if d.tx.state is State.PAUSED:
+                            raise ValueError(
+                                "cycle: wait() invalid for a wait_for that "
+                                "already succeeded (it never waited)")
+                        if not is_wait_for:
+                            raise ValueError(
+                                "cycle: wait() invalid for a plain cond.wait")
+
+                    self.ready.remove(d)
 
                     if d.tx.state is State.PAUSED:
                         # An immediate-success wait_for parked at PAUSED,
                         # still holding UL (cycle's pausing incref).
-                        if verb == 'wait':
-                            raise ValueError(
-                                "cycle: wait() invalid for a wait_for that "
-                                "already succeeded (it never waited)")
                         tx = d.tx
                         if verb == 'pause':
                             # Hand the cycle's pausing incref off to the
@@ -6674,9 +7172,6 @@ class Scenario:
                         # Plain cond.wait: unstall (reacquire UL); the
                         # wait returns and the thread runs on.  pause
                         # parks it at PAUSED, wake/wait let it run.
-                        if verb == 'wait':
-                            raise ValueError(
-                                "cycle: wait() invalid for a plain cond.wait")
                         if verb == 'pause':
                             d.pause()
                             d()
@@ -6696,7 +7191,54 @@ class Scenario:
                     # re-runs the predicate (Predicate -> REENTERED).  Run
                     # the scheduler, wait for the predicate to return,
                     # then settle per the verb.
-                    wf = d.tx.api
+                    # d.tx is the inner cond.wait child; Predicate/Nested
+                    # signals belong to its parent wait_for transaction.
+                    wf = d.tx.parent.api
+
+                    if verb == 'wait':
+                        # Drive the just-notified inner wait to terminal.
+                        # Then watch the parent wait_for directly while it
+                        # re-runs the predicate; if it creates a fresh inner
+                        # wait, reactivate this Driver and park that child at
+                        # WAITING.
+                        d.finish()
+                        d()
+                        signals = (Predicate(wf), Nested(wf), Paused(wf), wf,
+                                   Terminated(d.thread))
+                        while True:
+                            fired = score.wait(signals)
+                            if Predicate(wf) in fired:
+                                with unlock(score.lock):
+                                    if self.scheduler is not _do_nothing:
+                                        self.scheduler(wf)
+                                score.wait((Not(Predicate(wf)),))
+                                continue
+                            if Terminated(d.thread) in fired:
+                                raise RuntimeError(
+                                    "cycle: wait() expected the predicate "
+                                    "to wait again, but the thread terminated")
+                            if Nested(wf) in fired:
+                                # Nested(wf) can beat publication of the
+                                # actual cond.wait child as the current tx;
+                                # wait for the child to be parked at BLOCKED
+                                # before Driver.wait() tries to drive it to
+                                # WAITING.
+                                score.wait((Call(d.thread, core.primitive.wait, State.BLOCKED),))
+                                d.wait()
+                                d()
+                                self.previous = d
+                                return
+                            # The predicate did not wait again; this waiter
+                            # has left wait_for and now owns the underlying
+                            # lock until its following lock.release runs.
+                            # Preserve the relay pointer so a caller who
+                            # catches this error can still drain the rest of
+                            # the cycle.
+                            self.previous = d
+                            raise RuntimeError(
+                                "cycle: wait() expected the predicate to "
+                                "wait again, but the wait_for exited")
+
                     d.listen_predicate = True
                     if verb == 'pause':
                         d.pause()
@@ -6713,23 +7255,8 @@ class Scenario:
                         fired = score.wait(signals)
                         if Terminated(d.thread) in fired:
                             d.listen_predicate = False
-                            if verb == 'wait':
-                                raise RuntimeError(
-                                    "cycle: wait() expected the predicate "
-                                    "to wait again, but the thread "
-                                    "terminated")
                             self.previous = d
                             return
-                        if verb == 'wait':
-                            if Nested(wf) in fired:
-                                d.listen_predicate = False
-                                d.wait()
-                                d()
-                                self.previous = d
-                                return
-                            raise RuntimeError(
-                                "cycle: wait() expected the predicate to "
-                                "wait again, but the wait_for exited")
                         if verb == 'pause':
                             if Paused(wf) in fired:
                                 d.listen_predicate = False
@@ -7060,7 +7587,7 @@ class Scenario:
                     itself.)"""
                     with self._lock:
                         core = self._core
-                        threads, txs = core.threads_to_txs(threads, caller='unstall')
+                        threads, txs = core.threads_to_txs(threads, 'unstall')
                         for tx in txs:
                             tx.validate(method=method, state=State.STALLED, caller='unstall')
                         for tx in txs:
@@ -7104,6 +7631,8 @@ class Scenario:
 
             def __init__(self, score, primitive, value, bounded, actual_cls, raw_cls, api_cls):
                 self.lock = score.lock
+                self.bounded = bounded
+                self.initial_value = value
                 p = primitive
                 raw = raw_cls(self)
                 methods = {
@@ -7153,187 +7682,181 @@ class Scenario:
                 return f"{before}{at}{addr}:{after}"
 
             def __repr__(self):
-                return self.fancy_repr()
+                return self.fancy_repr(type(self).__name__)
 
             def allocate(self, pairs, pause=False):
-                """Driver-based ordered drive of Semaphore acquires
-                and releases.
+                """Drive an ordered script of Semaphore acquires and releases.
 
-                `pairs` is a list of (thread, base_tx_or_None) tuples in
-                spec order.  A non-None base scopes that thread's driver
-                to its subtree under base -- its acquire / release must
-                then surface as base's child.
+                Participants are thread specs, in user order.  Each
+                participant's next transaction must be acquire or
+                release on this Semaphore, and it must still be at
+                BLOCKED when allocate first sees it.
 
-                Returns an iterator that yields each acquire thread
-                in turn.  Setup -- Driver construction, role
-                classification, and semaphore-math feasibility check
-                -- runs SYNCHRONOUSLY (before the generator returns)
-                so that an infeasible batch raises RuntimeError
-                before any release in the batch executes.  The
-                Driver-yielding loop runs lazily as the iterator is
-                consumed.
+                allocate surfaces participants at BLOCKED, keeps all
+                unchosen transactions parked there, and drives one
+                acquire / release transaction at a time.  It chooses
+                the first pending transaction that can make progress
+                using the Semaphore's current state: releases can run,
+                and acquires can run when a unit is available.  If no
+                pending transaction can be proven runnable, allocate
+                drives the oldest pending transaction; an impossible
+                blocking acquire therefore blocks the iterator, just as
+                the user's semaphore traffic script would deadlock.
 
-                Pass 1 (sync): drive each Driver to active, classify
-                by method, run pre-flight math check.  Imperatives
-                are NOT pushed here -- doing so would unblock all
-                txs at once and let workers race.
-
-                Pass 2 (lazy, in the generator): a Chain over the
-                drivers in spec order is added to a Dispatch.  As
-                Chain promotes each driver, its imperative
-                (d.pause() or d.finish()) is pushed -- unblocking
-                exactly one tx at a time, so commits happen in spec
-                order.  Each acquire thread yields when its driver
-                reaches terminal.
+                Duplicate threads are allowed.  Only one occurrence of
+                a thread is active at once; the next occurrence starts
+                after the previous one exits.  The returned iterator
+                yields each acquire thread when that acquire succeeds
+                (or parks at PAUSED, if pause=True).
                 """
+                return self._allocate_pending(pairs, pause)
+
+            def _allocate_pending(self, pairs, pause=False):
                 lock = self.score.lock
                 score = self.score
                 acquire_methods = (self.primitive.acquire, self.raw.acquire)
                 release_methods = (self.primitive.release, self.raw.release)
 
+                class Entry:
+                    def __init__(self, index, thread, base_tx):
+                        self.index = index
+                        self.thread = thread
+                        self.base_tx = base_tx
+                        self.driver = None
+                        self.tx = None
+                        self.role = None
+
+                entries = [Entry(i, thread, base_tx)
+                           for i, (thread, base_tx) in enumerate(pairs)]
+                by_thread = defaultdict(deque)
+                thread_order = []
+                for entry in entries:
+                    if entry.thread not in by_thread:
+                        thread_order.append(entry.thread)
+                    by_thread[entry.thread].append(entry)
+
+                pending = []
+                drivers = []
+
+                def classify(tx):
+                    method = tx.method
+                    if method in acquire_methods:
+                        return 'acquire'
+                    if method in release_methods:
+                        return 'release'
+                    return None
+
+                def start(entry):
+                    d = score.Driver(entry.thread, entry.base_tx)
+                    entry.driver = d
+                    drivers.append(d)
+                    d()
+                    if d.state is d.impasse:
+                        raise RuntimeError(
+                            f"allocate: thread {entry.thread.name!r} base tx "
+                            f"is blanket-parked, can't reach its acquire "
+                            f"or release")
+                    if d.state is d.terminated:
+                        if entry.base_tx is not None:
+                            raise RuntimeError(
+                                f"allocate: thread {entry.thread.name!r} base "
+                                f"tx ended before pushing a tx")
+                        raise RuntimeError(
+                            f"allocate: thread {entry.thread.name!r} "
+                            f"terminated before pushing a tx")
+                    if d.state is not d.active:
+                        raise RuntimeError(
+                            f"allocate: thread {entry.thread.name!r} stopped "
+                            f"in unexpected Driver state {d.state.name}")
+
+                    tx = d.tx
+                    role = classify(tx)
+                    if role is None:
+                        raise ValueError(
+                            f"allocate: thread {entry.thread.name!r} should be "
+                            f"calling acquire or release on this Semaphore, "
+                            f"but is calling {tx.method}")
+                    if tx.state is not State.BLOCKED:
+                        raise RuntimeError(
+                            f"allocate: {role} thread {entry.thread.name!r} "
+                            f"must be at BLOCKED, got {tx.state.name}")
+                    entry.tx = tx
+                    entry.role = role
+                    pending.append(entry)
+
+                def can_run(entry):
+                    tx = entry.tx
+                    if entry.role == 'release':
+                        if not self.bounded:
+                            return True
+                        initial = getattr(self.actual, '_initial_value', None)
+                        if initial is None:
+                            return True
+                        n = getattr(tx, 'n', 1)
+                        return self.value + n <= initial
+
+                    assert entry.role == 'acquire'
+                    if not tx.kwargs.get('blocking', True):
+                        return True
+                    if tx.timeout == 0:
+                        return True
+                    return self.available > 0
+
                 lock.acquire()
-                role = {}
                 try:
-                    # Build a Driver per thread, in spec order, each
-                    # scoped to its base tx if given.  A duplicate thread
-                    # is rejected up front (deterministic ValueError,
-                    # before any drive), and Driver(current_thread)
-                    # raises.
-                    seen = set()
-                    for thread, base in pairs:
-                        if thread in seen:
-                            raise ValueError(
-                                f"allocate: thread {thread.name!r} "
-                                f"specified more than once")
-                        seen.add(thread)
-                        d = score.Driver(thread, base)
-                        role[d] = None
+                    for thread in thread_order:
+                        start(by_thread[thread][0])
 
-                    # Pass 1a: drive each Driver to active (blocking
-                    # until the thread has pushed a tx), classify by
-                    # method.  Do NOT push imperatives yet -- math
-                    # check below must precede any drive that would
-                    # commit a release.
-                    for d in role:
+                    remaining = len(entries)
+                    while remaining:
+                        for i, entry in enumerate(pending):
+                            if can_run(entry):
+                                pending.pop(i)
+                                break
+                        else:
+                            entry = pending.pop(0)
+
+                        d = entry.driver
+                        if entry.role == 'acquire' and pause:
+                            d.pause(autoskip=True)
+                        else:
+                            d.finish(autoskip=True)
                         d()
-                        if d.state is d.impasse:
-                            raise RuntimeError(
-                                f"allocate: thread {d.thread.name!r} base tx "
-                                f"is blanket-parked, can't reach its acquire "
-                                f"or release")
-                        if d.state is d.terminated:
-                            if d.base_tx is not None:
-                                raise RuntimeError(
-                                    f"allocate: thread {d.thread.name!r} base "
-                                    f"tx ended before pushing a tx")
-                            raise RuntimeError(
-                                f"allocate: thread {d.thread.name!r} "
-                                f"terminated before pushing a tx")
-                        method = d.tx.method
-                        if method in acquire_methods:
-                            role[d] = 'acquire'
-                        elif method in release_methods:
-                            role[d] = 'release'
-                        else:
-                            raise ValueError(
-                                f"allocate: thread {d.thread.name!r} should be "
-                                f"calling acquire or release on this Semaphore, "
-                                f"but is calling {method}")
 
-                    # Pass 1b: every tx must be at BLOCKED.  Allowing
-                    # an acquire past BLOCKED (in COMMIT, or already
-                    # parked at WAITING) means the worker is racing
-                    # other actual.wait waiters outside the batch
-                    # for slots, which breaks any ordering guarantee
-                    # allocate could otherwise provide.  Allowing a
-                    # release past BLOCKED is the same: the release
-                    # has already committed (or is mid-commit) so
-                    # allocate's pre-flight math is observing stale
-                    # state.  Reject either with a clear error.
-                    for d, r in role.items():
-                        if d.tx.state is not State.BLOCKED:
-                            raise RuntimeError(
-                                f"allocate: {r} thread {d.thread.name!r} "
-                                f"must be at BLOCKED, got {d.tx.state.name}")
-
-                    # Pass 1c: pre-flight semaphore math.  Must run
-                    # before any release commits -- callers expect
-                    # that if allocate raises, nothing in the batch
-                    # has executed yet.  Every acquire must consume
-                    # a unit of slack from the running tally.
-                    value = self.available
-                    for d, r in role.items():
-                        tx = d.tx
-                        if r == 'release':
-                            value += tx.n
-                            continue
-                        if value <= 0:
-                            raise RuntimeError(
-                                f"allocate: acquire thread {tx.thread.name!r} "
-                                f"cannot be proven to succeed")
-                        value -= 1
-
-                    # Pass 1d: math is proven, push imperatives.
-                    # Under lazy driver semantics, calling
-                    # d.pause()/d.finish() here stages each driver's
-                    # tx.unblock on self.lazy but doesn't fire it.
-                    # The Chain in pass 2 promotes one driver at a
-                    # time and fires only the promoted driver's
-                    # lazy, so workers can't race for score.lock.
-                    for d, r in role.items():
-                        if r == 'acquire' and pause:
-                            d.pause()
-                        else:
-                            d.finish()
-                except BaseException:
-                    # Setup failed.  Close any non-terminal Drivers
-                    # and release the lock before re-raising.
-                    for d in role:
-                        if not d.done:
-                            d.close()
-                    lock.release()
-                    raise
-
-                # Setup succeeded; return the generator that does the
-                # chain-drive + yields.  The generator owns the lock
-                # from here.
-                return self._allocate_drive(role, lock)
-
-            def _allocate_drive(self, role, lock):
-                """Lazy phase of allocate: build a Chain over the
-                drivers in spec order, add it to a Dispatch, and
-                yield each acquire thread as its Driver reaches
-                terminal.
-
-                The Chain promotes drivers one at a time.  Each
-                promotion fires the promoted driver's lazy callable
-                (its staged tx.unblock from pass 1d), unblocking
-                exactly one tx at a time -- commits happen in spec
-                order.
-                """
-                score = self.score
-                try:
-                    chain = score.Chain(*role.keys())
-                    dispatch = score.Dispatch()
-                    dispatch.add(chain)
-
-                    for d in dispatch:
-                        tx = d.tx
-                        if tx is not None and tx.state == State.RAISED:
+                        tx = entry.tx
+                        if tx.state is State.RAISED:
                             raise tx.result
-                        if tx is not None and tx.result is False:
+                        if entry.role == 'acquire' and tx.result is False:
                             status = "timed out" if tx.timed_out else "failed"
                             raise RuntimeError(
-                                f"allocate: {role[d]} thread {d.thread.name!r} {status}")
-                        if role[d] != 'acquire':
-                            continue
-                        lock.release()
-                        try:
-                            yield d.thread
-                        finally:
-                            lock.acquire()
+                                f"allocate: acquire thread {entry.thread.name!r} {status}")
+                        if entry.role == 'acquire' and pause:
+                            if d.state is not d.parked:
+                                raise RuntimeError(
+                                    f"allocate: thread {entry.thread.name!r} stopped "
+                                    f"in unexpected Driver state {d.state.name}")
+                        elif d.state is not d.finished:
+                            raise RuntimeError(
+                                f"allocate: thread {entry.thread.name!r} stopped "
+                                f"in unexpected Driver state {d.state.name}")
+
+                        remaining -= 1
+
+                        thread_entries = by_thread[entry.thread]
+                        assert thread_entries[0] is entry
+                        thread_entries.popleft()
+
+                        if entry.role == 'acquire':
+                            lock.release()
+                            try:
+                                yield entry.thread
+                            finally:
+                                lock.acquire()
+
+                        if thread_entries:
+                            start(thread_entries[0])
                 finally:
-                    for d in role:
+                    for d in drivers:
                         if not d.done:
                             d.close()
                     lock.release()
@@ -7360,19 +7883,34 @@ class Scenario:
                         self.timed_out = True
                     return result
 
-            @BoundInnerClass
-            class release(base.Transaction):
-                def __init__(self, core, method, start_time, regulated, n=1):
-                    super().__init__(method, start_time, regulated)
-                    self.n = n
-                    self.kwargs['n'] = n
+            if _semaphore_release_accepts_n:
+                @BoundInnerClass
+                class release(base.Transaction):
+                    def __init__(self, core, method, start_time, regulated, n=1):
+                        super().__init__(method, start_time, regulated)
+                        self.n = n
+                        self.kwargs['n'] = n
 
-                def __repr__(self):
-                    return self.repr("Semaphore.release")
+                    def __repr__(self):
+                        return self.repr("Semaphore.release")
 
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.release(self.n)
+                    def commit(self):
+                        with unlock(self.score.lock):
+                            return self.core.actual.release(self.n)
+            else:
+                @BoundInnerClass
+                class release(base.Transaction):
+                    n = 1
+
+                    def __init__(self, core, method, start_time, regulated):
+                        super().__init__(method, start_time, regulated)
+
+                    def __repr__(self):
+                        return self.repr("Semaphore.release")
+
+                    def commit(self):
+                        with unlock(self.score.lock):
+                            return self.core.actual.release()
 
             @base()
             @BoundInnerClass
@@ -7408,9 +7946,10 @@ class Scenario:
                     def __repr__(self):
                         return self._core.repr("Semaphore.release")
 
-                    @property
-                    def n(self):
-                        return self._core.n
+                    if _semaphore_release_accepts_n:
+                        @property
+                        def n(self):
+                            return self._core.n
 
                 def allocate(self, *args, pause=False):
                     """Drive an ordered sequence of Semaphore acquires and releases.
@@ -7422,13 +7961,13 @@ class Scenario:
                     yield so the caller can run code in their own
                     with-lock context.
 
-                    Arguments are the participant threads, in spec order,
+                    Arguments are participant specs, in spec order,
                     mixing acquire-side and release-side threads (all
                     parked at BLOCKED on Semaphore.acquire / .release).
-                    Each thread may be immediately followed by a base tx
+                    A spec may be a strict ``(thread, base_tx)`` tuple
                     scoping its driver to its subtree under base (its
                     acquire / release must then surface as base's child):
-                        sem.allocate(t1, base1, t2, t3, base3)
+                        sem.allocate((t1, base1), t2, (t3, base3))
 
                     Mixing in a tx that's already past BLOCKED (in
                     COMMIT, parked at WAITING, or further along) raises
@@ -7447,8 +7986,9 @@ class Scenario:
                     if not pairs:
                         raise ValueError("allocate requires at least one thread")
                     # No lock here: the core generator acquires and
-                    # manages score.lock itself.  Duplicate threads are
-                    # rejected in the core's setup pass.
+                    # manages score.lock itself.  Duplicate thread specs
+                    # are allowed; the core starts later occurrences only
+                    # after the previous occurrence has finished.
                     return self._core.allocate(pairs, pause=pause)
 
                 def expire(self, method, *threads):
@@ -7479,7 +8019,7 @@ class Scenario:
             @base()
             class SemaphoreAPI(base.SemaphoreAPIBase):
                 def __repr__(self):
-                    return self._core.fancy_repr('BoundedSemaphoreAPI')
+                    return self._core.fancy_repr('SemaphoreAPI')
 
         @BoundInnerClass
         class BoundedSemaphoreCore(base.SemaphoreCoreBase):
@@ -7525,7 +8065,7 @@ class Scenario:
             opaque -- there's no Python Condition to introspect -- so
             blanket regulates it purely through the tx state machine.
             get is a TimeoutTransaction: it parks at BLOCKED, then on
-            unblock its commit OS-blocks inside actual.get() in COMMIT
+            unblock its commit blocks inside actual.get() in COMMIT
             until an item arrives (or it times out / raises Empty),
             then reaches COMMITTED.  The items themselves are opaque
             payload blanket never inspects.
@@ -7566,10 +8106,35 @@ class Scenario:
 
             def compatibility_repr(self):
                 addr = hex(id(self.primitive)).upper()
-                return f"<queue.SimpleQueue object at {addr}>"
+                cls = type(self.actual)
+                return f"<{cls.__module__}.{cls.__qualname__} object at {addr}>"
 
             def __repr__(self):
                 return self.fancy_repr('SimpleQueueCore')
+
+            def deliver_role(self, tx):
+                if tx.core is not self:
+                    return None
+                if isinstance(tx, (self.get, self.get_nowait)):
+                    return 'get'
+                if isinstance(tx, (self.put, self.put_nowait)):
+                    return 'put'
+                return None
+
+            def deliver_size(self):
+                return self.actual.qsize()
+
+            def deliver_can_run(self, role, size):
+                return role == 'put' or size > 0
+
+            def deliver_adjust_size(self, role, size):
+                if role == 'put':
+                    return size + 1
+                assert role == 'get'
+                return size - 1
+
+            def deliver(self, pairs):
+                return self.score.drive_queue_deliver(self, pairs)
 
             # ---- blocking method: get (TimeoutTransaction) ----
 
@@ -7585,8 +8150,8 @@ class Scenario:
                 def commit(self):
                     block = self.kwargs['block']
                     timeout = self.timeout
-                    # Opaque commit: OS-block inside actual.get with the
-                    # score lock released.  Raises queue.Empty on a
+                    # Opaque commit: actual.get() blocks with the score
+                    # lock released.  Raises queue.Empty on a
                     # non-blocking/timed-out empty read; that propagates
                     # to the worker as a normal RAISED tx.
                     with unlock(self.score.lock):
@@ -7662,11 +8227,6 @@ class Scenario:
                 def __repr__(self):
                     return self._core.fancy_repr('SimpleQueueAPI')
 
-                @property
-                def qsize(self):
-                    with self._lock:
-                        return self._core.actual.qsize()
-
                 @BoundInnerClass
                 class get(base.TransactionAPI):
                     def __repr__(self):
@@ -7710,6 +8270,13 @@ class Scenario:
                         return self._core.revert(method, threads)
 
 
+                def deliver(self, *args):
+                    pairs = self._core.score.parse_thread_base_pairs(
+                        args, 'deliver')
+                    with self._lock:
+                        return self._core.deliver(pairs)
+
+
         ###############################################################
         ###############################################################
         ##
@@ -7743,7 +8310,7 @@ class Scenario:
             cond.wait() spawns a child StallingTransaction (the real
             park).  join is a plain Transaction (it cannot time out) whose
             internal all_tasks_done.wait()s likewise spawn child stalling
-            waits.  [get/put/join: stage 2.]
+            waits.
             """
 
             def __init__(self, score, primitive, maxsize, actual_cls, raw_cls, api_cls):
@@ -7754,14 +8321,14 @@ class Scenario:
                 self.actual = actual_cls(maxsize)
 
                 # Swap the queue's shared mutex and its three Conditions
-                # onto a raw blanket Lock -- the same shape as Event: the
-                # lock's release-save / acquire-restore shims expose
-                # WAITING (and STALLED) scheduler points for whichever tx
-                # is OS-blocked inside actual.X's internal cond.wait().
-                # The Conditions are plain native threading.Conditions; the
-                # mutex/wait/notify traffic is unregulated, and the
-                # scheduler controls concurrency at the get/put/join tx
-                # level (which method calls are allowed to proceed).
+                # onto a raw blanket Lock -- the same shape as Event.  The
+                # Conditions are native threading.Conditions, but they use
+                # the raw blanket mutex, so their release-save /
+                # acquire-restore traffic gives the scheduler WAITING (and
+                # STALLED) points inside queue.py's own wait loops.  The
+                # scheduler still controls concurrency at the top-level
+                # get/put/join transaction level: it chooses which method
+                # call is allowed to proceed.
                 underlying_lock = score.api.Lock()
                 self.underlying_lock = underlying_lock
                 self.underlying_lock_core = underlying_lock._core
@@ -7800,6 +8367,10 @@ class Scenario:
                     raw.task_done:  self.task_done,
                 }
 
+                if _queue_provides_shutdown:
+                    methods[p.shutdown] = self.shutdown
+                    methods[raw.shutdown] = self.shutdown
+
                 super().__init__(primitive, api_cls, raw, methods)
 
             @property
@@ -7818,7 +8389,35 @@ class Scenario:
 
             def compatibility_repr(self):
                 addr = hex(id(self.primitive)).upper()
-                return f"<queue.{self.label} object at {addr}>"
+                cls = type(self.actual)
+                return f"<{cls.__module__}.{cls.__qualname__} object at {addr}>"
+
+            def deliver_role(self, tx):
+                if tx.core is not self:
+                    return None
+                if isinstance(tx, (self.get, self.get_nowait)):
+                    return 'get'
+                if isinstance(tx, (self.put, self.put_nowait)):
+                    return 'put'
+                return None
+
+            def deliver_size(self):
+                return self.actual._qsize()
+
+            def deliver_can_run(self, role, size):
+                if role == 'get':
+                    return size > 0
+                assert role == 'put'
+                return self.maxsize <= 0 or size < self.maxsize
+
+            def deliver_adjust_size(self, role, size):
+                if role == 'put':
+                    return size + 1
+                assert role == 'get'
+                return size - 1
+
+            def deliver(self, pairs):
+                return self.score.drive_queue_deliver(self, pairs)
 
             # ---- non-blocking methods (plain Transaction) ----
 
@@ -7880,6 +8479,21 @@ class Scenario:
                     with unlock(self.score.lock):
                         return self.core.actual.task_done()
 
+            if _queue_provides_shutdown:
+                @BoundInnerClass
+                class shutdown(base.Transaction):
+                    def __init__(self, core, method, start_time, regulated, immediate=False):
+                        super().__init__(method, start_time, regulated)
+                        self.kwargs['immediate'] = immediate
+
+                    def __repr__(self):
+                        return self.repr(f"{self.core.label}.shutdown")
+
+                    def commit(self):
+                        immediate = self.kwargs['immediate']
+                        with unlock(self.score.lock):
+                            return self.core.actual.shutdown(immediate=immediate)
+
             # ---- blocking methods ----
             #
             # get/put run queue.py's own `with cond: while ...: cond.wait()`
@@ -7889,7 +8503,7 @@ class Scenario:
             # They can time out, so they're WaitingTransactions (a
             # TimeoutTransaction that visits WAITING).  join cannot time
             # out, so it is a plain Transaction; its all_tasks_done.wait
-            # is an opaque OS-block, so it parks at COMMIT (and restates
+            # is an opaque native block, so it parks at COMMIT (and restates
             # the lock-shim hooks -- see the class).
 
             @BoundInnerClass
@@ -7928,7 +8542,7 @@ class Scenario:
             class join(base.Transaction):
                 # join() can't time out (actual.join takes no args), so
                 # it is NOT a TimeoutTransaction -- but it parks in
-                # COMMIT (the opaque OS-block inside actual.join's
+                # COMMIT (the opaque block inside actual.join's
                 # all_tasks_done.wait), so it declares COMMIT in its own
                 # parking set.  As a plain Transaction it doesn't surface
                 # WAITING, so it also restates the lock-shim hooks the
@@ -7953,11 +8567,6 @@ class Scenario:
                     super().__init__(raw)
 
                 @property
-                def qsize(self):
-                    with self._lock:
-                        return self._core.actual.qsize()
-
-                @property
                 def maxsize(self):
                     with self._lock:
                         return self._core.actual.maxsize
@@ -7965,47 +8574,57 @@ class Scenario:
                 @BoundInnerClass
                 class qsize(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.qsize")
+                        return self._core.repr(f"{self._core.core.label}.qsize")
 
                 @BoundInnerClass
                 class get(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.get")
+                        return self._core.repr(f"{self._core.core.label}.get")
 
                 @BoundInnerClass
                 class put(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.put")
+                        return self._core.repr(f"{self._core.core.label}.put")
 
                 @BoundInnerClass
                 class join(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.join")
+                        return self._core.repr(f"{self._core.core.label}.join")
 
                 @BoundInnerClass
                 class empty(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.empty")
+                        return self._core.repr(f"{self._core.core.label}.empty")
 
                 @BoundInnerClass
                 class full(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.full")
+                        return self._core.repr(f"{self._core.core.label}.full")
 
                 @BoundInnerClass
                 class put_nowait(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.put_nowait")
+                        return self._core.repr(f"{self._core.core.label}.put_nowait")
 
                 @BoundInnerClass
                 class get_nowait(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.get_nowait")
+                        return self._core.repr(f"{self._core.core.label}.get_nowait")
 
                 @BoundInnerClass
                 class task_done(base.TransactionAPI):
                     def __repr__(self):
-                        return self._core.repr(f"{self._core.label}.task_done")
+                        return self._core.repr(f"{self._core.core.label}.task_done")
+
+                if _queue_provides_shutdown:
+                    @BoundInnerClass
+                    class shutdown(base.TransactionAPI):
+                        def __repr__(self):
+                            return self._core.repr(f"{self._core.core.label}.shutdown")
+
+                        @property
+                        def immediate(self):
+                            return self._core.kwargs['immediate']
 
                 def expire(self, method, *threads):
                     with self._lock:
@@ -8018,6 +8637,12 @@ class Scenario:
                 def revert(self, method, *threads):
                     with self._lock:
                         return self._core.revert(method, threads)
+
+                def deliver(self, *args):
+                    pairs = self._core.score.parse_thread_base_pairs(
+                        args, 'deliver')
+                    with self._lock:
+                        return self._core.deliver(pairs)
 
         @base()
         @BoundInnerClass
@@ -8761,7 +9386,7 @@ class Scenario:
         # the unwrapped class, so Core.X here yields exactly the same
         # unwrapped class objects the through-the-class path does --
         # no module-scope plumbing, no __wrapped__ groping.
-        TxAPI = Core.API.TransactionAPI
+        TransactionAPI = Core.API.TransactionAPI
         Transaction = Core.Transaction
         TimeoutTransaction = Core.TimeoutTransaction
         WaitingTransaction = Core.WaitingTransaction
@@ -8786,12 +9411,19 @@ class Scenario:
         finish), PARKING (stop at a parking state and stay there),
         FINISHING (stop after the tx exits), and so on.  Imperatives
         on the Driver (skip, finish, block, commit, wait, stall,
-        pausing, pause) request a state transition; the Driver
+        pause) request a state transition; the Driver
         advances the underlying tx and validates the result.
 
-        Construct with a worker thread.  The Driver immediately
-        registers itself in the score's drivers registry; only one
-        Driver per thread is allowed.
+        Construct with a worker thread, optionally with a base
+        transaction.  Driver objects claim the score's per-thread
+        driving slot only while actively driving, so multiple idle
+        Driver objects for a thread may coexist.  When a nested tx
+        appears, a raw Driver yields in NESTING state for the
+        caller to steer.  When the driven transaction is running a
+        user callback and that callback asks blanket for scheduler
+        help, a raw Driver yields in REENTERED.  High-level scenario
+        imperatives opt into autoskip where that is their documented
+        behavior.
         """
 
         # State constants, accessible at instance OR class level.
@@ -8806,6 +9438,7 @@ class Scenario:
         terminated = base.Driver.terminated
         impasse    = base.Driver.impasse  # base out of purview, frozen
         nesting    = base.Driver.nesting  # NESTING state (child surfaced)
+        reentered  = base.Driver.reentered  # REENTERED state (callback reentry)
 
         driving_states  = base.Driver.driving_states
         active_states   = base.Driver.active_states
@@ -8825,6 +9458,12 @@ class Scenario:
         @property
         def thread(self):
             return self._core.thread
+
+        @property
+        def base_tx(self):
+            with self._lock:
+                tx = self._core.base_tx
+                return tx.api if tx is not None else None
 
         @property
         def state(self):
@@ -9217,8 +9856,7 @@ class Scenario:
     @base()
     @BoundInnerClass
     class RLockPrimitive(base.LockPrimitive):
-        # threading.RLock._recursion_count() was added in Python 3.12.
-        # Mirror the underlying type: expose the method only when the
+        # Mirror the underlying type: expose this private helper only when the
         # underlying has it, so hasattr() returns the same answer as
         # for a raw threading.RLock.
         if hasattr(threading.RLock(), '_recursion_count'):
@@ -9241,10 +9879,11 @@ class Scenario:
             with ul._lock:
                 return ul._core(ul.release, True, entry=self)
 
-        def locked(self):
-            ul = self._core.underlying.primitive
-            with ul._lock:
-                return ul._core(ul.locked, True, entry=self)
+        if _condition_provides_locked:
+            def locked(self):
+                ul = self._core.underlying.primitive
+                with ul._lock:
+                    return ul._core(ul.locked, True, entry=self)
 
         def __enter__(self):
             self.acquire()
@@ -9284,8 +9923,7 @@ class Scenario:
     class QueuePrimitive(base.Primitive):
         """Cooked base for Queue / LifoQueue / PriorityQueue, holding the
         regulated method implementations shared by all three (they differ
-        only in which core they build).  Not a context manager.
-        [get/put/join are added in stage 2.]"""
+        only in which core they build).  Not a context manager."""
 
         @property
         def maxsize(self):
@@ -9328,10 +9966,15 @@ class Scenario:
             with self._lock:
                 return self._core(self.task_done, True)
 
+        if _queue_provides_shutdown:
+            def shutdown(self, immediate=False):
+                with self._lock:
+                    return self._core(self.shutdown, True, immediate=immediate)
+
 
     @base()
     @BoundInnerClass
-    class RawQueuePrimitive(base.QueuePrimitive):
+    class RawQueuePrimitive(base.QueuePrimitive, _Raw):
         """Raw (unregulated) base for the Queue family: the same methods
         as QueuePrimitive but dispatched non-regulated."""
 
@@ -9374,6 +10017,11 @@ class Scenario:
             with self._lock:
                 return self._core(self.task_done, False)
 
+        if _queue_provides_shutdown:
+            def shutdown(self, immediate=False):
+                with self._lock:
+                    return self._core(self.shutdown, False, immediate=immediate)
+
 
     @base()
     @BoundInnerClass
@@ -9396,7 +10044,7 @@ class Scenario:
                 return self._core.broken
 
     @BoundInnerClass
-    class RawLock(base.LockPrimitive):
+    class RawLock(base.LockPrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9405,19 +10053,34 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, False, blocking=blocking, timeout=timeout)
 
+        if _lock_provides_legacy_aliases:
+            def acquire_lock(self, blocking=True, timeout=-1):
+                with self._lock:
+                    return self._core(self.acquire, False, blocking=blocking, timeout=timeout)
+
         def release(self):
             with self._lock:
                 return self._core(self.release, False)
+
+        if _lock_provides_legacy_aliases:
+            def release_lock(self):
+                with self._lock:
+                    return self._core(self.release, False)
 
         def locked(self):
             with self._lock:
                 return self._core(self.locked, False)
 
+        if _lock_provides_legacy_aliases:
+            def locked_lock(self):
+                with self._lock:
+                    return self._core(self.locked, False)
+
         def __repr__(self):
             return self._core.fancy_repr('Lock.raw')
 
     @BoundInnerClass
-    class RawRLock(base.RLockPrimitive):
+    class RawRLock(base.RLockPrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9430,7 +10093,7 @@ class Scenario:
             with self._lock:
                 return self._core(self.release, False)
 
-        if _rlock_provides_locked:  # pragma: no cover
+        if _rlock_provides_locked:
             def locked(self):
                 with self._lock:
                     return self._core(self.locked, False)
@@ -9439,7 +10102,7 @@ class Scenario:
             return self._core.fancy_repr('RLock.raw')
 
     @BoundInnerClass
-    class RawCondition(base.ConditionPrimitive):
+    class RawCondition(base.ConditionPrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9466,7 +10129,7 @@ class Scenario:
 
 
     @BoundInnerClass
-    class RawSemaphore(base.SemaphorePrimitive):
+    class RawSemaphore(base.SemaphorePrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9475,15 +10138,20 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, False, blocking=blocking, timeout=timeout)
 
-        def release(self, n=1):
-            with self._lock:
-                return self._core(self.release, False, n=n)
+        if _semaphore_release_accepts_n:
+            def release(self, n=1):
+                with self._lock:
+                    return self._core(self.release, False, n=n)
+        else:
+            def release(self):
+                with self._lock:
+                    return self._core(self.release, False)
 
         def __repr__(self):
             return self._core.fancy_repr('Semaphore.raw')
 
     @BoundInnerClass
-    class RawBoundedSemaphore(base.SemaphorePrimitive):
+    class RawBoundedSemaphore(base.SemaphorePrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9492,46 +10160,52 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, False, blocking=blocking, timeout=timeout)
 
-        def release(self, n=1):
-            with self._lock:
-                return self._core(self.release, False, n=n)
+        if _semaphore_release_accepts_n:
+            def release(self, n=1):
+                with self._lock:
+                    return self._core(self.release, False, n=n)
+        else:
+            def release(self):
+                with self._lock:
+                    return self._core(self.release, False)
 
         def __repr__(self):
             return self._core.fancy_repr('BoundedSemaphore.raw')
 
 
-    @BoundInnerClass
-    class RawSimpleQueue(base.SimpleQueuePrimitive):
+    if _queue_provides_simplequeue:
+        @BoundInnerClass
+        class RawSimpleQueue(base.SimpleQueuePrimitive, _Raw):
 
-        def __init__(self, score, core):
-            super().__init__(core)
+            def __init__(self, score, core):
+                super().__init__(core)
 
-        def put(self, item, block=True, timeout=None):
-            with self._lock:
-                return self._core(self.put, False, item=item, block=block, timeout=timeout)
+            def put(self, item, block=True, timeout=None):
+                with self._lock:
+                    return self._core(self.put, False, item=item, block=block, timeout=timeout)
 
-        def put_nowait(self, item):
-            with self._lock:
-                return self._core(self.put_nowait, False, item=item)
+            def put_nowait(self, item):
+                with self._lock:
+                    return self._core(self.put_nowait, False, item=item)
 
-        def get(self, block=True, timeout=None):
-            with self._lock:
-                return self._core(self.get, False, block=block, timeout=timeout)
+            def get(self, block=True, timeout=None):
+                with self._lock:
+                    return self._core(self.get, False, block=block, timeout=timeout)
 
-        def get_nowait(self):
-            with self._lock:
-                return self._core(self.get_nowait, False)
+            def get_nowait(self):
+                with self._lock:
+                    return self._core(self.get_nowait, False)
 
-        def qsize(self):
-            with self._lock:
-                return self._core(self.qsize, False)
+            def qsize(self):
+                with self._lock:
+                    return self._core(self.qsize, False)
 
-        def empty(self):
-            with self._lock:
-                return self._core(self.empty, False)
+            def empty(self):
+                with self._lock:
+                    return self._core(self.empty, False)
 
-        def __repr__(self):
-            return self._core.fancy_repr('SimpleQueue.raw')
+            def __repr__(self):
+                return self._core.fancy_repr('SimpleQueue.raw')
 
 
     @BoundInnerClass
@@ -9553,7 +10227,7 @@ class Scenario:
 
 
     @BoundInnerClass
-    class RawEvent(base.Primitive):
+    class RawEvent(base.Primitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9582,7 +10256,7 @@ class Scenario:
             return self._core.fancy_repr('Event.raw')
 
     @BoundInnerClass
-    class RawBarrier(base.BarrierPrimitive):
+    class RawBarrier(base.BarrierPrimitive, _Raw):
 
         def __init__(self, score, core):
             super().__init__(core)
@@ -9614,13 +10288,28 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, True, blocking=blocking, timeout=timeout)
 
+        if _lock_provides_legacy_aliases:
+            def acquire_lock(self, blocking=True, timeout=-1):
+                with self._lock:
+                    return self._core(self.acquire, True, blocking=blocking, timeout=timeout)
+
         def release(self):
             with self._lock:
                 return self._core(self.release, True)
 
+        if _lock_provides_legacy_aliases:
+            def release_lock(self):
+                with self._lock:
+                    return self._core(self.release, True)
+
         def locked(self):
             with self._lock:
                 return self._core(self.locked, True)
+
+        if _lock_provides_legacy_aliases:
+            def locked_lock(self):
+                with self._lock:
+                    return self._core(self.locked, True)
 
         def __repr__(self):
             if self._core.use_fancy_repr:
@@ -9642,7 +10331,7 @@ class Scenario:
             with self._lock:
                 return self._core(self.release, True)
 
-        if _rlock_provides_locked:  # pragma: no cover
+        if _rlock_provides_locked:
             def locked(self):
                 with self._lock:
                     return self._core(self.locked, True)
@@ -9694,9 +10383,14 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, True, blocking=blocking, timeout=timeout)
 
-        def release(self, n=1):
-            with self._lock:
-                return self._core(self.release, True, n=n)
+        if _semaphore_release_accepts_n:
+            def release(self, n=1):
+                with self._lock:
+                    return self._core(self.release, True, n=n)
+        else:
+            def release(self):
+                with self._lock:
+                    return self._core(self.release, True)
 
         def __repr__(self):
             if self._core.use_fancy_repr:
@@ -9714,9 +10408,14 @@ class Scenario:
             with self._lock:
                 return self._core(self.acquire, True, blocking=blocking, timeout=timeout)
 
-        def release(self, n=1):
-            with self._lock:
-                return self._core(self.release, True, n=n)
+        if _semaphore_release_accepts_n:
+            def release(self, n=1):
+                with self._lock:
+                    return self._core(self.release, True, n=n)
+        else:
+            def release(self):
+                with self._lock:
+                    return self._core(self.release, True)
 
         def __repr__(self):
             if self._core.use_fancy_repr:
@@ -9797,6 +10496,10 @@ class Scenario:
             return self._core.compatibility_repr()
 
 
+    if not _queue_provides_simplequeue:
+        del SimpleQueue
+
+
     @BoundInnerClass
     class Event(base.Primitive):
         def __init__(self, scenario):
@@ -9874,6 +10577,9 @@ class Scenario:
     # base name (LockAPI, etc.).  The cooked primitives, Raw handles,
     # Driver, and Dispatch are already surfaced as direct members
     # above, so they're not repeated here.
+    Primitive = base.Primitive
+    API = base.API
+
     LockAPI = base.LockAPI
     RLockAPI = base.RLockAPI
     ConditionAPI = base.ConditionAPI
@@ -9881,7 +10587,9 @@ class Scenario:
     SemaphoreAPI = base.SemaphoreAPI
     BoundedSemaphoreAPI = base.BoundedSemaphoreAPI
     BarrierAPI = base.BarrierAPI
-    SimpleQueueAPI = base.SimpleQueueAPI
+
+    if _queue_provides_simplequeue:
+        SimpleQueueAPI = base.SimpleQueueAPI
     QueueAPI = base.QueueAPI
     LifoQueueAPI = base.LifoQueueAPI
     PriorityQueueAPI = base.PriorityQueueAPI

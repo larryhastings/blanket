@@ -58,7 +58,11 @@ def preload_local_blanket():
         blanket_init = blanket_dir / "blanket" / "__init__.py"
         if blanket_init.is_file():
             break
-        blanket_dir = blanket_dir.parent
+        parent = blanket_dir.parent
+        if parent == blanket_dir:
+            raise FileNotFoundError(
+                f"could not find local blanket package starting from {argv_0.resolve()!s}")
+        blanket_dir = parent
 
     # this almost certainly *is* a git checkout
     # ... but that's not required, so don't assert it.
@@ -79,7 +83,13 @@ def run(name, module, permutations=None):
     # this is a lot of work to suppress the "\nOK"!
     sio = io.StringIO()
     runner = unittest.TextTestRunner(stream=sio)
-    t = unittest.main(module=module, exit=False, testRunner=runner)
+    if name:
+        argv0 = name
+    elif isinstance(module, str):
+        argv0 = module
+    else:
+        argv0 = module.__name__
+    t = unittest.main(module=module, exit=False, testRunner=runner, argv=[argv0])
     result = t.result
     for name in stats:
         value = getattr(result, attribute_names[name], ())
@@ -102,13 +112,13 @@ def run(name, module, permutations=None):
         break
 
 def finish():
-    if not (stats['failures'] or stats['errors']): # pragma: nocover
+    if not (stats['failures'] or stats['errors']):
         result = "OK"
-    else: # pragma: no cover
+    else:
         result = "FAILED"
 
     fields = [f"{name}={value}" for name, value in stats.items() if value]
-    if fields: # pragma: no cover
+    if fields:
         addendum = ", ".join(fields)
         result = f"{result} ({addendum})"
     print(result)

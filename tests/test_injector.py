@@ -24,17 +24,22 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
 THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import contextlib
 import inspect
+import io
+import pathlib
 import sys
 import unittest
 import time
 import threading
 import tokenize
+import tempfile
 
 import blankettestlib
 blankettestlib.preload_local_blanket()
 
 from blanket import Location, inject_call
+import blanket.injector as injector_module
 from blanket.injector import _find_statement_end
 
 # Test decorators for version-specific tests
@@ -43,8 +48,6 @@ _python_3_8_plus  = sys.version_info >= (3,  8)
 _python_3_11_plus = sys.version_info >= (3, 11)
 _python_3_13_plus = sys.version_info >= (3, 13)
 
-skip_if_no_column_info = unittest.skipUnless(_python_3_11_plus, "requires Python 3.11+ for column precision")
-skip_if_column_info_is_available = unittest.skipIf(_python_3_11_plus, "requires Python 3.10- (no column info)")
 
 
 def _strip_line_and_column_information(fn, *, firstlineno, name=None, qualname=None):
@@ -68,11 +71,12 @@ def _strip_line_and_column_information(fn, *, firstlineno, name=None, qualname=N
         fn_name = fn.__name__
 
     if _python_3_11_plus:
-        if qualname is None:
-            if name is not None:
-                co_qualname = name
-            else:
-                co_qualname = co.co_qualname
+        if qualname is not None:
+            co_qualname = qualname
+        elif name is not None:
+            co_qualname = name
+        else:
+            co_qualname = co.co_qualname
 
     code_args = [
         co.co_argcount,
@@ -97,10 +101,10 @@ def _strip_line_and_column_information(fn, *, firstlineno, name=None, qualname=N
         code_args.insert(1, co.co_posonlyargcount)
 
     if _python_3_11_plus:
-        # added qualname, inconveniently as positional argument 11 (after name)
-        code_args.insert(11, co_qualname)
-        # added exceptiontable, inconveniently as positional argument 14 (after linetable)
-        code_args.insert(14, co.co_exceptiontable)
+        # added qualname, inconveniently as positional argument 12 (after name)
+        code_args.insert(12, co_qualname)
+        # added exceptiontable, inconveniently as positional argument 15 (after linetable)
+        code_args.insert(15, co.co_exceptiontable)
 
     code = code_type(*code_args)
 
@@ -115,7 +119,10 @@ def _strip_line_and_column_information(fn, *, firstlineno, name=None, qualname=N
     if _python_3_13_plus:
         fn_args.append(fn.__kwdefaults__)
 
-    return fn_type(*fn_args)
+    fn = fn_type(*fn_args)
+    if qualname is not None:
+        fn.__qualname__ = qualname
+    return fn
 
 
 # Test code
@@ -125,6 +132,12 @@ def sample_function(n=0):
     if n:
         return n * 2
     return x + y
+
+
+def function_with_trailing_uncompiled_line():
+    x = 1
+    return x
+    # this line is part of inspect.getsource(), but compiles to no bytecode
 
 
 def do_nothing():
@@ -142,6 +155,211 @@ def add_100_to_global_value():
 
 
 
+class TestBlanketTestLib(unittest.TestCase):
+
+    def test_module_helper_functions_execute(self):
+        global global_value
+        self.assertEqual(function_with_trailing_uncompiled_line(), 1)
+        global_value = 0
+        add_100_to_global_value()
+        self.assertEqual(global_value, 100)
+
+    def test_finish_reports_ok_or_failed_and_stats(self):
+        old_stats = blankettestlib.stats.copy()
+        try:
+            for key in blankettestlib.stats:
+                blankettestlib.stats[key] = 0
+
+            sio = io.StringIO()
+            with contextlib.redirect_stdout(sio):
+                blankettestlib.finish()
+            self.assertEqual(sio.getvalue(), "OK\n")
+
+            for key in blankettestlib.stats:
+                blankettestlib.stats[key] = 0
+            blankettestlib.stats['errors'] = 1
+            blankettestlib.stats['skipped'] = 2
+
+            sio = io.StringIO()
+            with contextlib.redirect_stdout(sio):
+                blankettestlib.finish()
+            self.assertEqual(sio.getvalue(), "FAILED (errors=1, skipped=2)\n")
+        finally:
+            blankettestlib.stats.update(old_stats)
+
+    def test_preload_local_blanket_raises_if_search_hits_root(self):
+        old_argv0 = sys.argv[0]
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                sys.argv[0] = str(pathlib.Path(directory) / "runner.py")
+                with self.assertRaises(FileNotFoundError):
+                    blankettestlib.preload_local_blanket()
+            finally:
+                sys.argv[0] = old_argv0
+
+
+class TestInjectorVersionHelpers(unittest.TestCase):
+
+    def test_export_accepts_explicit_string_names(self):
+        original_all = injector_module.__all__.copy()
+        try:
+            self.assertEqual(injector_module.export('made_up_name'), 'made_up_name')
+            self.assertIn('made_up_name', injector_module.__all__)
+        finally:
+            injector_module.__all__[:] = original_all
+
+    def test_bound_public_helpers_keep_public_names(self):
+        """Binding-time helper selection should preserve introspection names."""
+        for name in (
+            '_instr_line_column',
+            '_validate_match_at_line_start',
+            '_text_position_to_search_start_position',
+            '_find_bytecode_range_for_source_range',
+            '_insert_call_bytecode',
+            ):
+            self.assertEqual(getattr(injector_module, name).__name__, name)
+
+        self.assertEqual(Location.position.__name__, 'position')
+        self.assertEqual(Location.position.__qualname__, 'Location.position')
+        self.assertEqual(Location._position_py310_minus.__name__, 'position')
+        self.assertEqual(Location._position_py310_minus.__qualname__, 'Location.position')
+        self.assertEqual(Location._position_py311_plus.__name__, 'position')
+        self.assertEqual(Location._position_py311_plus.__qualname__, 'Location.position')
+
+    def test_py310_minus_line_column_helper_runs_on_current_python(self):
+        """The old line-only helper is directly testable on modern Python."""
+        rows = list(injector_module._instr_line_column_py310_minus(sample_function))
+        self.assertTrue(rows)
+        self.assertTrue(all(column == 0 for instr, line, column in rows))
+        self.assertTrue(all(line >= sample_function.__code__.co_firstlineno for instr, line, column in rows))
+
+    def test_py310_minus_line_column_helper_accepts_old_starts_line_shape(self):
+        """The old helper still handles the pre-3.13 starts_line shape."""
+        class FakeCode:
+            co_firstlineno = 10
+
+        class FakeFunction:
+            __code__ = FakeCode()
+
+        class FakeInstruction:
+            def __init__(self, starts_line):
+                self.starts_line = starts_line
+
+        class FakeDis:
+            @staticmethod
+            def get_instructions(function):
+                return iter((
+                    FakeInstruction(None),
+                    FakeInstruction(12),
+                    FakeInstruction(None),
+                    ))
+
+        old_dis = injector_module.dis
+        try:
+            # Do not mutate the real stdlib dis module here.  Coverage's
+            # Python 3.14 sys.monitoring tracer uses dis.get_instructions
+            # while this test is running.  Rebind blanket.injector's global
+            # instead, so only the helper under test sees the fake shape.
+            injector_module.dis = FakeDis
+            rows = list(injector_module._instr_line_column_py310_minus(FakeFunction()))
+        finally:
+            injector_module.dis = old_dis
+
+        self.assertEqual([line for instr, line, column in rows], [10, 12, 12])
+        self.assertEqual([column for instr, line, column in rows], [0, 0, 0])
+
+    def test_py310_minus_match_validation(self):
+        """The old text/token matcher only allows line-start matches."""
+        old = injector_module._validate_match_at_line_start_py310_minus
+        old('    needle = 1', 4, 'needle', 'Location.text', 'text')
+        old('        ', 7, 'needle', 'Location.text', 'text')
+        with self.assertRaisesRegex(ValueError, 'Python 3.10'):
+            old('    x = needle', 8, 'needle', 'Location.text', 'text')
+
+        # The modern helper is deliberately a no-op.
+        injector_module._validate_match_at_line_start_py311_plus(
+            '    x = needle', 8, 'needle', 'Location.text', 'text')
+
+    def test_py310_minus_text_position_helper(self):
+        """The old text helper backs up to the containing token start."""
+        class Token:
+            start = (3, 7)
+        self.assertEqual(
+            injector_module._text_position_to_search_start_position_py310_minus(
+                100, 20, 15, Token),
+            (22, 7))
+        self.assertEqual(
+            injector_module._text_position_to_search_start_position_py311_plus(
+                100, 20, 15, Token),
+            (100, 15))
+
+    def test_py310_minus_range_helper_ignores_columns(self):
+        """Old source-position matching is line-only, even on current Python."""
+        line = sample_function.__code__.co_firstlineno + 1
+        old_range = injector_module._find_bytecode_range_for_source_range_py310_minus
+        first, stop = old_range(sample_function, line, 999, line, 1000)
+        self.assertIsInstance(first, int)
+        self.assertGreater(stop, first)
+        self.assertEqual(old_range(sample_function, line + 1000, 0, line + 1001, 0),
+                         (None, None))
+
+        if _python_3_11_plus:
+            new_range = injector_module._find_bytecode_range_for_source_range_py311_plus
+            self.assertEqual(
+                new_range(sample_function, line, 999, line, 1000),
+                (None, None))
+
+
+    def test_old_insert_call_bytecode_helpers_emit_expected_instruction_shapes(self):
+        """Exercise old-bytecode helpers without asking bytecode to validate old opcodes."""
+        class FakeInstr:
+            def __init__(self, opname, arg=None, *, lineno=None):
+                self.opname = opname
+                self.arg = arg
+                self.lineno = lineno
+
+        old_instr = injector_module.Instr
+        try:
+            injector_module.Instr = FakeInstr
+
+            bc = []
+            injector_module._insert_call_bytecode_py310_minus(bc, 0, 'f', 123)
+            self.assertEqual(
+                [(i.opname, i.arg, i.lineno) for i in bc],
+                [('LOAD_GLOBAL', 'f', 123),
+                 ('CALL_FUNCTION', 0, 123),
+                 ('POP_TOP', None, 123)])
+
+            bc = []
+            injector_module._insert_call_bytecode_py311(bc, 0, 'f', 456)
+            self.assertEqual(
+                [(i.opname, i.arg, i.lineno) for i in bc],
+                [('LOAD_GLOBAL', (True, 'f'), 456),
+                 ('PRECALL', 0, 456),
+                 ('CALL', 0, 456),
+                 ('POP_TOP', None, 456)])
+        finally:
+            injector_module.Instr = old_instr
+
+
+    def test_py310_minus_position_helper_runs_on_current_python(self):
+        """The old public-position implementation is directly testable."""
+        loc = Location._position_py310_minus(sample_function, 2)
+        self.assertIsInstance(loc, Location)
+        self.assertIs(loc.function, sample_function)
+
+        with self.assertRaisesRegex(ValueError, 'outside function range'):
+            Location._position_py310_minus(sample_function, 0)
+
+        with self.assertRaisesRegex(ValueError, 'Python 3.10'):
+            Location._position_py310_minus(sample_function, 2, 5)
+
+        source_lines = inspect.getsource(function_with_trailing_uncompiled_line).splitlines()
+        trailing_line = len(source_lines)
+        with self.assertRaisesRegex(ValueError, 'No bytecode was compiled'):
+            Location._position_py310_minus(function_with_trailing_uncompiled_line, trailing_line)
+
+
 class TestModifyBytecode(unittest.TestCase):
 
     def test_location_has_start_and_stop(self):
@@ -150,6 +368,32 @@ class TestModifyBytecode(unittest.TestCase):
         self.assertIsInstance(loc.start, int)
         self.assertIsInstance(loc.stop, int)
         self.assertGreaterEqual(loc.stop, loc.start)
+
+    def test_location_text_wraps_tokenization_errors(self):
+        old_getsource = injector_module.inspect.getsource
+        try:
+            injector_module.inspect.getsource = lambda function: "x = (\n"
+            with self.assertRaises(tokenize.TokenError) as cm:
+                Location.text(sample_function, "x")
+        finally:
+            injector_module.inspect.getsource = old_getsource
+
+        message = str(cm.exception)
+        self.assertIn("Tokenization failed", message)
+        self.assertIn(sample_function.__code__.co_filename, message)
+
+    def test_location_token_wraps_tokenization_errors(self):
+        old_getsource = injector_module.inspect.getsource
+        try:
+            injector_module.inspect.getsource = lambda function: "x = (\n"
+            with self.assertRaises(tokenize.TokenError) as cm:
+                Location.token(sample_function, "x")
+        finally:
+            injector_module.inspect.getsource = old_getsource
+
+        message = str(cm.exception)
+        self.assertIn("Tokenization failed", message)
+        self.assertIn(sample_function.__code__.co_filename, message)
 
     def test_location_comparison_tuple_like(self):
         """Test Location comparison works like tuple comparison."""
@@ -267,58 +511,18 @@ class TestModifyBytecode(unittest.TestCase):
         self.assertEqual(loc.function, sample_function)
         self.assertGreaterEqual(loc.stop, loc.start)
 
-    @skip_if_no_column_info
-    def test_location_position_with_column(self):
-        """Test Location.position with line and column."""
-        loc = Location.position(sample_function, 2, 5)
-        self.assertIsInstance(loc, Location)
-        self.assertGreaterEqual(loc.stop, loc.start)
-
-    @skip_if_column_info_is_available
-    def test_location_position_column_not_supported_on_old_python(self):
-        """Test that Location.position raises on Python 3.10- when column != 1."""
-        with self.assertRaises(ValueError) as cm:
-            Location.position(sample_function, 2, 5)
-        self.assertIn("Python 3.10", str(cm.exception))
-        self.assertIn("column", str(cm.exception).lower())
+    if not _python_3_11_plus:
+        def test_location_position_column_not_supported_on_old_python(self):
+            """Test that Location.position raises on Python 3.10- when column != 1."""
+            with self.assertRaises(ValueError) as cm:
+                Location.position(sample_function, 2, 5)
+            self.assertIn("Python 3.10", str(cm.exception))
+            self.assertIn("column", str(cm.exception).lower())
 
     def test_location_position_out_of_range(self):
         """Test that position outside function range raises ValueError."""
         with self.assertRaises(ValueError):
             Location.position(sample_function, 100)
-
-    @skip_if_no_column_info
-    def test_location_position_past_all_code_by_column(self):
-        """Test Location.position when column is past all code on last line."""
-        def simple_function():
-            x = 1
-            return x
-
-        simple_function()  # Called for coverage
-
-        # Get the number of lines in the function
-        source_lines = inspect.getsource(simple_function).splitlines()
-        last_line = len(source_lines)
-
-        # Request a position on the last line at column 999
-        with self.assertRaises(ValueError) as cm:
-            Location.position(simple_function, last_line, 999)
-        self.assertIn("No bytecode", str(cm.exception))
-
-    @skip_if_no_column_info
-    def test_location_position_with_corrupt_code_object(self):
-        """Test that Location.position raises on functions with corrupt code objects."""
-        # Test with invalid firstlineno
-        stripped_invalid = _strip_line_and_column_information(sample_function, firstlineno=-1)
-        with self.assertRaises(ValueError) as cm:
-            Location.position(stripped_invalid, 1)
-        self.assertIn("corrupt", str(cm.exception))
-
-        # Test with missing line information
-        stripped_no_lines = _strip_line_and_column_information(sample_function, firstlineno=None)
-        with self.assertRaises(ValueError) as cm:
-            Location.position(stripped_no_lines, 1)
-        self.assertIn("corrupt", str(cm.exception))
 
     def test_strip_line_and_column_information_with_name_parameter(self):
         """Test that _strip_line_and_column_information can change function name."""
@@ -330,13 +534,15 @@ class TestModifyBytecode(unittest.TestCase):
         self.assertEqual(stripped.__name__, 'renamed_function')
         self.assertEqual(stripped.__code__.co_name, 'renamed_function')
 
-    @skip_if_no_column_info
-    def test_location_text_basic(self):
-        """Test Location.text with simple text search."""
-        loc = Location.text(sample_function, "x = 1")
-        self.assertIsInstance(loc, Location)
-        self.assertEqual(loc.function, sample_function)
-        self.assertGreaterEqual(loc.stop, loc.start)
+    def test_strip_line_and_column_information_with_qualname_parameter(self):
+        """Test that _strip_line_and_column_information can change qualname."""
+        stripped = _strip_line_and_column_information(
+            sample_function,
+            firstlineno=None,
+            qualname='Outer.Inner.renamed_function'
+        )
+        self.assertEqual(stripped.__qualname__, 'Outer.Inner.renamed_function')
+        self.assertEqual(stripped.__code__.co_qualname, 'Outer.Inner.renamed_function')
 
     def test_location_text_not_found(self):
         """Test that missing text raises ValueError."""
@@ -344,113 +550,53 @@ class TestModifyBytecode(unittest.TestCase):
             Location.text(sample_function, "nonexistent")
         self.assertIn("not found", str(cm.exception))
 
-    @skip_if_no_column_info
-    def test_location_text_in_comment_not_found(self):
-        """Test that text in comment raises ValueError (no bytecode for comments)."""
-        def function_with_comment():
-            x = 1  # unique comment marker text
-            return x
+    def test_location_text_in_whitespace_does_not_hang(self):
+        """Text matches in whitespace should not trap Location.text in its token scan."""
+        self.assertIsInstance(Location.text(sample_function, " "), Location)
 
-        with self.assertRaises(ValueError) as cm:
-            Location.text(function_with_comment, "unique comment marker")
+    def test_location_text_match_after_token_stream_is_exhausted(self):
+        """A text match with no token left to contain it is simply not a match."""
+        old_getsource = injector_module.inspect.getsource
+        old_tokenize = injector_module.tokenize.tokenize
+        try:
+            injector_module.inspect.getsource = lambda function: "def sample_function():\n    x = 1\n"
+            injector_module.tokenize.tokenize = lambda readline: iter(())
+            with self.assertRaises(ValueError) as cm:
+                Location.text(sample_function, "x")
+        finally:
+            injector_module.inspect.getsource = old_getsource
+            injector_module.tokenize.tokenize = old_tokenize
         self.assertIn("not found", str(cm.exception))
 
-    @skip_if_no_column_info
-    def test_location_text_in_docstring_not_found(self):
-        """Test that text in docstring raises ValueError (no bytecode for docstrings)."""
-        def function_with_docstring():
-            """This docstring contains rubber baby buggy bumpers."""
-            x = 1
-            return x
+    def test_location_token_tolerates_token_line_outside_source(self):
+        """The validation lookup is skipped if a synthetic token reports a bad line."""
+        class Token:
+            def __init__(self, string, start, type):
+                self.string = string
+                self.start = start
+                self.end = start
+                self.type = type
 
-        with self.assertRaises(ValueError) as cm:
-            Location.text(function_with_docstring, "rubber baby buggy bumpers")
-        self.assertIn("not found", str(cm.exception))
-
-    @skip_if_no_column_info
-    def test_location_text_with_skip(self):
-        """Test Location.text with skip parameter."""
-        def function_with_duplicates():
-            global global_value
-            x = 1 - global_value
-            y = 1 - global_value
-            return x + y
-
-        # Verify unmodified behavior
-        global global_value
-        global_value = 0
-        self.assertEqual(function_with_duplicates(), 2)
-
-        # Inject before first "= 1"
-        global_value = 0
-        loc0 = Location.text(function_with_duplicates, "= 1", skip=0)
-        modified0 = inject_call(add_100_to_global_value, loc0)
-        self.assertEqual(modified0(), -198)
-        self.assertEqual(global_value, 100)
-
-        # Inject before second "= 1"
-        global_value = 0
-        loc1 = Location.text(function_with_duplicates, "= 1", skip=1)
-        modified1 = inject_call(add_100_to_global_value, loc1)
-        self.assertEqual(modified1(), -98)
-        self.assertEqual(global_value, 100)
-
-    @skip_if_no_column_info
-    def test_location_text_skip_out_of_range(self):
-        """Test that skip beyond matches raises ValueError."""
-        with self.assertRaises(ValueError) as cm:
-            Location.text(sample_function, "x = 1", skip=5)
-        self.assertIn("cannot skip", str(cm.exception))
-
-    @skip_if_no_column_info
-    def test_location_text_with_after(self):
-        """Test Location.text with after parameter."""
-        global global_value
-        global_value = 0
-
-        def function_with_duplicates():
-            global global_value
-            x = 1 - global_value
-            z = 1
-            y = 2 - global_value
-            z -= global_value
-            return (x, y, z)
-
-        self.assertEqual(function_with_duplicates(), (1, 2, 1))
-
-        # Find location of "y", then find "z" after that
-        y = Location.text(function_with_duplicates, "y")
-        loc = Location.text(function_with_duplicates, "z", after=y)
-
-        # Inject before the "z -=" line
-        modified = inject_call(add_100_to_global_value, loc)
-        result = modified()
-        self.assertEqual(result, (1, 2, -99))
-
-    @skip_if_no_column_info
-    def test_location_text_with_after_using_max(self):
-        """Test Location.text with after using max() of multiple constraints."""
-        global global_value
-        global_value = 0
-
-        def function_with_duplicates():
-            global global_value
-            x = 1 - global_value
-            z = 1
-            y = 2 - global_value
-            z -= global_value
-            return (x, y, z)
-
-        # Find "z" after the maximum of text "y" and text "2"
-        y_and_2 = max([
-            Location.text(function_with_duplicates, "y"),
-            Location.text(function_with_duplicates, "2")
-        ])
-        loc = Location.text(function_with_duplicates, "z", after=y_and_2)
-
-        modified = inject_call(add_100_to_global_value, loc)
-        result = modified()
-        self.assertEqual(result, (1, 2, -99))
+        old_getsource = injector_module.inspect.getsource
+        old_tokenize = injector_module.tokenize.tokenize
+        old_find_range = injector_module._find_bytecode_range_for_source_range
+        old_validate = injector_module._validate_match_at_line_start
+        try:
+            injector_module.inspect.getsource = lambda function: "def sample_function():\n    pass\n"
+            injector_module.tokenize.tokenize = lambda readline: iter((
+                Token("needle", (99, 0), tokenize.NAME),
+                Token("", (99, 6), tokenize.NEWLINE),
+                ))
+            injector_module._find_bytecode_range_for_source_range = lambda *args: (0, 1)
+            injector_module._validate_match_at_line_start = (
+                lambda *args: self.fail("line validation should have been skipped"))
+            loc = Location.token(sample_function, "needle")
+        finally:
+            injector_module.inspect.getsource = old_getsource
+            injector_module.tokenize.tokenize = old_tokenize
+            injector_module._find_bytecode_range_for_source_range = old_find_range
+            injector_module._validate_match_at_line_start = old_validate
+        self.assertEqual((loc.start, loc.stop), (0, 1))
 
     def test_location_token_basic(self):
         """Test Location.token with basic token search."""
@@ -469,135 +615,6 @@ class TestModifyBytecode(unittest.TestCase):
         loc0 = Location.token(sample_function, "return", skip=0)
         loc1 = Location.token(sample_function, "return", skip=1)
         self.assertLess(loc0, loc1)
-
-    @skip_if_no_column_info
-    def test_location_token_skip_out_of_range(self):
-        """Test that skip beyond matches raises ValueError for token."""
-        with self.assertRaises(ValueError) as cm:
-            Location.token(sample_function, "return", skip=10)
-        self.assertIn("cannot skip", str(cm.exception))
-
-    @skip_if_no_column_info
-    def test_location_token_with_after_regression(self):
-        """Regression test: token after text should respect text position within line."""
-        global global_value
-        global_value = 0
-
-        def crazy_function(a):
-            global global_value
-            if a > 3:
-                return (a * 2) - global_value
-            foo = 1
-            return (a * 3) - global_value
-
-        # Verify unmodified behavior
-        self.assertEqual(crazy_function(5), 10)
-        self.assertEqual(crazy_function(2), 6)
-
-        # Search for 'return' token after text "foo"
-        foo_location = Location.text(crazy_function, "foo")
-        loc = Location.token(crazy_function, 'return', after=foo_location)
-
-        # Inject before the second return (the one in the else path)
-        modified = inject_call(add_100_to_global_value, loc)
-
-        # First branch shouldn't trigger injection
-        global_value = 0
-        self.assertEqual(modified(5), 10)
-        self.assertEqual(global_value, 0)
-
-        # Second branch should trigger injection
-        global_value = 0
-        self.assertEqual(modified(2), -94)
-        self.assertEqual(global_value, 100)
-
-    @skip_if_no_column_info
-    def test_location_token_multiline(self):
-        """Test Location.token with a multi-line token."""
-        global global_value
-        global_value = 0
-
-        def function_with_multiline_strings():
-            global global_value
-
-            jabberwocky = '''
-'Twas brillig, and the slithy toves
-Did gyre and gimble in the wabe:
-All mimsy were the borogoves,
-And the mome raths outgrabe.
-'''.ljust(3)
-            jabberwocky_number = len(jabberwocky) - global_value
-
-            the_crocodile = '''
-How doth the little crocodile
-     Improve his shining tail,
-And pour the waters of the Nile
-     On every golden scale!
-'''.rjust(
-    3)
-            the_crocodile_number = len(the_crocodile) - global_value
-
-            return (jabberwocky, jabberwocky_number, the_crocodile, the_crocodile_number)
-
-        # Call unmodified function to get the strings
-        jabberwocky, jabberwocky_number, the_crocodile, the_crocodile_number = function_with_multiline_strings()
-
-        # Verify unmodified behavior
-        self.assertEqual((jabberwocky_number, the_crocodile_number), (129, 122))
-
-        # Find the first multi-line string token and inject before it
-        loc = Location.token(function_with_multiline_strings, f"'''{jabberwocky}'''")
-        modified = inject_call(add_100_to_global_value, loc)
-
-        global_value = 0
-        result = modified()
-        self.assertEqual((result[1], result[3]), (29, 22))
-        self.assertEqual(global_value, 100)
-
-        # Find "the" after the first multiline string
-        the_loc = Location.text(function_with_multiline_strings, 'the', after=loc)
-        modified2 = inject_call(add_100_to_global_value, the_loc)
-
-        global_value = 0
-        result2 = modified2()
-        self.assertEqual((result2[1], result2[3]), (129, 22))
-        self.assertEqual(global_value, 100)
-
-        # Search for "ljust" using Location.text
-        ljust_text_loc = Location.text(function_with_multiline_strings, 'ljust')
-        modified3 = inject_call(add_100_to_global_value, ljust_text_loc)
-
-        global_value = 0
-        result3 = modified3()
-        self.assertEqual((result3[1], result3[3]), (29, 22))
-        self.assertEqual(global_value, 100)
-
-        # Search for "ljust" using Location.token
-        ljust_token_loc = Location.token(function_with_multiline_strings, 'ljust')
-        modified4 = inject_call(add_100_to_global_value, ljust_token_loc)
-
-        global_value = 0
-        result4 = modified4()
-        self.assertEqual((result4[1], result4[3]), (29, 22))
-        self.assertEqual(global_value, 100)
-
-        # Search for "rjust" using Location.text to test multi-line range
-        rjust_text_loc = Location.text(function_with_multiline_strings, 'rjust')
-        modified5 = inject_call(add_100_to_global_value, rjust_text_loc)
-
-        global_value = 0
-        result5 = modified5()
-        self.assertEqual((result5[1], result5[3]), (129, 22))
-        self.assertEqual(global_value, 100)
-
-        # Search for "rjust" using Location.token
-        rjust_token_loc = Location.token(function_with_multiline_strings, 'rjust')
-        modified6 = inject_call(add_100_to_global_value, rjust_token_loc)
-
-        global_value = 0
-        result6 = modified6()
-        self.assertEqual((result6[1], result6[3]), (129, 22))
-        self.assertEqual(global_value, 100)
 
     def test_location_bytecode_basic(self):
         """Test Location.bytecode with basic bytecode search."""
@@ -641,21 +658,6 @@ And pour the waters of the Nile
 
         loc = Location.position(sample_function, 1)
         modified = inject_call(injected, loc, name="test_func")
-        result = modified()
-
-        self.assertEqual(result, 3)
-        self.assertEqual(call_count[0], 1)
-
-    @skip_if_no_column_info
-    def test_inject_call_at_text_location(self):
-        """Test injection at a text-based location."""
-        call_count = [0]
-
-        def injected():
-            call_count[0] += 1
-
-        loc = Location.text(sample_function, "y = 2")
-        modified = inject_call(injected, loc)
         result = modified()
 
         self.assertEqual(result, 3)
@@ -747,6 +749,21 @@ And pour the waters of the Nile
             inject_call('nonexistent_function', loc)
         self.assertIn("not found in function globals", str(cm.exception))
 
+    def test_inject_call_at_end_of_bytecode_uses_no_line_info(self):
+        """A Location past the last instruction inserts at the end cleanly."""
+        calls = []
+        def injected():
+            calls.append('called')
+
+        injected()
+        self.assertEqual(calls, ['called'])
+        calls.clear()
+
+        loc = Location(sample_function, 100000, 100001)
+        modified = inject_call(injected, loc, name='end_injection')
+        self.assertEqual(modified(), 3)
+        self.assertEqual(calls, [])
+
     def test_sample_function_with_argument(self):
         """Test sample_function with argument to cover conditional branch."""
         result = sample_function(5)
@@ -818,21 +835,6 @@ And pour the waters of the Nile
         self.assertEqual(modified(), 7)
         self.assertEqual(call_count[0], 1)
 
-    @skip_if_no_column_info
-    def test_location_text_on_closure(self):
-        """Location.text works on a closure even though its first
-        bytecode instruction (COPY_FREE_VARS) has no position info."""
-        captured = 100
-
-        def closure_fn():
-            y = captured
-            return y - 50
-
-        # Two distinct matches; verify both work despite the prologue.
-        loc1 = Location.text(closure_fn, "captured")
-        loc2 = Location.text(closure_fn, "- 50")
-        self.assertLess(loc1, loc2)
-
     def test_corrupt_code_object_check_still_works_on_closure(self):
         """The relaxed validation rejects only functions whose
         instructions ALL lack position info -- not functions that
@@ -842,6 +844,7 @@ And pour the waters of the Nile
         captured = 1
         def closure_fn():
             return captured
+        self.assertEqual(closure_fn(), 1)
         Location.position(closure_fn, 1)  # should not raise
 
         # A function whose entire code object has been stripped of

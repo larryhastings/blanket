@@ -28,8 +28,15 @@ import blankettestlib
 blankettestlib.preload_local_blanket()
 
 
+import contextlib
+import importlib.util
+import inspect
+from itertools import count
+from pathlib import Path
+import sys
 import threading
 import queue
+import re
 import blanket
 from threading import BrokenBarrierError
 import time
@@ -37,12 +44,127 @@ import types
 import unittest
 
 from blanket import Scenario
-from blanket import Call, Use, Terminated, Not, TimeoutState, ThreadOrderingError, Blocked, Waiting, Paused, Nested, TransactionState, State, Reached, Action
+from blanket import Call, Use, Terminated, Not, TimeoutState, ThreadOrderingError, Blocked, Waiting, Paused, Nested, TransactionState, State, Reached, Action, Predicate
 from blanket import Stalled, Commit, Committed, Exiting, CompetingDriversError
-from blanket import Primitive
 from blanket import Location, inject_call
 from blanket import primitives as primitives_module
 from big.boundinnerclass import bound_to
+
+
+_temp_primitives_module_counter = count(1)
+
+
+@contextlib.contextmanager
+def _temporarily_removed_attribute(obj, name):
+    """Temporarily remove obj.name, restoring it on exit.
+
+    Used for stdlib-version-shape tests: load blanket.primitives while the
+    stdlib looks like an older Python, without needing that interpreter handy.
+    """
+    sentinel = object()
+    old = getattr(obj, name, sentinel)
+    if old is sentinel:
+        yield
+        return
+
+    delattr(obj, name)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
+
+
+@contextlib.contextmanager
+def _temporarily_assigned_attribute(obj, name, value):
+    """Temporarily assign obj.name to value, restoring it on exit."""
+    sentinel = object()
+    old = getattr(obj, name, sentinel)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        if old is sentinel:
+            delattr(obj, name)
+        else:
+            setattr(obj, name, old)
+
+def _compatibility_repr_like(real_object, blanket_object):
+    """Return real_object's repr with blanket_object's uppercase address."""
+    real_repr = repr(real_object)
+    expected = re.sub(r" at 0[xX][0-9a-fA-F]+(?=>)",
+                      f" at {hex(id(blanket_object)).upper()}",
+                      real_repr,
+                      count=1)
+    if expected == real_repr:
+        raise AssertionError(f"repr has no object address to replace: {real_repr!r}")
+    return expected
+
+
+def _load_fresh_primitives_module():
+    """Load blanket/primitives.py under a unique temporary module name."""
+    module_name = f"_blanket_primitives_test_{next(_temp_primitives_module_counter)}"
+    path = Path(primitives_module.__file__).resolve()
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+@contextlib.contextmanager
+def _fresh_primitives_module():
+    module = _load_fresh_primitives_module()
+    try:
+        yield module
+    finally:
+        sys.modules.pop(module.__name__, None)
+
+
+class TestTestHelpers(unittest.TestCase):
+    def test_temporarily_removed_attribute_when_attribute_is_absent(self):
+        class Holder:
+            pass
+        holder = Holder()
+        with _temporarily_removed_attribute(holder, 'missing'):
+            self.assertFalse(hasattr(holder, 'missing'))
+        self.assertFalse(hasattr(holder, 'missing'))
+
+    def test_temporarily_assigned_attribute_removes_new_attribute(self):
+        class Holder:
+            pass
+        holder = Holder()
+        with _temporarily_assigned_attribute(holder, 'temporary', 37):
+            self.assertEqual(holder.temporary, 37)
+        self.assertFalse(hasattr(holder, 'temporary'))
+
+    def test_compatibility_repr_requires_address(self):
+        with self.assertRaisesRegex(AssertionError, "repr has no object address"):
+            _compatibility_repr_like(37, object())
+
+    def test_load_fresh_primitives_module_cleans_up_after_exec_failure(self):
+        class Loader:
+            def create_module(self, spec):
+                return None
+            def exec_module(self, module):
+                raise RuntimeError("synthetic import failure")
+
+        spec = importlib.machinery.ModuleSpec("synthetic_primitives_failure", Loader())
+        original = importlib.util.spec_from_file_location
+        try:
+            importlib.util.spec_from_file_location = lambda name, path: spec
+            with self.assertRaisesRegex(RuntimeError, "synthetic import failure"):
+                _load_fresh_primitives_module()
+        finally:
+            importlib.util.spec_from_file_location = original
+
+        leaked = [name for name in sys.modules
+                  if name.startswith("_blanket_primitives_test_")
+                  and getattr(sys.modules[name], "__spec__", None) is spec]
+        self.assertEqual(leaked, [])
 
 
 # Standard timeout values for tests.  Use these instead of magic numbers:
@@ -558,6 +680,42 @@ class TestInstructions(unittest.TestCase):
 class TestLockAPIConvenience(unittest.TestCase):
     """Tests for LockAPI convenience methods."""
 
+    def test_lock_api_unblock_accepts_base_tx_tuple(self):
+        """Primitive API thread selectors accept (thread, base_tx)."""
+        scenario = Scenario()
+        rlock = scenario.RLock()
+        condition = scenario.Condition(rlock)
+        lock = scenario.Lock()
+        results = []
+
+        def predicate():
+            results.append(lock.locked())
+            return True
+
+        def worker():
+            rlock.acquire()
+            condition.wait_for(predicate, timeout=NEVER)
+            rlock.release()
+
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.skip(t, rlock.acquire)
+            scenario.wait(Call(t, condition.wait_for, State.BLOCKED))
+            base_tx = scenario.transaction(t)
+            base_tx.unblock()
+            scenario.wait(Call((t, base_tx), lock.locked, State.BLOCKED))
+            child_tx = scenario.transaction(t)
+            self.assertIs(child_tx.parent, base_tx)
+
+            returned = scenario.api(lock).unblock(lock.locked, (t, base_tx))
+            self.assertEqual(returned, ((t, base_tx),))
+            self.assertTrue(child_tx.done)
+
+            scenario.wait(base_tx)
+            scenario.skip(t, rlock.release)
+
+        self.assertEqual(results, [False])
+
     def test_lock_api_expire(self):
         """LockAPI.expire(thread) expires thread's acquire."""
         scenario = Scenario()
@@ -853,6 +1011,23 @@ class TestRepr(unittest.TestCase):
         r = repr(api)
         self.assertIn('RLockAPI', r)
 
+    def test_semaphore_api_repr(self):
+        """SemaphoreAPI repr shows SemaphoreAPI class name."""
+        scenario = Scenario()
+        sem = scenario.Semaphore()
+        api = scenario.api(sem)
+        r = repr(api)
+        self.assertIn('SemaphoreAPI', r)
+        self.assertNotIn('BoundedSemaphoreAPI', r)
+
+    def test_bounded_semaphore_api_repr(self):
+        """BoundedSemaphoreAPI repr shows BoundedSemaphoreAPI class name."""
+        scenario = Scenario()
+        sem = scenario.BoundedSemaphore()
+        api = scenario.api(sem)
+        r = repr(api)
+        self.assertIn('BoundedSemaphoreAPI', r)
+
     def test_lock_core_repr(self):
         """LockCore repr shows LockCore class name."""
         scenario = Scenario()
@@ -1033,6 +1208,35 @@ class TestPrimitiveMasquerading(unittest.TestCase):
     def test_barrier_masquerades_as_threading_barrier(self):
         scenario = Scenario()
         self.assert_masquerades_as(scenario.Barrier(2), threading.Barrier(2))
+
+    def test_queue_primitives_masquerade_as_queue_primitives(self):
+        scenario = Scenario()
+        pairs = [
+            (scenario.Queue(), queue.Queue()),
+            (scenario.LifoQueue(), queue.LifoQueue()),
+            (scenario.PriorityQueue(), queue.PriorityQueue()),
+        ]
+        if hasattr(queue, 'SimpleQueue'):
+            pairs.insert(0, (scenario.SimpleQueue(), queue.SimpleQueue()))
+
+        for primitive, real in pairs:
+            with self.subTest(primitive=real.__class__.__name__):
+                self.assert_masquerades_as(primitive, real)
+
+    def test_queue_compatibility_repr_matches_stdlib_except_upper_id(self):
+        scenario = Scenario()
+        pairs = [
+            (scenario.Queue(), queue.Queue()),
+            (scenario.LifoQueue(), queue.LifoQueue()),
+            (scenario.PriorityQueue(), queue.PriorityQueue()),
+        ]
+        if hasattr(queue, 'SimpleQueue'):
+            pairs.insert(0, (scenario.SimpleQueue(), queue.SimpleQueue()))
+
+        for primitive, real in pairs:
+            with self.subTest(primitive=real.__class__.__name__):
+                self.assertEqual(repr(primitive),
+                    _compatibility_repr_like(real, primitive))
 
     def test_raw_primitives_also_masquerade(self):
         scenario = Scenario()
@@ -1413,6 +1617,39 @@ class TestEvent(unittest.TestCase):
         self.assertIn('Event', r)
         self.assertNotIn('threading.Event', r)
 
+    def test_event_fancy_reprs_raw_methods_and_transaction_reprs(self):
+        s = Scenario()
+        event = s.Event()
+        event.name = 'named-event'
+        self.assertIn('EventCore', repr(event._core))
+        self.assertIn('EventAPI', repr(s.api(event)))
+        raw = s.raw(event)
+        self.assertIn('Event.raw', repr(raw))
+        self.assertFalse(raw.is_set())
+        self.assertFalse(raw.isSet())
+        raw.set()
+        self.assertTrue(raw.wait(timeout=0))
+        raw.clear()
+        self.assertFalse(raw.wait(timeout=0))
+
+        methods = [event.is_set, event.isSet, event.set, event.clear, event.wait]
+
+        def worker():
+            event.is_set()
+            event.isSet()
+            event.set()
+            event.clear()
+            event.wait(timeout=0)
+
+        with s:
+            t = s.thread(worker)
+            for method in methods:
+                s.wait(method)
+                tx = s.transaction(t)
+                self.assertIn('Event.', repr(tx))
+                self.assertIn('Event.', repr(tx._core))
+                s.skip(t, method)
+
     def test_event_api_waiters(self):
         scenario = Scenario()
         event = scenario.Event()
@@ -1608,21 +1845,16 @@ class TestEvent(unittest.TestCase):
 class TestConditionDelegation(unittest.TestCase):
     """Tests for Condition delegation to underlying lock."""
 
-    def test_condition_locked_delegates_to_lock(self):
-        """Condition.locked() reflects underlying lock state across all related primitives."""
+    def test_condition_locked_availability_matches_current_stdlib(self):
+        """Condition.locked() mirrors stdlib availability."""
         scenario = Scenario()
         lock = scenario.Lock()
         condition1 = scenario.Condition(lock)
         condition2 = scenario.Condition(lock)
-
-        primitives = (condition1, condition2, lock)
-
-        for p in primitives:
-            self.assertFalse(any(o.locked() for o in primitives))
-            p.acquire()
-            self.assertTrue(all(o.locked() for o in primitives))
-            p.release()
-            self.assertFalse(any(o.locked() for o in primitives))
+        available = hasattr(threading.Condition(), 'locked')
+        self.assertEqual(hasattr(condition1, 'locked'), available)
+        self.assertEqual(hasattr(condition2, 'locked'), available)
+        self.assertEqual(hasattr(scenario.raw(condition1), 'locked'), available)
 
     def test_condition_unblock_delegates_to_lock(self):
         """Unblocking condition.acquire via condition API delegates to underlying lock."""
@@ -1648,6 +1880,62 @@ class TestConditionDelegation(unittest.TestCase):
             api.unblock(condition.acquire, t)
 
         self.assertEqual(results, ['acquiring', 'acquired', 'released'])
+
+    def test_high_level_drivers_accept_condition_lock_aliases(self):
+        """skip/park/block/pause accept Condition.acquire as the target.
+
+        Condition.acquire delegates to the underlying lock core, so the
+        transaction's normalized method is the lock's acquire.  The
+        high-level Driver helpers should still accept the condition method
+        spelling the user actually wrote.
+        """
+
+        def exercise(verb):
+            scenario = Scenario()
+            condition = scenario.Condition()
+            results = []
+
+            def worker():
+                condition.acquire()
+                results.append('acquired')
+                condition.release()
+
+            with scenario:
+                t = scenario.thread(worker)
+                if verb == 'skip':
+                    scenario.wait(condition.acquire)
+                    txs = scenario.skip(t, condition.acquire)
+                    self.assertIn(t, txs)
+                elif verb == 'park':
+                    txs = scenario.park(t, condition.acquire)
+                    tx = txs[t]
+                    self.assertEqual(tx.state, State.BLOCKED)
+                    tx.unblock()
+                    scenario.wait(tx)
+                elif verb == 'block':
+                    txs = scenario.block(t, condition.acquire)
+                    tx = txs[t]
+                    self.assertEqual(tx.state, State.BLOCKED)
+                    tx.unblock()
+                    scenario.wait(tx)
+                elif verb == 'pause':
+                    txs = scenario.pause(t, condition.acquire)
+                    tx = txs[t]
+                    self.assertEqual(tx.state, State.PAUSED)
+                    tx.unpause()
+                    scenario.wait(tx)
+                else:
+                    raise AssertionError(verb)  # coverage: test-defensive branch
+
+                scenario.wait(condition.release)
+                release_txs = scenario.skip(t, condition.release)
+                self.assertIn(t, release_txs)
+
+            self.assertEqual(results, ['acquired'])
+
+        for verb in ('skip', 'park', 'block', 'pause'):
+            with self.subTest(verb=verb):
+                exercise(verb)
 
 
 class TestSemaphore(unittest.TestCase):
@@ -1680,6 +1968,15 @@ class TestSemaphore(unittest.TestCase):
         sem.release()
         sem.release()
 
+    def test_semaphore_release_signature_matches_stdlib(self):
+        scenario = Scenario()
+        stdlib_params = tuple(inspect.signature(threading.Semaphore().release).parameters)
+        for sem in (scenario.Semaphore(), scenario.BoundedSemaphore()):
+            with self.subTest(primitive=type(sem).__name__):
+                raw = scenario.raw(sem)
+                self.assertEqual(tuple(inspect.signature(sem.release).parameters), stdlib_params)
+                self.assertEqual(tuple(inspect.signature(raw.release).parameters), stdlib_params)
+
     def test_semaphore_context_manager(self):
         scenario = Scenario()
         sem = scenario.Semaphore(1)
@@ -1689,6 +1986,37 @@ class TestSemaphore(unittest.TestCase):
 
         self.assertTrue(sem.acquire(blocking=False))
         sem.release()
+
+    def test_semaphore_fancy_reprs_raw_methods_and_transaction_reprs(self):
+        for factory_name in ('Semaphore', 'BoundedSemaphore'):
+            with self.subTest(factory=factory_name):
+                s = Scenario()
+                sem = getattr(s, factory_name)(1)
+                sem.name = f'named-{factory_name}'
+                self.assertIn('Semaphore', repr(sem._core))
+                self.assertIn('SemaphoreAPI', repr(s.api(sem)))
+                self.assertIn(factory_name, repr(sem))
+                self.assertIn(factory_name + '.raw', repr(s.raw(sem)))
+                self.assertEqual(s.api(sem).value, 1)
+                self.assertTrue(s.api(sem).available)
+                self.assertEqual(s.api(sem).waiters, 0)
+
+                raw = s.raw(sem)
+                self.assertTrue(raw.acquire(blocking=False))
+                raw.release()
+
+                def worker():
+                    sem.acquire()
+                    sem.release()
+
+                with s:
+                    t = s.thread(worker)
+                    for method in (sem.acquire, sem.release):
+                        s.wait(method)
+                        tx = s.transaction(t)
+                        self.assertIn('Semaphore.', repr(tx))
+                        self.assertIn('Semaphore.', repr(tx._core))
+                        s.skip(t, method)
 
     def test_bounded_semaphore_creation_and_overrelease(self):
         scenario = Scenario()
@@ -1786,7 +2114,7 @@ class TestSemaphore(unittest.TestCase):
             r = scenario.thread(releaser)
             b = scenario.thread(acquirer, 'B')
             self.assertEqual(list(sem_api.allocate(a, r, b)), [a, b])
-            # allocate's Chain serializes the commits in spec order,
+            # allocate drives one semaphore transaction at a time,
             # but the workers' post-commit Python (the results.append
             # calls) races outside blanket's synchronization.  Wait
             # for each worker to actually terminate so the ordering
@@ -1796,19 +2124,21 @@ class TestSemaphore(unittest.TestCase):
         self.assertIn(('B', True), results)
         self.assertLess(results.index(('A', True)), results.index(('B', True)))
 
-    def test_allocate_rejects_impossible_acquire(self):
+    def test_allocate_reports_nonblocking_failed_acquire(self):
         scenario = Scenario()
         sem = scenario.Semaphore(0)
         sem_api = scenario.api(sem)
+        results = []
 
         def acquirer():
-            sem.acquire()
+            results.append(sem.acquire(blocking=False))
 
         with scenario:
             a = scenario.thread(acquirer)
-            with self.assertRaisesRegex(RuntimeError, 'cannot be proven|would block'):
-                sem_api.allocate(a)
-            scenario.raw(sem).release()
+            with self.assertRaisesRegex(RuntimeError, 'timed out|failed'):
+                list(sem_api.allocate(a))
+
+        self.assertEqual(results, [False])
 
     def test_allocate_pause_applies_to_acquire_threads_only(self):
         scenario = Scenario()
@@ -1859,125 +2189,222 @@ class TestSemaphore(unittest.TestCase):
 
         self.assertEqual(results, ['overrelease'])
 
+    def test_bounded_semaphore_allocate_acquire_makes_room_for_release(self):
+        scenario = Scenario()
+        sem = scenario.BoundedSemaphore(1)
+        sem_api = scenario.api(sem)
+        results = []
 
-class TestSimpleQueue(unittest.TestCase):
-    """Tests for the SimpleQueue primitive."""
+        def releaser():
+            sem.release()
+            results.append('released')
 
-    def test_basic_put_get_main_thread(self):
-        s = Scenario(); q = s.SimpleQueue()
-        self.assertTrue(q.empty())
-        self.assertEqual(q.qsize(), 0)
-        q.put('a'); q.put('b')
-        self.assertFalse(q.empty())
-        self.assertEqual(q.qsize(), 2)
-        self.assertEqual(q.get(), 'a')
-        self.assertEqual(q.get(), 'b')
-        self.assertTrue(q.empty())
+        def acquirer():
+            results.append(sem.acquire())
 
-    def test_put_nowait_and_get_nowait(self):
-        s = Scenario(); q = s.SimpleQueue()
-        q.put_nowait('x')
-        self.assertEqual(q.get_nowait(), 'x')
-        with self.assertRaises(queue.Empty):
-            q.get_nowait()
+        with scenario:
+            r = scenario.thread(releaser)
+            a = scenario.thread(acquirer)
+            self.assertEqual(list(sem_api.allocate(r, a)), [a])
 
-    def test_raw_handle(self):
-        s = Scenario(); q = s.SimpleQueue()
-        raw = s.raws[q]
-        raw.put('z')
-        self.assertEqual(raw.qsize(), 1)
-        self.assertEqual(raw.get(), 'z')
-        self.assertTrue(raw.empty())
+        self.assertIn(True, results)
+        self.assertIn('released', results)
+        self.assertEqual(sem_api.value, 1)
 
-    def test_api_alias_and_isinstance(self):
-        s = Scenario(); q = s.SimpleQueue()
-        self.assertTrue(hasattr(Scenario, 'SimpleQueueAPI'))
-        self.assertIs(Scenario.SimpleQueueAPI, s.SimpleQueueAPI)
-        self.assertIsInstance(s.api(q), Scenario.SimpleQueueAPI)
 
-    def test_blocking_get_woken_by_put(self):
-        # get on an empty queue parks at BLOCKED, then OS-blocks in
-        # COMMIT inside actual.get; a concurrently-driven put enqueues
-        # an item and wakes it.  Validates the opaque-commit approach
-        # end to end (no introspection of the queue's internals).
-        s = Scenario(); q = s.SimpleQueue(); out = []
-        def getter(): out.append(q.get())
-        def putter(): q.put('x')
-        with s:
-            tg = s.thread(getter); tp = s.thread(putter)
-            s.wait(q.get)
-            s.wait(q.put)
-            self.assertEqual(s.transactions[tg].state, State.BLOCKED)
-            self.assertEqual(s.transactions[tp].state, State.BLOCKED)
-            s.skip(tg, q.get, tp, q.put)
-        self.assertEqual(out, ['x'])
 
-    def test_get_expire_raises_empty(self):
-        # get is a TimeoutTransaction; the scenario-level api.expire
-        # convenience forces its commit's actual.get(timeout=0) to
-        # raise queue.Empty -- parity with Lock/Semaphore.
-        s = Scenario(); q = s.SimpleQueue(); api = s.api(q); err = []
-        def getter():
-            try:
-                q.get()
-            except queue.Empty:
-                err.append('Empty')
-        with s:
-            tg = s.thread(getter)
-            s.wait(q.get)
-            self.assertEqual(api.expire(q.get, tg), (tg,))
-            s.skip(tg, q.get)
-        self.assertEqual(err, ['Empty'])
+class TestVersionSpecificStdlibFidelity(unittest.TestCase):
+    """Tests for import-time stdlib-shape gates.
 
-    def test_get_disregard_and_revert(self):
-        # disregard drops a get's timeout; revert restores it.  After
-        # the round-trip the (still-blocking) get is woken by a put.
-        s = Scenario(); q = s.SimpleQueue(); api = s.api(q); out = []
-        def getter(): out.append(q.get(timeout=99))
-        def putter(): q.put('v')
-        with s:
-            tg = s.thread(getter); tp = s.thread(putter)
-            s.wait(q.get); s.wait(q.put)
-            self.assertEqual(api.disregard(q.get, tg), (tg,))
-            self.assertEqual(api.revert(q.get, tg), (tg,))
-            s.skip(tg, q.get, tp, q.put)
-        self.assertEqual(out, ['v'])
+    These load a fresh copy of blanket.primitives while temporarily making
+    current-stdlib modules look like older Python versions.  They don't prove
+    those old interpreters work end-to-end, but they do keep blanket's
+    stdlib-exact API gates from quietly regressing on the only interpreter in
+    this test run.
+    """
 
-    def test_expire_wrong_method_rejected(self):
-        s = Scenario(); q = s.SimpleQueue(); api = s.api(q)
-        def getter():
-            try:
-                q.get()
-            except queue.Empty:
-                pass
-        with s:
-            tg = s.thread(getter)
-            s.wait(q.get)
-            with self.assertRaises(ValueError):
-                api.expire(q.put, tg)
-            api.expire(q.get, tg)
-            s.skip(tg, q.get)
+    def test_missing_simplequeue_is_not_impersonated(self):
+        with _temporarily_removed_attribute(queue, 'SimpleQueue'):
+            with _fresh_primitives_module() as mod:
+                scenario = mod.Scenario()
 
-    def test_get_nowait_raises_empty_under_scheduler(self):
-        s = Scenario(); q = s.SimpleQueue(); err = []
-        def getter():
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                err.append('Empty')
-        with s:
-            tg = s.thread(getter)
-            s.wait(q.get_nowait)
-            s.skip(tg, q.get_nowait)
-        self.assertEqual(err, ['Empty'])
+                self.assertFalse(mod._queue_provides_simplequeue)
+                self.assertFalse(hasattr(mod.Scenario, 'SimpleQueue'))
+                self.assertFalse(hasattr(mod.Scenario, 'RawSimpleQueue'))
+                self.assertFalse(hasattr(mod.Scenario, 'SimpleQueueAPI'))
+                self.assertFalse(hasattr(scenario, 'SimpleQueue'))
+                self.assertFalse(hasattr(scenario.raws, 'SimpleQueue'))
+                self.assertFalse(hasattr(scenario.queue, 'SimpleQueue'))
+
+    def test_missing_queue_shutdown_is_not_impersonated(self):
+        with _temporarily_removed_attribute(queue.Queue, 'shutdown'):
+            with _temporarily_removed_attribute(queue, 'ShutDown'):
+                with _fresh_primitives_module() as mod:
+                    scenario = mod.Scenario()
+
+                    self.assertFalse(mod._queue_provides_shutdown)
+                    self.assertFalse(hasattr(scenario.queue, 'ShutDown'))
+
+                    for name in ('Queue', 'LifoQueue', 'PriorityQueue'):
+                        with self.subTest(variant=name):
+                            q = getattr(scenario, name)()
+                            self.assertFalse(hasattr(q, 'shutdown'))
+                            self.assertFalse(hasattr(scenario.raw(q), 'shutdown'))
+                            self.assertFalse(hasattr(scenario.api(q), 'shutdown'))
+
+    def test_missing_semaphore_release_n_uses_old_signature(self):
+        original_sem_release = threading.Semaphore.release
+        original_bounded_release = threading.BoundedSemaphore.release
+
+        def semaphore_release(self):
+            return original_sem_release(self)
+
+        def bounded_semaphore_release(self):
+            return original_bounded_release(self)
+
+        with _temporarily_assigned_attribute(threading.Semaphore, 'release', semaphore_release):
+            with _temporarily_assigned_attribute(threading.BoundedSemaphore, 'release', bounded_semaphore_release):
+                with _fresh_primitives_module() as mod:
+                    scenario = mod.Scenario()
+
+                    self.assertFalse(mod._semaphore_release_accepts_n)
+                    for factory_name in ('Semaphore', 'BoundedSemaphore'):
+                        with self.subTest(primitive=factory_name):
+                            sem = getattr(scenario, factory_name)(2)
+                            raw = scenario.raw(sem)
+
+                            self.assertEqual(tuple(inspect.signature(sem.release).parameters), ())
+                            self.assertEqual(tuple(inspect.signature(raw.release).parameters), ())
+
+                            with self.assertRaises(TypeError):
+                                sem.release(2)
+                            with self.assertRaises(TypeError):
+                                raw.release(2)
+
+                            sem.acquire()
+                            sem.release()
+
+
+
+    def test_rlock_locked_is_impersonated_when_stdlib_has_it(self):
+        original_rlock = threading.RLock
+
+        class RLockWithLocked:
+            def __init__(self, *args, **kwargs):
+                self._actual = original_rlock(*args, **kwargs)
+
+            def acquire(self, *args, **kwargs):
+                return self._actual.acquire(*args, **kwargs)
+
+            def release(self):
+                return self._actual.release()
+
+            def _is_owned(self):
+                return self._actual._is_owned()
+
+            def _release_save(self):
+                return self._actual._release_save()
+
+            def _acquire_restore(self, state):
+                return self._actual._acquire_restore(state)
+
+            if hasattr(original_rlock(), '_recursion_count'):  # coverage: version-specific branch
+                def _recursion_count(self):
+                    return self._actual._recursion_count()
+
+            def locked(self):
+                # This fake is only used from the owning thread in this
+                # test; that is enough to verify blanket exposes and
+                # routes the stdlib method when the stdlib has one.
+                return self._actual._is_owned()
+
+            def __repr__(self):
+                return repr(self._actual)
+
+        fake_rlock = RLockWithLocked()
+        self.assertFalse(fake_rlock._is_owned())
+        fake_rlock.acquire()
+        self.assertTrue(fake_rlock._is_owned())
+        if hasattr(fake_rlock, '_recursion_count'):
+            self.assertEqual(fake_rlock._recursion_count(), 1)
+        state = fake_rlock._release_save()
+        self.assertFalse(fake_rlock._is_owned())
+        fake_rlock._acquire_restore(state)
+        self.assertTrue(fake_rlock._is_owned())
+        self.assertIn('RLock', repr(fake_rlock))
+        fake_rlock.release()
+
+        with _temporarily_assigned_attribute(threading, 'RLock', RLockWithLocked):
+            with _fresh_primitives_module() as mod:
+                scenario = mod.Scenario()
+                rlock = scenario.RLock()
+                raw = scenario.raw(rlock)
+
+                self.assertTrue(mod._rlock_provides_locked)
+                self.assertTrue(hasattr(rlock, 'locked'))
+                self.assertTrue(hasattr(raw, 'locked'))
+
+                self.assertFalse(rlock.locked())
+                rlock.acquire()
+                self.assertTrue(rlock.locked())
+                self.assertTrue(raw.locked())
+                rlock.release()
+                self.assertFalse(raw.locked())
+
+    def test_condition_locked_is_impersonated_when_stdlib_has_it(self):
+        original_condition = threading.Condition
+
+        class ConditionWithLocked(original_condition):
+            def locked(self):
+                lock = self._lock
+                if hasattr(lock, 'locked'):
+                    return lock.locked()
+                return lock._is_owned()
+
+        class FakeLockWithoutLocked:
+            def __init__(self, owned):
+                self.owned = owned
+            def _is_owned(self):
+                return self.owned
+        class FakeLockWithLocked:
+            def __init__(self, locked):
+                self._locked = locked
+            def locked(self):
+                return self._locked
+
+        fake_condition = object.__new__(ConditionWithLocked)
+        fake_condition._lock = FakeLockWithLocked(True)
+        self.assertTrue(fake_condition.locked())
+        fake_condition._lock = FakeLockWithLocked(False)
+        self.assertFalse(fake_condition.locked())
+        fake_condition._lock = FakeLockWithoutLocked(True)
+        self.assertTrue(fake_condition.locked())
+        fake_condition._lock = FakeLockWithoutLocked(False)
+        self.assertFalse(fake_condition.locked())
+
+        with _temporarily_assigned_attribute(threading, 'Condition', ConditionWithLocked):
+            with _fresh_primitives_module() as mod:
+                scenario = mod.Scenario()
+                lock = scenario.Lock()
+                condition = scenario.Condition(lock)
+                raw = scenario.raw(condition)
+
+                self.assertTrue(mod._condition_provides_locked)
+                self.assertTrue(hasattr(condition, 'locked'))
+                self.assertTrue(hasattr(raw, 'locked'))
+
+                self.assertFalse(condition.locked())
+                lock.acquire()
+                self.assertTrue(condition.locked())
+                self.assertTrue(raw.locked())
+                lock.release()
+                self.assertFalse(raw.locked())
+
+
 
 
 class TestQueueFamily(unittest.TestCase):
-    """Tests for the Queue / LifoQueue / PriorityQueue family.
-
-    Stage 1 covers construction, the mutex/condition swap, and the
-    non-blocking methods.  The blocking get/put/join live in their own
-    tests once the child-wait machinery is in."""
+    """Tests for the Queue / LifoQueue / PriorityQueue family."""
 
     VARIANTS = ('Queue', 'LifoQueue', 'PriorityQueue')
 
@@ -1985,6 +2412,11 @@ class TestQueueFamily(unittest.TestCase):
         s = Scenario()
         for name in self.VARIANTS:
             yield name, s, getattr(s, name)
+
+    def test_each_iterates_variants(self):
+        items = list(self.each())
+        self.assertEqual([name for name, _s, _factory in items], list(self.VARIANTS))
+        self.assertTrue(all(callable(factory) for _name, _s, factory in items))
 
     def test_construction_and_masquerade(self):
         s = Scenario()
@@ -2046,6 +2478,18 @@ class TestQueueFamily(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     q.task_done()  # over-call
 
+    def test_shutdown_matches_stdlib_availability(self):
+        s = Scenario()
+        stdlib_has_shutdown = hasattr(queue.Queue, 'shutdown')
+        for name in self.VARIANTS:
+            with self.subTest(variant=name):
+                q = getattr(s, name)()
+                raw = s.raw(q)
+                api = s.api(q)
+                self.assertEqual(hasattr(q, 'shutdown'), stdlib_has_shutdown)
+                self.assertEqual(hasattr(raw, 'shutdown'), stdlib_has_shutdown)
+                self.assertEqual(hasattr(api, 'shutdown'), stdlib_has_shutdown)
+
     def test_raw_handle(self):
         s = Scenario()
         for name in self.VARIANTS:
@@ -2062,6 +2506,77 @@ class TestQueueFamily(unittest.TestCase):
             with self.subTest(variant=name):
                 q = getattr(s, name)()
                 self.assertIsInstance(s.api(q), getattr(Scenario, name + 'API'))
+
+    def test_queue_family_fancy_reprs(self):
+        s = Scenario()
+        for name in self.VARIANTS:
+            with self.subTest(variant=name):
+                q = getattr(s, name)()
+                q.name = f"named-{name}"
+                self.assertIn(name, repr(q))
+                self.assertIn(name, repr(q._core))
+                self.assertIn(name + 'API', repr(s.api(q)))
+                self.assertIn(name + '.raw', repr(s.raw(q)))
+
+    def test_raw_queue_family_methods(self):
+        s = Scenario()
+        for name in self.VARIANTS:
+            with self.subTest(variant=name):
+                q = getattr(s, name)(maxsize=2)
+                raw = s.raw(q)
+                raw.put(1)
+                self.assertEqual(raw.qsize(), 1)
+                self.assertFalse(raw.empty())
+                self.assertFalse(raw.full())
+                self.assertEqual(raw.get(), 1)
+                raw.task_done()
+                raw.join()
+                raw.put_nowait(2)
+                self.assertEqual(raw.get_nowait(), 2)
+                raw.task_done()
+                if hasattr(raw, 'shutdown'):
+                    raw.shutdown()
+
+    def test_queue_transaction_reprs(self):
+        s = Scenario()
+        q = s.Queue(maxsize=3)
+        methods = [
+            q.put_nowait,
+            q.qsize,
+            q.empty,
+            q.full,
+            q.get_nowait,
+            q.task_done,
+            q.put,
+            q.get,
+            q.task_done,
+            q.join,
+        ]
+        if hasattr(q, 'shutdown'):
+            methods.append(q.shutdown)
+
+        def worker():
+            q.put_nowait(1)
+            q.qsize()
+            q.empty()
+            q.full()
+            q.get_nowait()
+            q.task_done()
+            q.put(2)
+            q.get()
+            q.task_done()
+            q.join()
+            if hasattr(q, 'shutdown'):
+                q.shutdown()
+
+        with s:
+            t = s.thread(worker)
+            for method in methods:
+                s.wait(method)
+                tx = s.transaction(t)
+                self.assertIn('Queue.', repr(tx))
+                self.assertIn('Queue.', repr(tx._core))
+                s.skip(t, method)
 
     def test_inject_covers_queue_family(self):
         s = Scenario()
@@ -2080,9 +2595,9 @@ class TestQueueFamily(unittest.TestCase):
     # The three Conditions are plain native Conditions over one shimmed
     # (but unregulated) raw blanket Lock -- the same shape as Event.
     # get/put are WaitingTransactions: the tx itself parks at WAITING via
-    # the raw lock's release-save shim while OS-blocked in actual.X (no
+    # the raw lock's release-save shim while native-blocked in actual.X (no
     # child wait tx).  join is a plain Transaction (it can't time out) and
-    # parks at COMMIT as an opaque OS-block.  Driving is by transaction:
+    # parks at COMMIT as an opaque native block.  Driving is by transaction:
     # park the blocker, then drive the waker to completion and wait on the
     # blocker's *transaction* (waiting on the thread would block forever,
     # since a finished thread stops signalling).
@@ -2155,6 +2670,84 @@ class TestQueueFamily(unittest.TestCase):
             s.wait(txj)
         self.assertEqual(done, ['joined'])
 
+    def test_deliver_empty_queue_reorders_get_after_put(self):
+        s = Scenario(); q = s.Queue(); out = []
+        def getter(): out.append(q.get())
+        def putter(): q.put('x')
+        with s:
+            tg = s.thread(getter)
+            tp = s.thread(putter)
+            txs = s.api(q).deliver(tg, tp)
+        self.assertEqual(out, ['x'])
+        self.assertEqual([tx.method for tx in txs], [q.get, q.put])
+        self.assertTrue(all(tx.state is State.RETURNED for tx in txs))
+
+    def test_deliver_full_queue_reorders_put_after_get(self):
+        s = Scenario(); q = s.Queue(maxsize=1); q.put_nowait('a'); out = []
+        def putter(): q.put('b')
+        def getter(): out.append(q.get())
+        with s:
+            tp = s.thread(putter)
+            tg = s.thread(getter)
+            txs = s.api(q).deliver(tp, tg)
+        self.assertEqual(out, ['a'])
+        self.assertEqual(q.get_nowait(), 'b')
+        self.assertEqual([tx.method for tx in txs], [q.put, q.get])
+
+    def test_deliver_preserves_order_when_operations_can_run(self):
+        s = Scenario(); q = s.LifoQueue(); q.put_nowait('old'); out = []
+        def putter(): q.put('new')
+        def getter(): out.append(q.get())
+        with s:
+            tp = s.thread(putter)
+            tg = s.thread(getter)
+            s.api(q).deliver(tp, tg)
+        self.assertEqual(out, ['new'])
+        self.assertEqual(q.get_nowait(), 'old')
+
+    def test_deliver_supports_nowait_methods(self):
+        s = Scenario(); q = s.Queue(); out = []
+        def getter(): out.append(q.get_nowait())
+        def putter(): q.put_nowait('x')
+        with s:
+            tg = s.thread(getter)
+            tp = s.thread(putter)
+            txs = s.api(q).deliver(tg, tp)
+        self.assertEqual(out, ['x'])
+        self.assertEqual([tx.method for tx in txs], [q.get_nowait, q.put_nowait])
+
+    def test_deliver_supports_duplicate_thread(self):
+        s = Scenario(); q = s.Queue(); out = []
+        def worker():
+            q.put('x')
+            out.append(q.get())
+        with s:
+            t = s.thread(worker)
+            txs = s.api(q).deliver(t, t)
+        self.assertEqual(out, ['x'])
+        self.assertEqual([tx.method for tx in txs], [q.put, q.get])
+
+    def test_deliver_rejects_non_traffic_queue_methods(self):
+        s = Scenario(); q = s.Queue(); q.put_nowait('x')
+        def worker(): q.task_done()
+        with s:
+            t = s.thread(worker)
+            with self.assertRaises(ValueError):
+                s.api(q).deliver(t)
+
+    def test_deliver_propagates_nowait_failure_when_no_call_can_run(self):
+        s = Scenario(); q = s.Queue(); errors = []
+        def getter():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                errors.append('empty')
+        with s:
+            t = s.thread(getter)
+            with self.assertRaises(queue.Empty):
+                s.api(q).deliver(t)
+        self.assertEqual(errors, ['empty'])
+
     def test_blocking_get_woken_by_put_each_variant(self):
         # the blocking machinery is shared across the family; confirm a
         # parked getter is woken for each variant (ints sort for the
@@ -2206,6 +2799,37 @@ class TestBarrier(unittest.TestCase):
         r = repr(barrier)
         self.assertIn('test_barrier', r)
         self.assertIn('Barrier', r)
+
+    def test_barrier_fancy_reprs_raw_methods_and_transaction_reprs(self):
+        s = Scenario()
+        barrier = s.Barrier(1)
+        barrier.name = 'named-barrier'
+        self.assertIn('BarrierCore', repr(barrier._core))
+        self.assertIn('BarrierAPI', repr(s.api(barrier)))
+        raw = s.raw(barrier)
+        self.assertIn('Barrier.raw', repr(raw))
+        self.assertEqual(raw.wait(timeout=0), 0)
+        raw.reset()
+        raw.abort()
+        self.assertTrue(s.api(barrier).broken)
+        raw.reset()
+
+        methods = [barrier.wait, barrier.reset, barrier.abort]
+
+        def worker():
+            barrier.wait(timeout=0)
+            barrier.reset()
+            barrier.abort()
+
+        with s:
+            t = s.thread(worker)
+            for method in methods:
+                s.wait(method)
+                tx = s.transaction(t)
+                self.assertIn('Barrier.', repr(tx))
+                self.assertIn('Barrier.', repr(tx._core))
+                self.assertEqual(tx.method.__name__, method.__name__)
+                s.skip(t, method)
 
     def test_barrier_invalid_parties(self):
         """Barrier raises ValueError for invalid parties."""
@@ -2261,7 +2885,7 @@ class TestBarrier(unittest.TestCase):
         def worker():
             try:
                 n = barrier.wait(timeout=IMMEDIATELY)
-                result.append(('success', n))
+                result.append(('success', n))  # coverage: defensive success branch
             except BrokenBarrierError:
                 result.append(('broken',))
 
@@ -2410,7 +3034,7 @@ class TestBarrier(unittest.TestCase):
         def waiter():
             try:
                 barrier.wait(timeout=NEVER)
-                results.append('wait_success')
+                results.append('wait_success')  # coverage: defensive success branch
             except BrokenBarrierError:
                 results.append('wait_broken')
 
@@ -2455,7 +3079,7 @@ class TestBarrier(unittest.TestCase):
         def waiter():
             try:
                 barrier.wait(timeout=NEVER)
-                results.append('wait_success')
+                results.append('wait_success')  # coverage: defensive success branch
             except BrokenBarrierError:
                 results.append('wait_broken')
 
@@ -2492,7 +3116,7 @@ class TestBarrier(unittest.TestCase):
         def waiter():
             try:
                 result = barrier.wait(timeout=IMMEDIATELY)
-                results.append(('success', result))
+                results.append(('success', result))  # coverage: defensive success branch
             except BrokenBarrierError:
                 results.append('broken')
 
@@ -2589,11 +3213,11 @@ class TestUnblockRaceCondition(unittest.TestCase):
     """Test that Core.unblock processes transactions one at a time."""
 
     def test_unblock_sequential_processing(self):
-        """Unblock with wait=True processes each transaction sequentially.
+        """API unblock can be sequenced explicitly one transaction at a time.
 
-        This is a regression test verifying that unblock processes transactions
-        one at a time (observer, unblock, wait) rather than batching all observers
-        first, then all unblocks, then all waits.
+        This is a regression test verifying that a scheduler can unblock one
+        transaction, observe it finish, then unblock the next one, rather than
+        being forced to batch all observers, all unblocks, and all waits.
 
         We add observers to both transactions before calling unblock. Each observer
         records the state of both transactions at the moment it runs. With correct
@@ -2928,7 +3552,7 @@ class TestChain(unittest.TestCase):
         lock.acquire is unblocked so it can exit.
         """
         for lock, t, d in triples:
-            if not d.done:
+            if not d.done:  # coverage: test-defensive branch
                 d.close()
             s.api(lock).unblock(lock.acquire, t)
 
@@ -3081,12 +3705,18 @@ class TestChain(unittest.TestCase):
 
 
 class TestModuleHelpersAndImportBranches(unittest.TestCase):
+    def test_do_nothing_sentinel_is_callable(self):
+        self.assertIsNone(primitives_module._do_nothing(None))
+
     def test_state_helpers_and_scenario_properties(self):
         s = Scenario()
         self.assertEqual(s.name, '')
         self.assertIs(s.apis, s._core.apis_proxy)
         self.assertIs(s.raws, s._core.raws_proxy)
-        self.assertIs(s.log, s._core.log)
+        self.assertIs(s.log, s._core.log_proxy)
+        self.assertEqual(list(s.log), s._core.log)
+        with self.assertRaises(AttributeError):
+            s.log.append(None)
         self.assertIs(s.managed, s._core.managed_proxy)
         self.assertIsNone(s.transaction(threading.current_thread()))
         self.assertEqual(State.BLOCKED.index, 100)
@@ -3096,6 +3726,20 @@ class TestModuleHelpersAndImportBranches(unittest.TestCase):
         s = Scenario()
         with self.assertRaises(ValueError):
             s.wait()
+
+    def test_transaction_wait_state(self):
+        s = Scenario()
+        lock = s.Lock()
+        with s:
+            t = s.thread(lambda: lock.acquire())
+            s.wait(Call(t, lock.acquire, State.BLOCKED))
+            tx = s.transaction(t)
+            self.assertIs(tx.wait(State.BLOCKED), State.BLOCKED)
+            with self.assertRaises(TypeError):
+                tx.wait("BLOCKED")
+            api = s.api(lock)
+            api.unblock(lock.acquire, t)
+            self.assertIs(tx.wait(), State.RETURNED)
 
 class TestSignalAndProxyInternals(unittest.TestCase):
     def setUp(self):
@@ -3209,9 +3853,57 @@ class TestScenarioCoreInternals(unittest.TestCase):
         self.scenario = Scenario()
         self.core = self.scenario._core
 
+    def test_context_manager_repr_reports_entered_state(self):
+        cm = self.core.ContextManager()
+        self.assertIn("not entered", repr(cm))
+        with self.scenario:
+            self.assertIn("entered", repr(self.scenario._context_manager))
+
+    def test_wait_interest_refcount_cleanup_keeps_positive_counts(self):
+        score = self.core
+        interest_key = object()
+        base_core = object()
+        not_call = object()
+        not_use = object()
+        not_nested = object()
+        not_state = object()
+
+        score.scoped_call_bases[interest_key][base_core] = 2
+        score.scoped_use_bases[interest_key][base_core] = 2
+        score.sleeping_not_calls[not_call] = 2
+        score.sleeping_not_uses[not_use] = 2
+        score.sleeping_not_nested[not_nested] = 2
+        score.sleeping_not_transaction_states[not_state] = 2
+
+        undo = [
+            ('scoped_call', interest_key, base_core),
+            ('scoped_use', interest_key, base_core),
+            ('not_call', not_call),
+            ('not_use', not_use),
+            ('not_nested', not_nested),
+            ('not_transaction_state', not_state),
+        ]
+        score.unregister_wait_interests(undo)
+
+        self.assertEqual(score.scoped_call_bases[interest_key][base_core], 1)
+        self.assertEqual(score.scoped_use_bases[interest_key][base_core], 1)
+        self.assertEqual(score.sleeping_not_calls[not_call], 1)
+        self.assertEqual(score.sleeping_not_uses[not_use], 1)
+        self.assertEqual(score.sleeping_not_nested[not_nested], 1)
+        self.assertEqual(score.sleeping_not_transaction_states[not_state], 1)
+
+        score.unregister_wait_interests(undo)
+
+        self.assertNotIn(interest_key, score.scoped_call_bases)
+        self.assertNotIn(interest_key, score.scoped_use_bases)
+        self.assertNotIn(not_call, score.sleeping_not_calls)
+        self.assertNotIn(not_use, score.sleeping_not_uses)
+        self.assertNotIn(not_nested, score.sleeping_not_nested)
+        self.assertNotIn(not_state, score.sleeping_not_transaction_states)
+
     def test_reset_clears_terminated_tx_debris_from_signaling(self):
         """reset() drops accumulated state.  Self-reporting tx and
-        Signaled items report their own state directly; the per-score
+        Signaling items report their own state directly; the per-score
         "signaling" set is gone, so reset has no signaling debris to
         clear.  This test verifies the post-refactor contract: tx.api
         self-reports True once done and stays True across reset (state
@@ -3252,6 +3944,8 @@ class TestScenarioCoreInternals(unittest.TestCase):
         scenario = self.scenario
         scenario.reset()
         scenario.reset()  # second call is a no-op
+        self.assertEqual(len(self.core.log), 0)
+        self.assertEqual(len(self.core.waiters), 0)
 
     def test_context_manager_exit_auto_clears(self):
         scenario = self.scenario
@@ -3282,7 +3976,7 @@ class TestScenarioCoreInternals(unittest.TestCase):
         self.assertTrue(ran)
 
     def test_core_signal_requires_signaled(self):
-        # Every wait item is Signaled now; score.signal on a bare
+        # Every wait item is self-reporting now; score.signal on a bare
         # object asserts out.  This is a contract assertion, not a
         # user-facing error -- internal callers must wrap properly.
         item = object()
@@ -3463,7 +4157,7 @@ class TestCoreTransactionAndApiInternals(unittest.TestCase):
         def bad_release():
             try:
                 self.lock.release()
-            except RuntimeError:
+            except RuntimeError:  # coverage: thread-defensive cleanup
                 pass
         with self.scenario:
             t = self.scenario.thread(bad_release)
@@ -3484,6 +4178,7 @@ class TestCoreTransactionAndApiInternals(unittest.TestCase):
                 return '<broken _thread.RLock object at 0x0>'
             def _recursion_count(self):
                 return 0
+        self.assertEqual(FakeActual()._recursion_count(), 0)
         try:
             rcore.actual = FakeActual()
             with self.assertRaises(RuntimeError):
@@ -3517,7 +4212,7 @@ class TestCoreTransactionAndApiInternals(unittest.TestCase):
         self.assertTrue(r._is_owned())
         if hasattr(actual, '_recursion_count'):
             self.assertEqual(r._recursion_count(), 2)
-        if hasattr(actual, 'locked'):
+        if hasattr(actual, 'locked'):  # coverage: version-specific branch
             self.assertTrue(r.locked())
         state = r._release_save()
         if hasattr(actual, '_recursion_count'):
@@ -3570,7 +4265,7 @@ class TestHighLevelLockApiCoverage(unittest.TestCase):
         def bad_releaser():
             try:
                 lock.release()
-            except RuntimeError:
+            except RuntimeError:  # coverage: thread-defensive cleanup
                 pass
         def acquirer():
             lock.acquire()
@@ -3855,6 +4550,36 @@ class TestNotSignal(unittest.TestCase):
             s.wait(t)
             _tx = s.transaction(t); _tx.unblock(); s.wait(_tx)
 
+    def test_not_normalized_shorthand_forms_stay_native(self):
+        """Not(thread/method/primitive) normalizes to native objects, not boxes."""
+        s = Scenario()
+        lock = s.Lock()
+        raw = s.raws[lock]
+
+        t = threading.Thread(target=lambda: None)
+        not_thread = Not(t)
+        self.assertIs(not_thread.normalized(), not_thread)
+        self.assertIs(not_thread.normalized().wrapped, t)
+
+        not_lock = Not(lock)
+        self.assertIs(not_lock.normalized(), not_lock)
+        self.assertIs(not_lock.normalized().wrapped, lock)
+        self.assertIs(Not(raw).normalized().wrapped, lock)
+
+        not_acquire = Not(lock.acquire)
+        self.assertIs(not_acquire.normalized(), not_acquire)
+        lock_acquire = not_acquire.normalized().wrapped
+        raw_acquire = Not(raw.acquire).normalized().wrapped
+        self.assertIs(lock_acquire.__self__, lock)
+        self.assertIs(raw_acquire.__self__, lock)
+        self.assertEqual(lock_acquire.__name__, 'acquire')
+        self.assertEqual(raw_acquire.__name__, 'acquire')
+
+        for signal in (Not(t), Not(lock), Not(raw), Not(lock.acquire), Not(raw.acquire)):
+            with self.subTest(signal=signal):
+                wrapped = signal.normalized().wrapped
+                self.assertNotIsInstance(wrapped, primitives_module.Signaling)
+
     def test_not_high_when_thread_idle(self):
         """Not(A) is high when A has no active tx (whether alive-idle or dead).
 
@@ -3927,6 +4652,146 @@ class TestNotSignal(unittest.TestCase):
             n = Not(t)
             self.assertEqual(repr(n), "Not('WorkerT')")
 
+    def _wait_until_parked(self, scenario, key, message):
+        deadline = time.perf_counter() + 1
+        while True:
+            with scenario._core.lock:
+                parked = bool(scenario._core.waiters.get(key))
+            if parked:
+                return
+            if time.perf_counter() > deadline:
+                self.fail(message)
+            time.sleep(0.001)
+
+    def _assert_not_shorthand_wakes_on_close(self, signal_factory):
+        s = Scenario()
+        lock = s.Lock()
+
+        def worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            signal = signal_factory(t, lock)
+            self.assertFalse(s.wait(signal, timeout=0))
+
+            results = []
+            def wait_for_signal():
+                results.append(s.wait(signal, timeout=NEVER))
+
+            waiter = threading.Thread(target=wait_for_signal)
+            waiter.start()
+            self._wait_until_parked(
+                s, signal.normalized(),
+                f"{signal!r} waiter did not park")
+
+            s.skip(t, lock.acquire)
+
+            waiter.join(5)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(results, [{signal}])
+            return True
+
+    def test_not_thread_wait_wakes_when_thread_goes_idle(self):
+        self.assertTrue(self._assert_not_shorthand_wakes_on_close(lambda t, lock: Not(t)))
+
+    def test_not_thread_bearing_signals_reject_unstarted_thread(self):
+        s = Scenario()
+        lock = s.Lock()
+        t = threading.Thread(target=lambda: None)
+        signals = [
+            Not(t),
+            Not(Terminated(t)),
+            Not(Call(t, lock.acquire)),
+            Not(Use(t, lock)),
+        ]
+        for signal in signals:
+            with self.subTest(signal=signal):
+                with self.assertRaises(ValueError) as cm:
+                    s.wait(signal, timeout=0)
+                self.assertIn("unstarted thread", str(cm.exception))
+
+    def test_not_bound_method_wait_wakes_when_method_goes_low(self):
+        self.assertTrue(self._assert_not_shorthand_wakes_on_close(lambda t, lock: Not(lock.acquire)))
+
+    def test_not_primitive_wait_wakes_when_primitive_goes_low(self):
+        self.assertTrue(self._assert_not_shorthand_wakes_on_close(lambda t, lock: Not(lock)))
+
+    def test_not_transaction_state_wait_wakes_when_state_changes(self):
+        s = Scenario()
+        lock = s.Lock()
+
+        def worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            tx = s.transaction(t)
+            signal = Not(Blocked(tx))
+            self.assertFalse(s.wait(signal, timeout=0))
+
+            results = []
+            def wait_for_signal():
+                results.append(s.wait(signal, timeout=NEVER))
+
+            waiter = threading.Thread(target=wait_for_signal)
+            waiter.start()
+            self._wait_until_parked(
+                s, signal.normalized(),
+                "Not(Blocked(tx)) waiter did not park")
+
+            tx.unblock()
+
+            waiter.join(5)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(results, [{signal}])
+            s.wait(tx)
+
+    def test_not_nested_wait_wakes_when_child_transaction_closes(self):
+        s = Scenario()
+        rlock = s.RLock()
+        condition = s.Condition(rlock)
+
+        def predicate():
+            return condition.wait_for(lambda: True, timeout=-1)
+
+        def worker():
+            rlock.acquire()
+            condition.wait_for(predicate, timeout=-1)
+            rlock.release()
+
+        with s:
+            t = s.thread(worker)
+            s.skip(t, rlock.acquire)
+            s.wait(Call(t, condition.wait_for, State.BLOCKED))
+            parent = s.transaction(t)
+            parent.unblock()
+            s.wait(Call((t, parent), condition.wait_for, State.BLOCKED))
+            child = s.transaction(t)
+
+            signal = Not(Nested(parent))
+            self.assertFalse(s.wait(signal, timeout=0))
+
+            results = []
+            def wait_for_signal():
+                results.append(s.wait(signal, timeout=NEVER))
+
+            waiter = threading.Thread(target=wait_for_signal)
+            waiter.start()
+            self._wait_until_parked(
+                s, signal.normalized(),
+                "Not(Nested(tx)) waiter did not park")
+
+            child.unblock()
+
+            waiter.join(5)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(results, [{signal}])
+            s.wait(parent)
+            s.skip(t, rlock.release)
+
 
 class TestScenarioLifecycleErrors(unittest.TestCase):
     """Scenario.__enter__/__exit__ misuse errors."""
@@ -3946,6 +4811,14 @@ class TestScenarioLifecycleErrors(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             s.__exit__(None, None, None)
         self.assertIn("haven't entered", str(cm.exception))
+
+    def test_block_without_enter_raises(self):
+        s = Scenario()
+        lock = s.Lock()
+        t = threading.Thread(target=lambda: None)
+        with self.assertRaises(RuntimeError) as cm:
+            s.block(t, lock.acquire)
+        self.assertIn("scenario not entered", str(cm.exception))
 
 
 class TestThreadRegistrationCoverage(unittest.TestCase):
@@ -4040,6 +4913,109 @@ class TestSignalTokenCoverage(unittest.TestCase):
             nested = Nested(tx)
             self.assertIs(nested.transaction, tx)
             self.assertIs(nested.transaction, nested.tx)
+        finally:
+            self._finish_tx(s, tx)
+
+    def test_signaling_base_sample_must_be_overridden(self):
+        signal = primitives_module.Signaling()
+        with self.assertRaises(NotImplementedError):
+            signal.sample(Scenario())
+
+    def test_transaction_signal_token_thread_property(self):
+        s = Scenario()
+        lock = s.Lock()
+        tx = self._make_tx(s, lock)
+        try:
+            nested = Nested(tx)
+            self.assertIs(nested.thread, tx.thread)
+        finally:
+            self._finish_tx(s, tx)
+
+    def test_use_rejects_non_primitive(self):
+        t = threading.Thread(target=lambda: None)
+        with self.assertRaises(TypeError) as cm:
+            Use(t, object())
+        self.assertIn("primitive", str(cm.exception))
+
+    def test_use_scoped_properties_and_repr(self):
+        s = Scenario()
+        lock = s.Lock()
+        tx = self._make_tx(s, lock)
+        try:
+            use = Use((tx.thread, tx), lock)
+            self.assertIs(use.thread, tx.thread)
+            self.assertIs(use.base_tx, tx)
+            self.assertIs(use.primitive, lock)
+            self.assertEqual(use.thread_scope, (tx.thread, tx))
+            self.assertIn(tx.thread.name, repr(use))
+            self.assertIn("Use(", repr(use))
+
+            child = types.SimpleNamespace(use_primitives=set(), parent=tx._core)
+            old_tx = s._core.transactions[tx.thread]
+            s._core.transactions[tx.thread] = child
+            try:
+                self.assertIsNone(use.matching_tx(s))
+            finally:
+                s._core.transactions[tx.thread] = old_tx
+        finally:
+            self._finish_tx(s, tx)
+
+    def test_call_rejects_unregulated_callable(self):
+        t = threading.Thread(target=lambda: None)
+        with self.assertRaises(TypeError) as cm:
+            Call(t, lambda: None)
+        self.assertIn("bound method", str(cm.exception))
+
+    def test_call_scoped_properties_and_repr(self):
+        s = Scenario()
+        lock = s.Lock()
+        tx = self._make_tx(s, lock)
+        try:
+            call = Call((tx.thread, tx), lock.acquire, State.BLOCKED)
+            self.assertIs(call.thread, tx.thread)
+            self.assertIs(call.base_tx, tx)
+            self.assertIs(call.method.__self__, lock)
+            self.assertIs(call.state, State.BLOCKED)
+            self.assertEqual(call.thread_scope, (tx.thread, tx))
+            self.assertIn(tx.thread.name, repr(call))
+            self.assertIn("BLOCKED", repr(call))
+
+            class FakeTx:
+                def __init__(self, parent, methods=()):
+                    self.parent = parent
+                    self._methods = set(methods)
+                def call_methods(self):
+                    return self._methods
+
+            middle = FakeTx(tx._core)
+            child = FakeTx(middle, {lock.acquire})
+            self.assertTrue(Call._scoped_tx_selected(child, tx._core, lock.acquire))
+        finally:
+            self._finish_tx(s, tx)
+
+    def test_reached_thread_property(self):
+        s = Scenario()
+        lock = s.Lock()
+        tx = self._make_tx(s, lock)
+        try:
+            self.assertIs(Reached(tx, State.BLOCKED).thread, tx.thread)
+        finally:
+            self._finish_tx(s, tx)
+
+    def test_action_and_predicate_validation_and_repr(self):
+        with self.assertRaises(TypeError) as cm:
+            Action("not a tx")
+        self.assertIn("Transaction", str(cm.exception))
+        with self.assertRaises(TypeError) as cm:
+            Predicate("not a tx")
+        self.assertIn("Transaction", str(cm.exception))
+
+        s = Scenario()
+        lock = s.Lock()
+        tx = self._make_tx(s, lock)
+        try:
+            self.assertTrue(repr(Action(tx)).startswith("Action("))
+            self.assertTrue(repr(Predicate(tx)).startswith("Predicate("))
         finally:
             self._finish_tx(s, tx)
 
@@ -4337,8 +5313,8 @@ class TestPark(unittest.TestCase):
         self.assertEqual(order, ['B', 'A'])
 
     def test_park_after_completed_skip_tolerates_inflight_tx(self):
-        """park after skip(wait=True) tolerates whatever transient
-        state the worker is in mid-tx-pop."""
+        """park after skip tolerates whatever transient state the worker
+        is in mid-tx-pop."""
         s = Scenario()
         lock = s.Lock()
         def worker():
@@ -4566,6 +5542,7 @@ class TestSkip(unittest.TestCase):
             # By the time skip returns, the worker has completed the
             # first pair and is heading to the next lock.acquire.
             s.skip(t, lock.acquire, lock.release)
+            self.assertEqual(s.wait(Terminated(t), timeout=IMMEDIATELY), {Terminated(t)})
 
 
 
@@ -4752,6 +5729,44 @@ class TestConditionCycleBasic(unittest.TestCase):
             scenario.skip(woke[-1], lock.release)
 
         self.assertEqual(log, ['A', 'B', 'C', 'D', 'E'])
+
+    def test_cycle_wait_rejects_plain_waiter_and_preserves_ready(self):
+        """wait() is only valid for wait_for waiters that can re-wait.
+
+        A plain cond.wait waiter should remain ready after the error so
+        the caller can still wake or pause it.
+        """
+        scenario = Scenario()
+        lock = scenario.Lock()
+        condition = scenario.Condition(lock)
+        capi = scenario.api(condition)
+        log = []
+
+        def waiter():
+            lock.acquire(); condition.wait(); log.append('A'); lock.release()
+
+        def notifier():
+            lock.acquire(); condition.notify(); lock.release()
+
+        with scenario:
+            a = scenario.thread(waiter)
+            n = scenario.thread(notifier)
+            self.park_waiter(scenario, condition, lock, a)
+            cycle = capi.cycle(a, n)
+            self.assertEqual(cycle.ready, (a,))
+
+            with self.assertRaisesRegex(ValueError, "plain cond.wait"):
+                cycle.wait(a)
+            self.assertEqual(cycle.ready, (a,))
+            self.assertFalse(cycle.closed)
+            self.assertEqual(log, [])
+
+            scenario.skip(n, lock.release)
+            self.assertEqual(cycle.wake(a), (a,))
+            scenario.skip(a, lock.release)
+
+        self.assertEqual(log, ['A'])
+
 
     def test_cycle_pause_plain_waiter(self):
         """pause() on a plain cond.wait waiter parks it at PAUSED (user
@@ -5142,14 +6157,6 @@ class TestConditionCycleValidation(unittest.TestCase):
             s.skip(n, lock.acquire, condition.notify, lock.release)
 
 
-class TestDriveNotifyTermination(unittest.TestCase):
-    """drive_notify's terminated-thread paths."""
-
-    def test_drive_notify_thread_terminates_mid_notify(self):
-        # Hard to deterministically kill a thread mid-notify.  Skip for now.
-        pass
-
-
 class TestConditionTimeoutSemantics(unittest.TestCase):
     """Regression tests for thin-wrapper timeout handling."""
 
@@ -5482,6 +6489,67 @@ class TestConditionCycleScheduler(unittest.TestCase):
             self.assertEqual(cycle.wake(), w)
             s.skip(w, lock.release)
 
+    def test_scheduler_tx_disambiguates_multiple_wait_for_waiters(self):
+        """scheduler(wait_for_tx) identifies which waiter reentered.
+
+        A single Condition.cycle may manage multiple wait_for callers;
+        the tx argument lets the scheduler distinguish them by tx.thread.
+        """
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+        capi = s.api(condition)
+        predicate_calls = {}
+        seen = []
+        log = []
+
+        def predicate():
+            thread = threading.current_thread()
+            predicate_calls[thread] = predicate_calls.get(thread, 0) + 1
+            return predicate_calls[thread] >= 2
+
+        def waiter(name):
+            def fn():
+                lock.acquire()
+                condition.wait_for(predicate)
+                log.append(name)
+                lock.release()
+            return fn
+
+        def notifier():
+            lock.acquire()
+            condition.notify_all()
+            lock.release()
+
+        def scheduler(wf):
+            seen.append((wf.thread, wf.method))
+
+        with s:
+            a = s.thread(waiter('A')); a.name = 'A'
+            b = s.thread(waiter('B')); b.name = 'B'
+            n = s.thread(notifier); n.name = 'N'
+
+            s.skip(a, lock.acquire)
+            s.wait(a)      # A is at wait_for, holding UL.
+            s.wait(b)      # B is at UL.acquire.
+            s.wait(n)      # N is also waiting for UL.
+
+            cycle = capi.cycle(a, b, n, scheduler=scheduler)
+            ready = cycle.ready
+
+            s.skip(n, lock.release)
+            woke_a = cycle.wake(a)
+            s.skip(a, lock.release)
+            woke_b = cycle.wake(b)
+            s.skip(b, lock.release)
+
+        self.assertEqual(ready, (a, b))
+        self.assertEqual(woke_a, (a,))
+        self.assertEqual(woke_b, (b,))
+        self.assertEqual([thread for thread, _ in seen], [a, b])
+        self.assertEqual([method for _, method in seen], [condition.wait_for, condition.wait_for])
+        self.assertEqual(log, ['A', 'B'])
+
     def test_scheduler_drives_predicate_child(self):
         """A predicate that spawns a regulated child: the scheduler
         drives that child to terminal while the predicate runs, then
@@ -5572,9 +6640,119 @@ class TestConditionCycleScheduler(unittest.TestCase):
 
             cycle = capi.cycle(w, n, scheduler=scheduler)
             self.assertEqual(cycle.ready, (w,))
+            with self.assertRaisesRegex(ValueError, "already succeeded"):
+                cycle.wait(w)
+            self.assertEqual(cycle.ready, (w,))
             self.assertEqual(cycle.wake(w), (w,))
             s.skip(w, lock.release)
             s.skip(n, lock.acquire, condition.notify, lock.release)
+
+    def test_cycle_wait_wait_for_waiter_rewaits(self):
+        """wait() on a wait_for waiter re-runs a false predicate and parks
+        the waiter at a fresh inner cond.wait, ready for a later cycle."""
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+        capi = s.api(condition)
+        log = []
+        results = iter([False, False, True])
+        seen = []
+
+        def predicate():
+            seen.append('predicate')
+            return next(results)
+
+        def waiter():
+            lock.acquire()
+            condition.wait_for(predicate)
+            log.append('A')
+            lock.release()
+
+        def notifier():
+            lock.acquire()
+            condition.notify()
+            lock.release()
+
+        with s:
+            w = s.thread(waiter)
+            n1 = s.thread(notifier)
+            s.skip(w, lock.acquire)
+            s.wait(w)
+            s.wait(n1)
+
+            cycle = capi.cycle(w, n1)
+            self.assertEqual(s.transaction(w).state, State.STALLED)
+
+            self.assertEqual(cycle.wait(), w)
+            self.assertTrue(cycle.closed)
+            self.assertEqual(s.transaction(w).method, condition.wait)
+            self.assertEqual(s.transaction(w).state, State.WAITING)
+            self.assertEqual(log, [])
+
+            # A later cycle can now notify the fresh wait.  The third
+            # predicate call succeeds and the waiter exits wait_for.
+            n2 = s.thread(notifier)
+            s.wait(n2)
+            cycle2 = capi.cycle(w, n2)
+            s.skip(n2, lock.release)
+            self.assertEqual(cycle2.wake(w), (w,))
+            s.skip(w, lock.release)
+
+        self.assertEqual(log, ['A'])
+        self.assertEqual(seen, ['predicate', 'predicate', 'predicate'])
+
+    def test_cycle_wait_exiting_wait_for_preserves_relay(self):
+        """If wait() expected a re-wait but the predicate succeeds,
+        the cycle raises while preserving enough relay state to drain
+        later waiters."""
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+        capi = s.api(condition)
+        results = {
+            'A': iter([False, True]),
+            'B': iter([False, True]),
+        }
+        log = []
+
+        def predicate(name):
+            return next(results[name])
+
+        def waiter(name):
+            def fn():
+                lock.acquire()
+                condition.wait_for(lambda: predicate(name))
+                log.append(f'{name}_after')
+                lock.release()
+            return fn
+
+        def notifier():
+            lock.acquire()
+            condition.notify_all()
+            lock.release()
+
+        with s:
+            a = s.thread(waiter('A'))
+            b = s.thread(waiter('B'))
+            n = s.thread(notifier)
+            s.skip(a, lock.acquire)
+            s.wait(a)          # A is at wait_for, holding the underlying lock.
+            s.wait(b)          # B is blocked at the underlying lock acquire.
+            s.wait(n)          # notifier is blocked behind both waiters.
+
+            cycle = capi.cycle(a, b, n)
+            s.skip(n, lock.release)
+
+            with self.assertRaisesRegex(RuntimeError, "wait_for exited"):
+                cycle.wait(a)
+            self.assertEqual(s.transaction(a).method, lock.release)
+
+            # Without the relay repair, this would try to free the
+            # underlying lock using the old notifier Driver instead of A.
+            self.assertEqual(cycle.wake(b), (b,))
+            self.assertEqual(log, ['A_after', 'B_after'])
+            s.skip(b, lock.release)
+
 
     def test_cycle_pause_wait_for_waiter(self):
         """pause() on a wait_for waiter: the cycle re-runs the predicate
@@ -5657,6 +6835,7 @@ class TestConditionContextManager(unittest.TestCase):
         with s:
             t = s.thread(worker)
             s.skip(t, lock.acquire, lock.release)
+            self.assertEqual(s.wait(Terminated(t), timeout=IMMEDIATELY), {Terminated(t)})
 
 
 class TestConditionAssign(unittest.TestCase):
@@ -5672,6 +6851,7 @@ class TestConditionAssign(unittest.TestCase):
             t = s.thread(worker)
             capi.assign(t)
             s.skip(t, lock.release)
+            self.assertEqual(s.wait(Terminated(t), timeout=IMMEDIATELY), {Terminated(t)})
 
 
 class TestConditionNotifyAllApiN(unittest.TestCase):
@@ -5883,10 +7063,11 @@ class TestUnstall(unittest.TestCase):
         lock = s.Lock()
         condition = s.Condition(lock)
         capi = s.api(condition)
+        results = []
 
         def waiter():
             lock.acquire()
-            condition.wait(timeout=IMMEDIATELY)
+            results.append(condition.wait(timeout=IMMEDIATELY))
             lock.release()
 
         with s:
@@ -5899,6 +7080,7 @@ class TestUnstall(unittest.TestCase):
             capi.unstall(condition.wait, t)
             s.wait(wait_tx)
             s.skip(t, lock.release)
+            self.assertEqual(results, [False])
 
     def test_cond_api_unstall_multi_thread(self):
         """cond_api.unstall(*threads) works for multiple parked threads."""
@@ -5906,10 +7088,11 @@ class TestUnstall(unittest.TestCase):
         lock = s.Lock()
         condition = s.Condition(lock)
         capi = s.api(condition)
+        results = []
 
         def waiter():
             lock.acquire()
-            condition.wait(timeout=IMMEDIATELY)
+            results.append(condition.wait(timeout=IMMEDIATELY))
             lock.release()
 
         def park(thread):
@@ -5937,6 +7120,7 @@ class TestUnstall(unittest.TestCase):
             capi.unstall(condition.wait, b)
             s.wait(b_tx)
             s.skip(b, lock.release)
+            self.assertEqual(results, [False, False])
 
     def test_cond_api_unstall_raises_on_no_tx(self):
         """cond_api.unstall(t) raises if t has no active tx."""
@@ -6159,6 +7343,57 @@ class TestWaitForInsidePredicate(unittest.TestCase):
             self.assertEqual(wf_tx._core.state, State.RETURNED)
             s.skip(t, lock.release)
 
+    def test_not_predicate_wakes_when_predicate_exits(self):
+        s = Scenario()
+        lock = s.RLock()
+        condition = s.Condition(lock)
+        child_lock = s.Lock()
+
+        def predicate():
+            child_lock.locked()
+            return True
+
+        def waiter():
+            lock.acquire()
+            condition.wait_for(predicate)
+            lock.release()
+
+        with s:
+            t = s.thread(waiter)
+            s.skip(t, lock.acquire)
+            s.wait(Call(t, condition.wait_for, State.BLOCKED))
+            wf_tx = s.transaction(t)
+            wf_tx.unblock()
+            s.wait(Predicate(wf_tx))
+            s.wait(Call((t, wf_tx), child_lock.locked, State.BLOCKED))
+
+            signal = Not(Predicate(wf_tx))
+            self.assertFalse(s.wait(signal, timeout=0))
+            results = []
+
+            def wait_for_signal():
+                results.append(s.wait(signal, timeout=NEVER))
+
+            parked = threading.Thread(target=wait_for_signal)
+            parked.start()
+            deadline = time.perf_counter() + 1
+            while True:
+                with s._core.lock:
+                    is_parked = bool(s._core.waiters.get(signal.normalized()))
+                if is_parked:
+                    break
+                if time.perf_counter() > deadline:
+                    self.fail("Not(Predicate(tx)) waiter did not park")
+                time.sleep(0.001)
+
+            child = s.transaction(t)
+            child.unblock()
+            parked.join(1)
+            self.assertFalse(parked.is_alive())
+            self.assertEqual(results, [{signal}])
+            s.wait(wf_tx)
+            s.skip(t, lock.release)
+
 
 class TestMonotonicStates(unittest.TestCase):
     """Verify the state machine makes only forward transitions (except
@@ -6178,12 +7413,6 @@ class TestMonotonicStates(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             tx = s.transaction(t)
-            # Install an observer on every non-START state.
-            prev_state = [tx._core.state]
-            def record():
-                cur = tx._core.state
-                transitions.append((prev_state[0], cur))
-                prev_state[0] = cur
             # We can't easily install a state_observer from outside,
             # so just verify that the tx's final state is terminal.
             s.skip(t, lock.acquire, lock.release)
@@ -6306,6 +7535,21 @@ class TestRegisterThreadValidation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unstarted thread"):
                 s.wait(Terminated(t), timeout=IMMEDIATELY)
 
+    def test_wait_positive_timeout_returns_empty_set(self):
+        s = Scenario()
+        gate = threading.Event()
+        t = threading.Thread(target=gate.wait, name='positive-timeout-target')
+        t.start()
+        try:
+            with s:
+                start = time.perf_counter()
+                self.assertEqual(s.wait(Terminated(t), timeout=IMMEDIATELY), set())
+                self.assertGreaterEqual(time.perf_counter() - start, IMMEDIATELY)
+                gate.set()
+        finally:
+            gate.set()
+            t.join(1)
+
 
 class TestParkSkipParseErrors(unittest.TestCase):
     """Argument validation for park/skip parsing."""
@@ -6354,7 +7598,7 @@ class TestParkSkipParseErrors(unittest.TestCase):
         s = Scenario()
         with s:
             t = s.thread(lambda: None)
-            with self.assertRaisesRegex(TypeError, "expected thread, base tx, or method"):
+            with self.assertRaisesRegex(TypeError, r"expected thread, \(thread, base_tx\), or method"):
                 s.park(t, "not-a-method")
 
     def test_park_rejects_thread_with_no_methods(self):
@@ -6366,6 +7610,61 @@ class TestParkSkipParseErrors(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "has no method"):
                 # Two threads with no methods between them.
                 s.park(t1, t2)
+
+    def test_thread_base_tuple_parser(self):
+        """Base txs are supplied only as strict (thread, base_tx) tuples."""
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+
+        def worker():
+            lock.acquire()
+            condition.wait_for(lambda: False, timeout=-1)
+            lock.release()
+
+        with s:
+            t = s.thread(worker)
+            s.skip(t, lock.acquire)
+            base = s.transaction(t)
+
+            plan = s._core.parse_park_skip_args(
+                ((t, base), lock.release), 'skip')
+            self.assertEqual(plan, [(t, base._core, [lock.release])])
+
+            pairs = s._core.parse_thread_base_pairs(((t, base),), 'cycle')
+            self.assertEqual(pairs, [(t, base._core)])
+
+            with self.assertRaisesRegex(
+                    TypeError, r"expected thread, \(thread, base_tx\), or method"):
+                s._core.parse_park_skip_args((t, base, lock.release), 'skip')
+            with self.assertRaisesRegex(
+                    TypeError, r"expected thread or \(thread, base_tx\)"):
+                s._core.parse_thread_base_pairs((t, base), 'cycle')
+
+    def test_thread_base_tuple_parser_rejects_bad_tuples(self):
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+
+        def worker():
+            lock.acquire()
+            condition.wait_for(lambda: False, timeout=-1)
+            lock.release()
+
+        with s:
+            t = s.thread(worker)
+            s.skip(t, lock.acquire)
+            base = s.transaction(t)
+            other = threading.Thread(target=lambda: None, name='other')
+
+            with self.assertRaisesRegex(TypeError, "2-tuple"):
+                s._core.parse_thread_base_pairs(((t, base, object()),), 'cycle')
+            with self.assertRaisesRegex(TypeError, "first item"):
+                s._core.parse_thread_base_pairs(((object(), base),), 'cycle')
+            with self.assertRaisesRegex(TypeError, "second item"):
+                s._core.parse_thread_base_pairs(((t, object()),), 'cycle')
+            with self.assertRaisesRegex(ValueError, "belongs to thread"):
+                s._core.parse_thread_base_pairs(((other, base),), 'cycle')
 
 
 class TestTransactionLookupMisses(unittest.TestCase):
@@ -6452,6 +7751,7 @@ class TestSettleWaitsForInTransit(unittest.TestCase):
             # next lock.acquire.  A second skip must settle on the
             # *next* fresh acquire, not get confused by the stale state.
             s.skip(t, lock.acquire, lock.release)
+            self.assertEqual(s.wait(Terminated(t), timeout=IMMEDIATELY), {Terminated(t)})
 
 
 class TestParkErrorPaths(unittest.TestCase):
@@ -6671,8 +7971,8 @@ class TestNestedTransactions(unittest.TestCase):
             'A_before', 'X_before', ('action', 'X'),
             'action_after_nested', 'A_after', 'X_after'])
 
-    def test_wait_for_recursive_depth_five_is_navigable(self):
-        """Recursive wait_for calls expose parent links and Call depths."""
+    def test_wait_for_recursive_base_scopes_are_navigable(self):
+        """Recursive wait_for calls can be selected with (thread, base_tx)."""
         s = Scenario()
         rlock = s.RLock()
         condition = s.Condition(rlock)
@@ -6694,25 +7994,30 @@ class TestNestedTransactions(unittest.TestCase):
             s.skip(t, rlock.acquire)
 
             txs = []
+            scope = t
             for depth in range(5):
-                s.wait(Call(t, condition.wait_for, State.BLOCKED, depth=depth))
+                s.wait(Call(scope, condition.wait_for, State.BLOCKED))
                 tx = s.transaction(t)
                 self.assertEqual(tx.method, condition.wait_for)
                 self.assertEqual(tx.depth, depth)
-
-
-                for d in range(depth + 1):
-                    call = Call(t, condition.wait_for, depth=d)
-                    signaled = s.wait(call)
-                    self.assertIn(call, signaled)
 
                 if depth == 0:
                     self.assertIsNone(tx.parent)
                 else:
                     self.assertIs(tx.parent, txs[-1])
                     self.assertEqual(tx.parent.depth, depth - 1)
+                    scoped_call = Call((t, txs[-1]), condition.wait_for)
+                    self.assertIn(scoped_call, s.wait(scoped_call, timeout=0))
+
+                if depth >= 2:
+                    # The current wait_for is shadowed from the grandparent
+                    # scope by the same-method child immediately under it.
+                    shadowed = Call((t, txs[-2]), condition.wait_for, State.BLOCKED)
+                    self.assertFalse(s.wait(shadowed, timeout=0))
+
                 txs.append(tx)
                 tx.unblock()
+                scope = (t, tx)
 
             # The innermost predicate returns True; every parent then
             # unwinds and returns True too.  The original worker finally
@@ -6723,10 +8028,193 @@ class TestNestedTransactions(unittest.TestCase):
         self.assertEqual(len(predicate_calls), 5)
         self.assertTrue(all(tx.done for tx in txs))
 
+    def test_not_scoped_call_wakes_on_state_and_close(self):
+        """Not(Call((thread, base), ...)) wakes when the selected call goes low."""
+        s = Scenario()
+        rlock = s.RLock()
+        condition = s.Condition(rlock)
+
+        def predicate():
+            return condition.wait_for(lambda: True, timeout=-1)
+
+        def worker():
+            rlock.acquire()
+            condition.wait_for(predicate, timeout=-1)
+            rlock.release()
+
+        with s:
+            t = s.thread(worker)
+            s.skip(t, rlock.acquire)
+            s.wait(Call(t, condition.wait_for, State.BLOCKED))
+            outer = s.transaction(t)
+            outer.unblock()
+            s.wait(Call((t, outer), condition.wait_for, State.BLOCKED))
+            inner = s.transaction(t)
+
+            not_inner_blocked = Not(Call((t, outer), condition.wait_for, State.BLOCKED))
+            not_inner_active = Not(Call((t, outer), condition.wait_for))
+            results = []
+
+            def wait_for_signal(signal):
+                results.append(s.wait(signal, timeout=NEVER))
+
+            waiters = [
+                threading.Thread(target=wait_for_signal, args=(not_inner_blocked,)),
+                threading.Thread(target=wait_for_signal, args=(not_inner_active,)),
+            ]
+            for waiter in waiters:
+                waiter.start()
+
+            keys = [not_inner_blocked.normalized(), not_inner_active.normalized()]
+            deadline = time.perf_counter() + 1
+            while True:
+                with s._core.lock:
+                    parked = all(s._core.waiters.get(key) for key in keys)
+                if parked:
+                    break
+                if time.perf_counter() > deadline:
+                    self.fail("Not(Call(...)) waiter threads did not park")
+                time.sleep(0.001)
+
+            inner.unblock()
+
+            for waiter in waiters:
+                waiter.join(1)
+                self.assertFalse(waiter.is_alive())
+
+            self.assertIn({not_inner_blocked}, results)
+            self.assertIn({not_inner_active}, results)
+            s.wait(outer)
+            s.skip(t, rlock.release)
+
+
+    def test_not_use_wakes_when_thread_stops_using_primitive(self):
+        """Not(Use(thread, primitive)) wakes when the selected Use goes low."""
+        s = Scenario()
+        lock = s.Lock()
+
+        def worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(worker)
+            use = Use(t, lock)
+            s.wait(use)
+            not_use = Not(use)
+            self.assertFalse(s.wait(not_use, timeout=0))
+            results = []
+
+            def wait_for_signal():
+                results.append(s.wait(not_use, timeout=NEVER))
+
+            waiter = threading.Thread(target=wait_for_signal)
+            waiter.start()
+
+            key = not_use.normalized()
+            deadline = time.perf_counter() + 1
+            while True:
+                with s._core.lock:
+                    parked = bool(s._core.waiters.get(key))
+                if parked:
+                    break
+                if time.perf_counter() > deadline:
+                    self.fail("Not(Use(thread, primitive)) waiter did not park")
+                time.sleep(0.001)
+
+            s.skip(t, lock.acquire)
+
+            waiter.join(1)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(results, [{not_use}])
+
+    def test_scoped_use_signal_and_not_wakeup(self):
+        """Use((thread, base_tx), primitive) signals for descendants only.
+
+        The positive signal wakes when a child transaction under the
+        base starts using the primitive; the negated signal wakes when
+        that selected child transaction closes.
+        """
+        s = Scenario()
+        rlock = s.RLock()
+        condition = s.Condition(rlock)
+
+        def predicate():
+            return condition.wait_for(lambda: True, timeout=-1)
+
+        def worker():
+            rlock.acquire()
+            condition.wait_for(predicate, timeout=-1)
+            rlock.release()
+
+        with s:
+            t = s.thread(worker)
+            s.skip(t, rlock.acquire)
+            s.wait(Call(t, condition.wait_for, State.BLOCKED))
+            outer = s.transaction(t)
+
+            scoped_use = Use((t, outer), condition)
+            self.assertFalse(s.wait(scoped_use, timeout=0))
+
+            results = []
+
+            def wait_for_signal(signal):
+                results.append(s.wait(signal, timeout=NEVER))
+
+            waiter = threading.Thread(target=wait_for_signal, args=(scoped_use,))
+            waiter.start()
+
+            key = scoped_use.normalized()
+            deadline = time.perf_counter() + 1
+            while True:
+                with s._core.lock:
+                    parked = bool(s._core.waiters.get(key))
+                if parked:
+                    break
+                if time.perf_counter() > deadline:
+                    self.fail("Use((thread, base_tx), primitive) waiter did not park")
+                time.sleep(0.001)
+
+            outer.unblock()
+
+            waiter.join(1)
+            self.assertFalse(waiter.is_alive())
+            self.assertIn({scoped_use}, results)
+
+            inner = s.transaction(t)
+            self.assertIsNot(inner, outer)
+
+            not_scoped_use = Not(scoped_use)
+            results.clear()
+            waiter = threading.Thread(target=wait_for_signal, args=(not_scoped_use,))
+            waiter.start()
+
+            key = not_scoped_use.normalized()
+            deadline = time.perf_counter() + 1
+            while True:
+                with s._core.lock:
+                    parked = bool(s._core.waiters.get(key))
+                if parked:
+                    break
+                if time.perf_counter() > deadline:
+                    self.fail("Not(Use((thread, base_tx), primitive)) waiter did not park")
+                time.sleep(0.001)
+
+            inner.unblock()
+
+            waiter.join(1)
+            self.assertFalse(waiter.is_alive())
+            self.assertIn({not_scoped_use}, results)
+
+            s.wait(outer)
+            s.skip(t, rlock.release)
+
     def test_use_signal_refcounted_through_recursion(self):
-        """Use(thread, primitive) stays signaling through the entire
-        nested wait_for tree.  Verifies the per-(thread, primitive)
-        SignalMinder refcount handles recursion correctly."""
+        """Use(thread, primitive) stays high through recursive wait_for.
+
+        Use is self-reporting: it walks the active transaction chain, so
+        it remains high while either the outer or inner wait_for is using
+        the condition.
+        """
         s = Scenario()
         rlock = s.RLock()
         condition = s.Condition(rlock)
@@ -6746,21 +8234,21 @@ class TestNestedTransactions(unittest.TestCase):
             t = s.thread(worker)
             s.skip(t, rlock.acquire)
 
-            call0 = Call(t, condition.wait_for, State.BLOCKED, depth=0)
+            call0 = Call(t, condition.wait_for, State.BLOCKED)
             use = Use(t, condition)
             signaled = s.wait(call0, use)
             self.assertIn(use, signaled)
             outer_tx = s.transaction(t)
             outer_tx.unblock()
 
-            s.wait(Call(t, condition.wait_for, State.BLOCKED, depth=1))
-            # Both outer (depth=0) and inner (depth=1) hold the
-            # per-(thread, condition) SignalMinder refcount up.
+            s.wait(Call((t, outer_tx), condition.wait_for, State.BLOCKED))
+            # Both outer and inner wait_for txs are in the thread's
+            # transaction chain, so Use(t, condition) remains high.
             signaled = s.wait(use)
             self.assertIn(use, signaled)
 
-            # Drive both back to RETURNED.  Predicate at depth=1
-            # returns True, then unwinds; depth=0 returns True too.
+            # Drive both back to RETURNED.  The inner predicate returns
+            # True, then unwinds; the outer returns True too.
             s.transaction(t).unblock()
             s.wait(outer_tx)
 
@@ -6780,8 +8268,8 @@ class TestNestedTransactions(unittest.TestCase):
 
     def test_raw_form_signals_for_condition_family(self):
         """Inside a Lock-family member's tx, every family member
-        (lock, conditions, and their raws) signals as Primitive(form).
-        Raw and primitive forms normalize to the same key, so waiting
+        (lock, conditions, and their raws) signals as bare primitive forms.
+        Raw and cooked primitive forms normalize to the same key, so waiting
         on any spelling returns that spelling."""
         s = Scenario()
         lock = s.Lock()
@@ -6797,16 +8285,15 @@ class TestNestedTransactions(unittest.TestCase):
             t = s.thread(worker)
             signaled = s.wait(
                 cond.acquire,
-                Primitive(lock), Primitive(lock_raw),
-                Primitive(cond), Primitive(cond_raw),
+                lock, lock_raw, cond, cond_raw,
                 Use(t, lock), Use(t, lock_raw), Use(t, cond), Use(t, cond_raw),
                 )
             # All four primitive forms signal (raw normalizes to cooked,
             # so each spelling comes back).
-            self.assertIn(Primitive(lock), signaled)
-            self.assertIn(Primitive(lock_raw), signaled)
-            self.assertIn(Primitive(cond), signaled)
-            self.assertIn(Primitive(cond_raw), signaled)
+            self.assertIn(lock, signaled)
+            self.assertIn(lock_raw, signaled)
+            self.assertIn(cond, signaled)
+            self.assertIn(cond_raw, signaled)
 
             # All four Use forms also signal.
             self.assertIn(Use(t, lock), signaled)
@@ -6815,9 +8302,28 @@ class TestNestedTransactions(unittest.TestCase):
             self.assertIn(Use(t, cond_raw), signaled)
 
 
+    def test_bare_primitive_not_signal_and_no_public_wrapper(self):
+        """Primitive signals are internal; users wait on primitives directly."""
+        self.assertFalse(hasattr(blanket, 'Primitive'))
+        self.assertNotIn('Primitive', blanket.__all__)
+
+        s = Scenario()
+        lock = s.Lock()
+
+        def worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(worker)
+            self.assertIn(lock, s.wait(lock))
+            self.assertFalse(s.wait(Not(lock), timeout=0))
+            s.skip(t, lock.acquire)
+            self.assertIn(Not(lock), s.wait(Not(lock)))
+
+
     def test_raw_method_call_signals_alongside_primitive(self):
         """Call(t, raw_method, ...) signals whenever Call(t, primitive_method, ...)
-        does.  Each pair shares one SignalMinder keyed by both methods."""
+        does.  Raw and cooked method forms normalize to the same key."""
         s = Scenario()
         lock = s.Lock()
         raw = s.raws[lock]
@@ -7059,12 +8565,17 @@ class TestBarrierThinWrapperActive(unittest.TestCase):
 class TestCoverageLowHangingFruit(unittest.TestCase):
     """Additional regression tests for straightforward coverage branches."""
 
-    def test_call_depth_validation_errors(self):
-        thread = threading.current_thread()
-        with self.assertRaises(TypeError):
-            Call(thread, lambda: None, depth='1')
-        with self.assertRaises(ValueError):
-            Call(thread, lambda: None, depth=-1)
+    def test_call_thread_scope_validation_errors(self):
+        scenario = Scenario()
+        lock = scenario.Lock()
+        with self.assertRaisesRegex(TypeError, "thread or"):
+            Call(object(), lock.acquire)
+        with self.assertRaisesRegex(TypeError, "2-tuple"):
+            Call((threading.current_thread(), object(), object()), lock.acquire)
+        with self.assertRaisesRegex(TypeError, "first item"):
+            Call((object(), object()), lock.acquire)
+        with self.assertRaisesRegex(TypeError, "second item"):
+            Call((threading.current_thread(), object()), lock.acquire)
 
     def test_read_only_list_index_with_explicit_stop(self):
         scenario = Scenario()
@@ -7077,9 +8588,7 @@ class TestCoverageLowHangingFruit(unittest.TestCase):
         core = lock._core
         with core.lock:
             with self.assertRaises(TypeError):
-                core.thread_to_tx(object())
-            with self.assertRaises(TypeError):
-                core.threads_to_txs([object()])
+                core.threads_to_txs([object()], 'test_core_thread_to_tx_type_validation')
 
     def test_park_raises_when_waited_thread_never_reaches_method(self):
         scenario = Scenario()
@@ -7173,14 +8682,21 @@ class TestCoverageLowHangingFruit(unittest.TestCase):
 class TestCoverageLowHanging(unittest.TestCase):
     """Low/medium-hanging coverage for validation and branch edges."""
 
-    def test_call_depth_rejects_non_integer_and_negative(self):
+    def test_call_thread_scope_rejects_mismatched_base_thread(self):
         s = Scenario()
         lock = s.Lock()
-        t = threading.current_thread()
-        with self.assertRaises(TypeError):
-            Call(t, lock.acquire, depth='deep')
-        with self.assertRaises(ValueError):
-            Call(t, lock.acquire, depth=-1)
+
+        def worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            tx = s.transaction(t)
+            other = threading.Thread(target=lambda: None, name='other')
+            with self.assertRaisesRegex(ValueError, "belongs to thread"):
+                Call((other, tx), lock.acquire)
+            tx.unblock()
 
     def test_lock_private_method_base_and_no_active_tx_paths(self):
         s = Scenario()
@@ -7201,6 +8717,8 @@ class TestCoverageLowHanging(unittest.TestCase):
         rlock = s.RLock()
         lock._at_fork_reinit()
         rlock._at_fork_reinit()
+        self.assertFalse(lock.locked())
+        self.assertIn('RLock', repr(rlock))
 
     def test_api_unblock_pause_wait_false_and_unpause_wait_false(self):
         s = Scenario()
@@ -7915,7 +9433,12 @@ class TestInject(unittest.TestCase):
 
     def test_queue_handle_primitives_and_fallthrough(self):
         scenario = Scenario()
-        self.assertIs(scenario.queue.SimpleQueue, scenario.SimpleQueue)
+        self.assertIs(scenario.queue.Queue, scenario.Queue)
+        self.assertIs(scenario.queue.LifoQueue, scenario.LifoQueue)
+        self.assertIs(scenario.queue.PriorityQueue, scenario.PriorityQueue)
+        self.assertEqual(hasattr(scenario.queue, 'SimpleQueue'), hasattr(queue, 'SimpleQueue'))
+        if hasattr(queue, 'SimpleQueue'):
+            self.assertIs(scenario.queue.SimpleQueue, scenario.SimpleQueue)
         self.assertIs(scenario.queue.Empty, queue.Empty)
         self.assertIs(scenario.queue.Full, queue.Full)
 
@@ -7935,13 +9458,13 @@ class TestInject(unittest.TestCase):
     # ---- queue injection -----------------------------------------
 
     def test_pattern1_queue_from_import(self):
-        """from queue import SimpleQueue -> scenario.SimpleQueue."""
+        """from queue import Queue -> scenario.Queue."""
         scenario = Scenario()
-        target = self.make_module(SimpleQueue=queue.SimpleQueue)
+        target = self.make_module(Queue=queue.Queue)
         with scenario.inject(target):
-            self.assertIs(target.SimpleQueue, scenario.SimpleQueue)
-            self.assertIs(bound_to(type(target.SimpleQueue())), scenario)
-        self.assertIs(target.SimpleQueue, queue.SimpleQueue)
+            self.assertIs(target.Queue, scenario.Queue)
+            self.assertIs(bound_to(type(target.Queue())), scenario)
+        self.assertIs(target.Queue, queue.Queue)
 
     def test_pattern2_queue_module_attr_replaced_with_standin(self):
         """import queue -> the attribute becomes the queue impersonator."""
@@ -7949,7 +9472,7 @@ class TestInject(unittest.TestCase):
         target = self.make_module(queue=queue)
         with scenario.inject(target):
             self.assertIs(target.queue, scenario.queue)
-            self.assertIs(target.queue.SimpleQueue, scenario.SimpleQueue)
+            self.assertIs(target.queue.Queue, scenario.Queue)
             self.assertIs(target.queue.Empty, queue.Empty)  # fallthrough
         self.assertIs(target.queue, queue)
 
@@ -7958,17 +9481,17 @@ class TestInject(unittest.TestCase):
         scenario = Scenario()
         target = self.make_module(
             Lock=threading.Lock,
-            SimpleQueue=queue.SimpleQueue,
+            Queue=queue.Queue,
             threading=threading,
             queue=queue,
         )
         with scenario.inject(target):
             self.assertIs(target.Lock, scenario.Lock)
-            self.assertIs(target.SimpleQueue, scenario.SimpleQueue)
+            self.assertIs(target.Queue, scenario.Queue)
             self.assertIs(target.threading, scenario.threading)
             self.assertIs(target.queue, scenario.queue)
         self.assertIs(target.Lock, threading.Lock)
-        self.assertIs(target.SimpleQueue, queue.SimpleQueue)
+        self.assertIs(target.Queue, queue.Queue)
         self.assertIs(target.threading, threading)
         self.assertIs(target.queue, queue)
 
@@ -8036,6 +9559,7 @@ class TestDriverConstructor(unittest.TestCase):
             # d1 has yielded, so d2 may now drive the same thread.
             d2.skip()             # no CompetingDriversError
             d2()                  # skip release -- t terminates
+            self.assertTrue(d2.done)
 
     def test_driver_init_clears_pause_chain(self):
         """Driver initialization clears tx.pause on first use of the Driver."""
@@ -8115,6 +9639,7 @@ class TestDriverImperatives(unittest.TestCase):
             disp = s.Dispatch()
             disp.add(d)
             list(disp)
+            self.assertTrue(d.done)
 
     def test_pause(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -8179,8 +9704,8 @@ class TestDriverImperatives(unittest.TestCase):
             s.wait(w)
             d = s.Driver(w)
             d.stall()
-            # Drive d to park at STALLED, then let scenario.finish
-            # drive past the stall through to termination.
+            # Drive d to park at STALLED.  The test only needs the parked
+            # state; scenario exit cleanup releases the worker afterwards.
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
@@ -8296,72 +9821,63 @@ class TestDriverCascade(unittest.TestCase):
                 next(iter(disp))
             self.assertIs(d.state, d.raised)
 
-    @unittest.skip("cascade-match (1859) / simple-restore (1880) branches: the "
-                   "CC rebuild changed nested-tx driving so finish() no longer "
-                   "pushes cascade frames for immediate-success nested wait_fors, "
-                   "and skip(autoskip) exhausts past the match; needs a new "
-                   "deterministic scenario -- see notes")
     def test_cascade_pop_match_in_inner_loop(self):
-        """Multi-level nested where intermediate ancestors close
-        before the Driver processes the child's tx-end signal:
-        the cascade-pop branch walks the saved frames until it
-        finds the still-alive ancestor.
+        """The Driver cascade-pop path restores the surviving ancestor frame.
 
-        Deterministic via bytecode injection: outer's predicate
-        gets gate.wait() woven in by inject_call before its
-        `return result` line, so the worker blocks there with
-        outer still alive after middle has closed.  A matching
-        gate.set() is woven into the Driver's signal method at
-        the cascade-match return line -- so the moment the
-        scheduler observes "intermediates closed, deeper
-        ancestor alive" and takes the L1837-1839 branch, it
-        releases the worker, outer terminates, and drive
-        completes cleanly.  No sleeps, no polling."""
+        This is a targeted state-machine test for the branch where a
+        driven child terminates, the immediate parent has already
+        disappeared, but an older saved ancestor is still the current
+        transaction.  Earlier versions of this test tried to create
+        the timing with bytecode injection; directly exercising the
+        Driver state machine is deterministic and tests the behavior
+        this branch actually owns.
+        """
+
+        class FakeTx:
+            def __init__(self, name, parent=None):
+                self.name = name
+                self.parent = parent
+                self.state = State.COMMITTED
+            def __repr__(self):
+                return f"<FakeTx {self.name}>"
+
         s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        gate = threading.Event()
-
-        def middle_pred():
-            return condition.wait_for(lambda: True, timeout=-1)
-        def outer_pred():
-            result = condition.wait_for(middle_pred, timeout=-1)
-            return result
-        # Weave gate.wait() into outer_pred before "return result"
-        # so the worker blocks with outer still alive once middle
-        # has closed.
-        outer_pred = inject_call(
-            gate.wait,
-            Location.text(outer_pred, "return result"))
-
-        def waiter():
-            lock.acquire()
-            condition.wait_for(outer_pred, timeout=-1)
-            lock.release()
-
+        thread = threading.Thread(name="fake-driver-thread")
         with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            d = s.Driver(t)
+            d = s.Driver(thread)
+            c = d._core
 
-            # Weave gate.set() into the Driver's signal method at
-            # the cascade-match return line.  Anchor via the unique
-            # `if self.tx is tx:` cascade-match guard, then find
-            # the immediately-following `return self.to(state)` --
-            # robust to reordering of the other `return self.to(...)`
-            # branches in the signal handler.  Instance-level patch
-            # leaves the class signal method untouched.
-            signal_fn = type(d._core).signal
-            cascade_guard = Location.text(signal_fn, "if self.tx is tx:")
-            patched = inject_call(
-                gate.set,
-                Location.text(signal_fn, "return self.to(state)",
-                              after=cascade_guard))
-            d._core.signal = patched.__get__(d._core)
+            outer = FakeTx("outer")
+            self.assertEqual(repr(outer), "<FakeTx outer>")
+            middle = FakeTx("middle", outer)
+            child = FakeTx("child", middle)
+            outer_target = object()
+            outer_base = object()
 
-            d.finish(); d()
-            self.assertEqual(d.state, d.finished)
+            c.state = c.skipping
+            c.tx = child
+            c.stack = [
+                (outer, c.active, outer_target, outer_base),
+                (middle, c.skipping, object(), object()),
+            ]
+            c.thread_signal = {Predicate: object(), Nested: object()}
+            old_cache_tx = c.cache_tx
+
+            def cache_tx_to_outer():
+                c.tx = outer
+
+            try:
+                c.cache_tx = cache_tx_to_outer
+                c.signal({child})
+
+                self.assertIs(c.state, c.active)
+                self.assertIs(c.tx, outer)
+                self.assertIs(c.target, outer_target)
+                self.assertIs(c.base, outer_base)
+            finally:
+                c.cache_tx = old_cache_tx
+                d.close()
+
 
     def test_skipping_terminate_yields_to_active_when_worker_has_next_tx(self):
         """When the Driver is skipping and the driven tx terminates,
@@ -8472,69 +9988,54 @@ class TestDriverCascade(unittest.TestCase):
             # handler).
             self.assertIs(d.state, d.terminated)
 
-    @unittest.skip("cascade-match (1859) / simple-restore (1880) branches: the "
-                   "CC rebuild changed nested-tx driving so finish() no longer "
-                   "pushes cascade frames for immediate-success nested wait_fors, "
-                   "and skip(autoskip) exhausts past the match; needs a new "
-                   "deterministic scenario -- see notes")
     def test_simple_pop_restore_when_parent_still_alive(self):
-        """Normal nested pop-and-restore: child terminates while
-        its parent is still in flight; the signal handler pops
-        the saved frame, cache_tx surfaces the parent (matching
-        the popped tx), and the no-cascade fall-through restores
-        the parent's pursue context.
+        """The Driver simple-pop path restores the immediate parent frame.
 
-        Deterministic via bytecode injection: outer's predicate
-        gets gate.wait() woven in before its `return result`
-        line; the inner wait_for terminates, then the worker
-        blocks with outer still alive.  A matching gate.set() is
-        woven into the Driver's signal method at the
-        simple-restore return line (the second `return
-        self.to(state)` occurrence -- the no-cascade L1845-1847
-        path).  When the scheduler reads cache_tx and finds the
-        parent still alive, it takes that branch, the injected
-        gate.set() releases the worker, and outer terminates."""
+        This covers the non-cascade branch where the driven child
+        terminates and cache_tx reports that the saved parent is still
+        the current transaction.
+        """
+
+        class FakeTx:
+            def __init__(self, name, parent=None):
+                self.name = name
+                self.parent = parent
+                self.state = State.COMMITTED
+            def __repr__(self):
+                return f"<FakeTx {self.name}>"
+
         s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        gate = threading.Event()
-
-        def outer_pred():
-            result = condition.wait_for(lambda: True, timeout=-1)
-            return result
-        outer_pred = inject_call(
-            gate.wait,
-            Location.text(outer_pred, "return result"))
-
-        def waiter():
-            lock.acquire()
-            condition.wait_for(outer_pred, timeout=-1)
-            lock.release()
-
+        thread = threading.Thread(name="fake-driver-thread")
         with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            d = s.Driver(t)
+            d = s.Driver(thread)
+            c = d._core
 
-            # Weave gate.set() into the Driver's signal method at
-            # the simple-restore return line.  Anchor via the
-            # unique `if self.tx is tx:` cascade-match guard, find
-            # the cascade-match return after it, then find the next
-            # `return self.to(state)` after that -- which is the
-            # no-cascade fall-through (the simple-restore path).
-            signal_fn = type(d._core).signal
-            cascade_guard = Location.text(signal_fn, "if self.tx is tx:")
-            cascade_return = Location.text(signal_fn, "return self.to(state)",
-                                           after=cascade_guard)
-            patched = inject_call(
-                gate.set,
-                Location.text(signal_fn, "return self.to(state)",
-                              after=cascade_return))
-            d._core.signal = patched.__get__(d._core)
+            parent = FakeTx("parent")
+            self.assertEqual(repr(parent), "<FakeTx parent>")
+            child = FakeTx("child", parent)
+            parent_target = object()
+            parent_base = object()
 
-            d.finish(); d()
-            self.assertEqual(d.state, d.finished)
+            c.state = c.skipping
+            c.tx = child
+            c.stack = [(parent, c.active, parent_target, parent_base)]
+            c.thread_signal = {Predicate: object(), Nested: object()}
+            old_cache_tx = c.cache_tx
+
+            def cache_tx_to_parent():
+                c.tx = parent
+
+            try:
+                c.cache_tx = cache_tx_to_parent
+                c.signal({child})
+
+                self.assertIs(c.state, c.active)
+                self.assertIs(c.tx, parent)
+                self.assertIs(c.target, parent_target)
+                self.assertIs(c.base, parent_base)
+            finally:
+                c.cache_tx = old_cache_tx
+                d.close()
 
 
 class TestDispatch(unittest.TestCase):
@@ -8629,6 +10130,24 @@ class TestDriverAPI(unittest.TestCase):
             self.assertIs(d.thread, t)
             d.close()
 
+    def test_base_tx_attribute(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            tx = s.transaction(t)
+
+            d = s.Driver(t)
+            self.assertIsNone(d.base_tx)
+            d.close()
+
+            d = s.Driver(t, tx)
+            self.assertIs(d.base_tx, tx)
+            d.close()
+
+            s.skip(t, lock.acquire)
+            s.raw(lock).release()
+
     def test_txs_history(self):
         s, lock, worker = _make_scenario_with_lock_worker()
         with s:
@@ -8644,9 +10163,12 @@ class TestDriverAPI(unittest.TestCase):
     def test_state_constants_at_class_level(self):
         self.assertEqual(Scenario.Driver.idle.name, 'IDLE')
         self.assertEqual(Scenario.Driver.active.name, 'ACTIVE')
+        self.assertEqual(Scenario.Driver.reentered.name, 'REENTERED')
         self.assertIn(Scenario.Driver.parked, Scenario.Driver.terminal_states)
         self.assertIn(Scenario.Driver.skipping, Scenario.Driver.driving_states)
         self.assertIn(Scenario.Driver.active, Scenario.Driver.active_states)
+        self.assertIn(Scenario.Driver.reentered, Scenario.Driver.active_states)
+        self.assertNotIn(Scenario.Driver.reentered, Scenario.Driver.terminal_states)
 
 
 
@@ -8987,6 +10509,9 @@ class TestCloseMethods(unittest.TestCase):
             d = s.Driver(t)
             d.close()
             d.close()  # no raise
+            d2 = s.Driver(t)
+            self.assertIs(d2.thread, t)
+            d2.close()
 
     def test_driver_close_after_auto_close_is_noop(self):
         """A driver that auto-closed on reaching terminal can still
@@ -9066,6 +10591,7 @@ class TestCloseMethods(unittest.TestCase):
             chain = s.Chain()
             chain.close()
             chain.close()  # no raise
+            self.assertFalse(chain)
 
     def test_dispatch_close_closes_drivers(self):
         """Dispatch.close closes every owned Driver and empties
@@ -9128,6 +10654,7 @@ class TestCloseMethods(unittest.TestCase):
             disp = s.Dispatch()
             disp.close()
             disp.close()  # no raise
+            self.assertIn('Scenario.Dispatch', repr(disp))
 
     def test_dispatch_close_with_driver_in_recent(self):
         """A driver added but never drained sits in dispatch.recent;
@@ -9242,8 +10769,8 @@ class TestCoverageMinor(unittest.TestCase):
         """WaitTransaction.__repr__ produces a readable string."""
         s = Scenario()
         ev = s.Event()
-        # WaitTransaction(score, items): every item is Signaling.
-        item = Primitive(ev)
+        # WaitTransaction(score, items): bare primitives are auto-boxed.
+        item = ev
         wtx = s._core.WaitTransaction(frozenset([item]))
         r = repr(wtx)
         self.assertIn('WaitTransaction', r)
@@ -9282,7 +10809,7 @@ class TestCoverageMinor(unittest.TestCase):
         core = s.api(lock)._core
         with s:
             with self.assertRaisesRegex(TypeError, "iterable of threads"):
-                core.threads_to_txs(42)
+                core.threads_to_txs(42, 'test_threads_to_txs_non_iterable')
 
     def test_threads_to_txs_empty(self):
         """primitive core threads_to_txs returns empty for empty iterable."""
@@ -9290,7 +10817,7 @@ class TestCoverageMinor(unittest.TestCase):
         lock = s.Lock()
         core = s.api(lock)._core
         with s:
-            threads, txs = core.threads_to_txs(())
+            threads, txs = core.threads_to_txs((), 'test_threads_to_txs_empty')
             self.assertEqual(threads, ())
             self.assertEqual(txs, [])
 
@@ -9301,7 +10828,7 @@ class TestCoverageMinor(unittest.TestCase):
         core = s.api(lock)._core
         with s:
             with self.assertRaisesRegex(ValueError, "calling thread"):
-                core.threads_to_txs((threading.current_thread(),))
+                core.threads_to_txs((threading.current_thread(),), 'threads_to_txs_self_thread_raises')
 
     def test_stacked_imperatives_raise(self):
         """An imperative call raises if a previous imperative is
@@ -9388,8 +10915,8 @@ class TestCoverageMinor(unittest.TestCase):
             # the waiter runs _acquire_restore and finishes cond.wait.
         self.assertEqual(ran, ['woke'])
 
-    def test_scenario_finish_handles_mid_tx_worker(self):
-        """scenario.finish handles a worker that has advanced past
+    def test_scenario_exit_handles_mid_tx_worker(self):
+        """scenario exit handles a worker that has advanced past
         BLOCKED on its current tx."""
         s = Scenario()
         ev = s.Event()
@@ -9411,8 +10938,8 @@ class TestCoverageMinor(unittest.TestCase):
             d()
             self.assertIs(d.tx.state, State.WAITING)
             d.close()  # release the slot
-            # Release the setter so it fires the event, then finish
-            # both threads.
+            # Release the setter so it fires the event; scenario exit
+            # then joins both managed threads.
             gate.set()
 
     def test_tx_failed_succeeded_is_none_before_done(self):
@@ -9525,6 +11052,7 @@ class TestRawPrimitives(unittest.TestCase):
         raw = s.raw(rlock)
         raw.acquire()
         raw.release()
+        self.assertIn('RLock.raw', repr(raw))
 
     def test_condition_raw(self):
         s = Scenario()
@@ -9685,6 +11213,7 @@ class TestDispatchChainCoverage(unittest.TestCase):
             d = s.Driver(t)
             d.skip()
             d()  # advance synchronously
+            self.assertTrue(d.done)
             d.close()
 
 
@@ -9859,7 +11388,7 @@ class TestTimeoutTrioAndFailureDetection(unittest.TestCase):
         def bad_releaser():
             try:
                 lock.release()
-            except RuntimeError:
+            except RuntimeError:  # coverage: thread-defensive cleanup
                 pass
         def acquirer():
             lock.acquire()
@@ -9876,8 +11405,9 @@ class TestTimeoutTrioAndFailureDetection(unittest.TestCase):
 
 
 class TestAction(unittest.TestCase):
-    """Push/pop, Action signal, cycle validation, and Driver.nested
-    state coverage.  Push/pop is an internal mechanism (barrier
+    """Push/pop, Action signal, and cycle-validation coverage.
+
+    Push/pop is an internal mechanism (barrier
     workers use it around their action callback); most tests reach
     in through tx._core to exercise it directly, since public API
     only exposes it indirectly via Barrier.cycle(scheduler=...)."""
@@ -9900,7 +11430,7 @@ class TestAction(unittest.TestCase):
             self.assertTrue(repr(a).startswith("Action("))
 
     def test_action_signal_low_before_push(self):
-        """Action(tx).signal returns False when tx isn't pushed."""
+        """Action(tx).sample returns False when tx isn't pushed."""
         s = Scenario()
         lock = s.Lock()
         with s:
@@ -9962,6 +11492,61 @@ class TestAction(unittest.TestCase):
 
         self.assertTrue(observed['during_action'])
 
+    def test_not_action_wakes_when_barrier_action_exits(self):
+        s = Scenario()
+        lock = s.Lock()
+        results = []
+
+        def action(tx):
+            lock.locked()
+
+        barrier = s.Barrier(2, action=action)
+        bapi = s.api(barrier)
+
+        def worker():
+            barrier.wait()
+
+        with s:
+            a = s.thread(worker)
+            x = s.thread(worker)
+            s.wait(a)
+            s.wait(x)
+            opener = s.transaction(x)
+
+            def drive_child(tx):
+                s.wait(Action(tx))
+                signal = Not(Action(tx))
+                self.assertFalse(s.wait(signal, timeout=0))
+
+                def wait_for_signal():
+                    results.append(s.wait(signal, timeout=NEVER))
+
+                parked = threading.Thread(target=wait_for_signal)
+                parked.start()
+                deadline = time.perf_counter() + 1
+                while True:
+                    with s._core.lock:
+                        is_parked = bool(s._core.waiters.get(signal.normalized()))
+                    if is_parked:
+                        break
+                    if time.perf_counter() > deadline:
+                        self.fail("Not(Action(tx)) waiter did not park")
+                    time.sleep(0.001)
+
+                child = s.transaction(x)
+                child.unblock()
+                s.wait(child)
+                observed_waiter[0] = parked
+
+            observed_waiter = [None]
+            cycle = bapi.cycle(a, x, scheduler=drive_child)
+            cycle.close()
+
+            parked = observed_waiter[0]
+            parked.join(1)
+            self.assertFalse(parked.is_alive())
+            self.assertEqual(results, [{Not(Action(opener))}])
+
     def test_cycle_scheduler_requires_action(self):
         """Barrier.cycle(scheduler=...) on a Barrier with no action
         raises ValueError: a scheduler without an action would never
@@ -9980,7 +11565,7 @@ class TestAction(unittest.TestCase):
             s.wait(x)
 
             def scheduler(tx):
-                pass  # never invoked
+                pass  # coverage: intentionally never invoked
 
             with self.assertRaisesRegex(ValueError,
                     "scheduler= requires the Barrier to have an action"):
@@ -10007,7 +11592,7 @@ class TestAction(unittest.TestCase):
             s.wait(a)
             s.wait(x)
             cycle = bapi.cycle(a, x)  # no scheduler= argument
-            cycle.close()
+            self.assertEqual(cycle.close(), (a, x))
 
     def test_barrier_action_no_child_round_trip(self):
         """When the action creates no regulated children, push and
@@ -10069,9 +11654,12 @@ class TestAction(unittest.TestCase):
 
 
 class TestDriverNested(unittest.TestCase):
-    """Driver.nested() imperative and the NESTING state.  Driver.nested()
-    is composable with the six pursue-based imperatives (skip, block,
-    commit, wait, stall, finish, pause) and also works standalone."""
+    """Driver handling for nested transactions and the NESTING state.
+
+    Driver imperatives now surface nested transactions by default; the
+    caller may drive the child explicitly, or request autoskip=True for
+    the old automatic child-draining behavior.
+    """
 
     def test_driver_nesting_state_constant_exposed(self):
         """The user-facing Driver class exposes the NESTING state
@@ -10080,6 +11668,14 @@ class TestDriverNested(unittest.TestCase):
         self.assertEqual(s.Driver.nesting.name, 'NESTING')
         self.assertIn(s.Driver.nesting, s.Driver.active_states)
         self.assertNotIn(s.Driver.nesting, s.Driver.terminal_states)
+
+    def test_driver_reentered_state_constant_exposed(self):
+        """The user-facing Driver class exposes the REENTERED state
+        constant (s.Driver.reentered)."""
+        s = Scenario()
+        self.assertEqual(s.Driver.reentered.name, 'REENTERED')
+        self.assertIn(s.Driver.reentered, s.Driver.active_states)
+        self.assertNotIn(s.Driver.reentered, s.Driver.terminal_states)
 
     def test_driver_nested_yields_in_nesting_state_when_child_appears(self):
         """When nested-armed and a child fires Nested, the Driver
@@ -10191,7 +11787,7 @@ class TestDriverNested(unittest.TestCase):
             for dd in dispatch:
                 if dd.done:
                     break
-                if dd.state is dd.active:
+                if dd.state is dd.active:  # coverage: cleanup branch
                     dd.finish(autoskip=True)
                 dispatch.add(dd)
 
@@ -10421,7 +12017,7 @@ class TestDriverNested(unittest.TestCase):
         self.assertEqual(seen, [False])
 
     def test_skip_with_base_tx_strict(self):
-        """s.skip(t, base, m1, m2) is strict on base's children: base's
+        """s.skip((t, base), m1, m2) is strict on base's children: base's
         next child must be m1 (driven to terminal), then the next must
         be m2.  Here base is a wait_for whose predicate calls
         lockB.acquire() then lockB.release(); naming both drives both to
@@ -10451,7 +12047,7 @@ class TestDriverNested(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.skip(t, base, lockB.acquire, lockB.release)
+            r = s.skip((t, base), lockB.acquire, lockB.release)
             self.assertEqual(r[t].method, lockB.release)
             self.assertTrue(r[t].done)
 
@@ -10482,7 +12078,7 @@ class TestDriverNested(unittest.TestCase):
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
             with self.assertRaisesRegex(RuntimeError, "expected"):
-                s.skip(t, base, lockB.release)
+                s.skip((t, base), lockB.release)
 
 
     def test_skip_with_base_tx_impasse_when_base_blanket_parked(self):
@@ -10505,11 +12101,11 @@ class TestDriverNested(unittest.TestCase):
             base = s.transaction(t)        # wait_for, BLOCKED (blanket-parked)
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.skip(t, base, lockC.acquire)
+                s.skip((t, base), lockC.acquire)
 
 
     def test_park_with_base_tx_parks_nested_method(self):
-        """s.park(t, base, method) skips over base's children until one
+        """s.park((t, base), method) skips over base's children until one
         matches `method`, then leaves that child parked at BLOCKED.
         This is how you park in a child tx (skip is strict and can't
         step past the intervening lockB.acquire)."""
@@ -10534,7 +12130,7 @@ class TestDriverNested(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.park(t, base, lockB.release)
+            r = s.park((t, base), lockB.release)
             self.assertEqual(r[t].method, lockB.release)
             self.assertEqual(r[t].state, State.BLOCKED)
 
@@ -10563,7 +12159,7 @@ class TestDriverNested(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.park(t, base, lockB.acquire)
+            r = s.park((t, base), lockB.acquire)
             self.assertEqual(r[t].method, lockB.acquire)
             self.assertEqual(r[t].state, State.BLOCKED)
             self.assertEqual(order, [])   # body not run while parked
@@ -10598,7 +12194,7 @@ class TestDriverNested(unittest.TestCase):
 
             with self.assertRaisesRegex(
                     RuntimeError, "base tx ended before reaching"):
-                s.park(t, base, lockZ.acquire)
+                s.park((t, base), lockZ.acquire)
 
     def test_park_with_base_tx_impasse_when_base_blanket_parked(self):
         """If base is blanket-parked (BLOCKED) when park starts, it can
@@ -10620,7 +12216,7 @@ class TestDriverNested(unittest.TestCase):
             base = s.transaction(t)   # wait_for, BLOCKED (blanket-parked)
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.park(t, base, lockC.acquire)
+                s.park((t, base), lockC.acquire)
 
     def test_park_with_base_tx_rejects_multiple_methods(self):
         """park takes exactly one method per thread, base or not."""
@@ -10644,9 +12240,9 @@ class TestDriverNested(unittest.TestCase):
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
             with self.assertRaisesRegex(ValueError, "exactly one method"):
-                s.park(t, base, lockB.acquire, lockB.release)
+                s.park((t, base), lockB.acquire, lockB.release)
             # leave t parked at a real child so __exit__ can drain it.
-            s.park(t, base, lockB.release)
+            s.park((t, base), lockB.release)
 
 
 
@@ -10740,7 +12336,7 @@ class TestPause(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.pause(t, base, lockB.acquire)
+            r = s.pause((t, base), lockB.acquire)
             self.assertEqual(r[t].method, lockB.acquire)
             self.assertEqual(r[t].state, State.PAUSED)
             r[t].pause = False
@@ -10770,7 +12366,7 @@ class TestPause(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.pause(t, base, lockB.acquire)
+            r = s.pause((t, base), lockB.acquire)
             self.assertEqual(r[t].state, State.PAUSED)
             self.assertEqual(order, [])
             r[t].pause = False
@@ -10801,9 +12397,9 @@ class TestPause(unittest.TestCase):
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
             with self.assertRaisesRegex(RuntimeError, "next child was"):
-                s.pause(t, base, lockB.release)
+                s.pause((t, base), lockB.release)
             # leave t parked so __exit__ can drain it.
-            s.park(t, base, lockB.release)
+            s.park((t, base), lockB.release)
 
     def test_pause_with_base_tx_impasse_when_base_blanket_parked(self):
         """base blanket-parked at BLOCKED -> nested method unreachable ->
@@ -10824,7 +12420,7 @@ class TestPause(unittest.TestCase):
             base = s.transaction(t)
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.pause(t, base, lockC.acquire)
+                s.pause((t, base), lockC.acquire)
 
     def test_pause_with_base_tx_rejects_multiple_methods(self):
         """pause takes exactly one method per thread, base or not."""
@@ -10848,8 +12444,8 @@ class TestPause(unittest.TestCase):
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
             with self.assertRaisesRegex(ValueError, "exactly one method"):
-                s.pause(t, base, lockB.acquire, lockB.release)
-            s.park(t, base, lockB.release)
+                s.pause((t, base), lockB.acquire, lockB.release)
+            s.park((t, base), lockB.release)
 
 
 class TestBlock(unittest.TestCase):
@@ -10955,7 +12551,7 @@ class TestBlock(unittest.TestCase):
             base.unblock()
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
-            r = s.block(t, base, lockB.acquire)
+            r = s.block((t, base), lockB.acquire)
             self.assertEqual(r[t].method, lockB.acquire)
             self.assertEqual(r[t].state, State.BLOCKED)
             self.assertEqual(order, [])
@@ -10985,8 +12581,8 @@ class TestBlock(unittest.TestCase):
             s.wait(Call(t, lockB.acquire, State.BLOCKED))
 
             with self.assertRaisesRegex(RuntimeError, "next child was"):
-                s.block(t, base, lockB.release)
-            s.park(t, base, lockB.release)
+                s.block((t, base), lockB.release)
+            s.park((t, base), lockB.release)
 
     def test_block_with_base_tx_impasse_when_base_blanket_parked(self):
         """base blanket-parked at BLOCKED -> nested method unreachable ->
@@ -11007,7 +12603,7 @@ class TestBlock(unittest.TestCase):
             base = s.transaction(t)
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.block(t, base, lockC.acquire)
+                s.block((t, base), lockC.acquire)
 
 
 class TestAssignBaseTx(unittest.TestCase):
@@ -11043,7 +12639,7 @@ class TestAssignBaseTx(unittest.TestCase):
             baseA.unblock()
             s.wait(Call(A, L.acquire, State.BLOCKED))
 
-            r = s.api(L).assign(R, A, baseA)
+            r = s.api(L).assign(R, (A, baseA))
             self.assertEqual(list(r), [A])
             self.assertEqual(order, ['R-acq', 'R-rel', 'A-acq'])
             s.skip(A, lockA.release, L.release)
@@ -11075,7 +12671,7 @@ class TestAssignBaseTx(unittest.TestCase):
             baseR.unblock()
             s.wait(Call(R, L.release, State.BLOCKED))
 
-            r = s.api(L).assign(R, baseR, A)
+            r = s.api(L).assign((R, baseR), A)
             self.assertEqual(order, ['R-rel', 'A-acq'])
             s.skip(R, lockR.release)
             s.skip(A, L.release)
@@ -11112,7 +12708,7 @@ class TestAssignBaseTx(unittest.TestCase):
             baseA = s.transaction(A); baseA.unblock()
             s.wait(Call(A, L.acquire, State.BLOCKED))
 
-            r = s.api(L).assign(R, baseR, A, baseA)
+            r = s.api(L).assign((R, baseR), (A, baseA))
             self.assertEqual(order, ['R-rel', 'A-acq'])
             s.skip(R, lockR.release)
             s.skip(A, lockA.release, L.release)
@@ -11138,7 +12734,7 @@ class TestAssignBaseTx(unittest.TestCase):
             baseA = s.transaction(A); baseA.unblock()
             s.wait(Call(A, L.acquire, State.BLOCKED))
 
-            r = s.api(L).assign(A, baseA)
+            r = s.api(L).assign((A, baseA))
             self.assertEqual(list(r), [A])
             self.assertEqual(order, ['A-acq'])
             s.skip(A, lockA.release, L.release)
@@ -11164,7 +12760,7 @@ class TestAssignBaseTx(unittest.TestCase):
             baseA = s.transaction(A)      # wait_for, blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.api(L).assign(R, A, baseA)
+                s.api(L).assign(R, (A, baseA))
 
     def test_assign_too_many_threads(self):
         """assign accepts at most a releaser and an acquirer."""
@@ -11267,7 +12863,7 @@ class TestRelayBaseTx(unittest.TestCase):
             baseA = s.transaction(A); baseA.unblock()
             s.wait(Call(A, L.acquire, State.BLOCKED))
 
-            got = list(s.api(L).relay(I, A, baseA))
+            got = list(s.api(L).relay(I, (A, baseA)))
             self.assertEqual(got, [A])
             self.assertEqual(order, ['I-acq', 'I-rel', 'A-acq'])
             s.skip(A, lockA.release, L.release)
@@ -11298,7 +12894,7 @@ class TestRelayBaseTx(unittest.TestCase):
             s.wait(Call(I, L.release, State.BLOCKED))
             s.block(A, L.acquire)
 
-            got = list(s.api(L).relay(I, baseI, A))
+            got = list(s.api(L).relay((I, baseI), A))
             self.assertEqual(got, [A])
             self.assertEqual(order, ['I-rel', 'A-acq'])
             s.skip(I, lockI.release)
@@ -11341,7 +12937,7 @@ class TestRelayBaseTx(unittest.TestCase):
             baseB = s.transaction(B); baseB.unblock()
             s.wait(Call(B, L.acquire, State.BLOCKED))
 
-            got = list(s.api(L).relay(I, baseI, M, B, baseB))
+            got = list(s.api(L).relay((I, baseI), M, (B, baseB)))
             self.assertEqual(got, [M, B])
             self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'B-acq'])
             s.skip(B, lockB.release, L.release)
@@ -11369,7 +12965,7 @@ class TestRelayBaseTx(unittest.TestCase):
             baseB = s.transaction(B)      # blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                list(s.api(L).relay(I, B, baseB))
+                list(s.api(L).relay(I, (B, baseB)))
 
     def test_relay_base_tx_on_middle_thread(self):
         """A 3-hop relay where the MIDDLE thread runs its acquire AND
@@ -11404,7 +13000,7 @@ class TestRelayBaseTx(unittest.TestCase):
             s.wait(Call(M, L.acquire, State.BLOCKED))
             s.block(C, L.acquire)
 
-            got = list(s.api(L).relay(I, M, baseM, C))
+            got = list(s.api(L).relay(I, (M, baseM), C))
             self.assertEqual(got, [M, C])
             self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
             s.skip(M, lockM.release)
@@ -11456,7 +13052,7 @@ class TestRelayBaseTx(unittest.TestCase):
             baseC = s.transaction(C); baseC.unblock()
             s.wait(Call(C, L.acquire, State.BLOCKED))
 
-            got = list(s.api(L).relay(I, baseI, M, baseM, C, baseC))
+            got = list(s.api(L).relay((I, baseI), (M, baseM), (C, baseC)))
             self.assertEqual(got, [M, C])
             self.assertEqual(order, ['I-rel', 'M-acq', 'M-rel', 'C-acq'])
             s.skip(I, lockI.release)
@@ -11491,7 +13087,7 @@ class TestAllocateBaseTx(unittest.TestCase):
             baseA = s.transaction(A); baseA.unblock()
             s.wait(Call(A, sem.acquire, State.BLOCKED))
 
-            got = list(s.api(sem).allocate(A, baseA))
+            got = list(s.api(sem).allocate((A, baseA)))
             self.assertEqual(got, [A])
             self.assertEqual(order, ['acq'])
             s.skip(A, lockA.release, sem.release)
@@ -11530,7 +13126,7 @@ class TestAllocateBaseTx(unittest.TestCase):
             baseB = s.transaction(B); baseB.unblock()
             s.wait(Call(B, sem.acquire, State.BLOCKED))
 
-            got = list(s.api(sem).allocate(R, baseR, A, B, baseB))
+            got = list(s.api(sem).allocate((R, baseR), A, (B, baseB)))
             self.assertEqual(got, [A, B])
             self.assertEqual(order, ['R-rel', 'A-acq', 'B-acq'])
             s.skip(B, lockB.release, sem.release)
@@ -11553,20 +13149,22 @@ class TestAllocateBaseTx(unittest.TestCase):
             baseA = s.transaction(A)      # blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                list(s.api(sem).allocate(A, baseA))
+                list(s.api(sem).allocate((A, baseA)))
 
-    def test_allocate_rejects_duplicate_thread(self):
-        """allocate naming the same thread twice raises ValueError
-        deterministically (seen-set guard, before any drive)."""
+    def test_allocate_allows_duplicate_thread_specs(self):
+        """A later occurrence of the same thread starts after the
+        earlier occurrence finishes its semaphore transaction."""
         s = Scenario()
-        sem = s.Semaphore(2)
+        sem = s.Semaphore(1)
+        order = []
         def w():
-            sem.acquire(); sem.release()
+            sem.acquire(); order.append('acquire')
+            sem.release(); order.append('release')
         with s:
             a = s.thread(w)
-            with self.assertRaisesRegex(ValueError, "specified more than once"):
-                list(s.api(sem).allocate(a, a))
-            s.skip(a, sem.acquire, sem.release)
+            self.assertEqual(list(s.api(sem).allocate(a, a)), [a])
+
+        self.assertEqual(order, ['acquire', 'release'])
 
 
 class TestEventCycleBaseTx(unittest.TestCase):
@@ -11597,7 +13195,7 @@ class TestEventCycleBaseTx(unittest.TestCase):
             baseW = s.transaction(W); baseW.unblock()
             s.wait(Call(W, ev.wait, State.BLOCKED))
 
-            c = s.api(ev).cycle(W, baseW, S)
+            c = s.api(ev).cycle((W, baseW), S)
             self.assertEqual(set(c.ready), {W, S})
             c.wake(W)
             c.close()
@@ -11627,7 +13225,7 @@ class TestEventCycleBaseTx(unittest.TestCase):
             baseS = s.transaction(S); baseS.unblock()
             s.wait(Call(S, ev.set, State.BLOCKED))
 
-            c = s.api(ev).cycle(W, S, baseS)
+            c = s.api(ev).cycle(W, (S, baseS))
             c.wake(W)
             c.close()
             self.assertEqual(order, ['W-wait', 'S-set'])
@@ -11654,7 +13252,7 @@ class TestEventCycleBaseTx(unittest.TestCase):
             baseW = s.transaction(W)      # blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.api(ev).cycle(W, baseW, S)
+                s.api(ev).cycle((W, baseW), S)
 
 
 class TestBarrierCycleBaseTx(unittest.TestCase):
@@ -11683,7 +13281,7 @@ class TestBarrierCycleBaseTx(unittest.TestCase):
             baseW = s.transaction(W1); baseW.unblock()
             s.wait(Call(W1, br.wait, State.BLOCKED))
 
-            c = s.api(br).cycle(W1, baseW, W2)
+            c = s.api(br).cycle((W1, baseW), W2)
             self.assertEqual(set(c.ready), {W1, W2})
             c.wake(W1)
             c.close()
@@ -11715,7 +13313,7 @@ class TestBarrierCycleBaseTx(unittest.TestCase):
             baseW = s.transaction(W1)      # blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.api(br).cycle(W1, baseW, W2)
+                s.api(br).cycle((W1, baseW), W2)
 
 
 class TestConditionCycleBaseTx(unittest.TestCase):
@@ -11767,7 +13365,7 @@ class TestConditionCycleBaseTx(unittest.TestCase):
             a = s.thread(waiter); x = s.thread(notifier)
             baseA = self.into_base(s, a, lockA, lock)
             # cycle drives a from UL.acquire through wait, then x notifies
-            c = s.api(condition).cycle(a, baseA, x)
+            c = s.api(condition).cycle((a, baseA), x)
             self.assertEqual(list(c.ready), [a])
             self.assertEqual(c.wake(a), (a,))
             c.close()
@@ -11799,7 +13397,7 @@ class TestConditionCycleBaseTx(unittest.TestCase):
             a = s.thread(waiter); x = s.thread(notifier)
             self.park_waiter(s, condition, lock, a)
             baseX = self.into_base(s, x, lockX, lock)
-            c = s.api(condition).cycle(a, x, baseX)
+            c = s.api(condition).cycle(a, (x, baseX))
             self.assertEqual(list(c.ready), [a])
             self.assertEqual(log, ['X-notify'])
             self.assertEqual(c.wake(a), (a,))
@@ -11837,7 +13435,7 @@ class TestConditionCycleBaseTx(unittest.TestCase):
             a = s.thread(waiter); x = s.thread(notifier)
             baseA = self.into_base(s, a, lockA, lock)
             baseX = self.into_base(s, x, lockX, lock)
-            c = s.api(condition).cycle(a, baseA, x, baseX)
+            c = s.api(condition).cycle((a, baseA), (x, baseX))
             self.assertEqual(list(c.ready), [a])
             self.assertEqual(log, ['X-notify'])
             self.assertEqual(c.wake(a), (a,))
@@ -11870,7 +13468,7 @@ class TestConditionCycleBaseTx(unittest.TestCase):
             baseX = s.transaction(x)      # blanket-parked
 
             with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                s.api(condition).cycle(a, x, baseX)
+                s.api(condition).cycle(a, (x, baseX))
 
             # Manual drain: free the stranded waiter deterministically.
             baseX.unblock()
@@ -11935,7 +13533,7 @@ class TestConditionCycleWaitingEntry(unittest.TestCase):
             s.wait(Call(a, lock.acquire, State.BLOCKED)); s.skip(a, lock.acquire)
             s.wait(Call(a, condition.wait, State.BLOCKED))
             wtx = s.transaction(a); wtx.unblock(); s.wait(Waiting(wtx))
-            c = s.api(condition).cycle(a, baseA, x)
+            c = s.api(condition).cycle((a, baseA), x)
             self.assertEqual(c.wake(a), (a,))
             c.close()
         self.assertEqual(log, ['X', 'A'])
@@ -11983,7 +13581,7 @@ class TestConditionCycleWaitingEntry(unittest.TestCase):
             wf = s.transaction(a); wf.unblock()
             s.wait(Call(a, condition.wait, State.BLOCKED))
             nested = s.transaction(a); nested.unblock(); s.wait(Waiting(nested))
-            c = s.api(condition).cycle(a, baseA, x)
+            c = s.api(condition).cycle((a, baseA), x)
             self.assertEqual(c.wake(a), (a,))
             c.close()
         self.assertEqual(log, ['X', 'A'])
@@ -12046,16 +13644,17 @@ class TestWrongTypeRaisesTypeError(unittest.TestCase):
             with self.assertRaises(TypeError):
                 s.api(ev).cycle(object(), object())
 
-    def test_duplicate_threads_still_value_error(self):
+    def test_allocate_duplicate_threads_are_allowed(self):
         s = Scenario()
         sem = s.Semaphore(2)
+        order = []
         def w():
-            sem.acquire(); sem.release()
+            sem.acquire(); order.append('first')
+            sem.acquire(); order.append('second')
         with s:
             a = s.thread(w)
-            with self.assertRaisesRegex(ValueError, "specified more than once"):
-                list(s.api(sem).allocate(a, a))
-            s.skip(a, sem.acquire, sem.release)
+            self.assertEqual(list(s.api(sem).allocate(a, a)), [a, a])
+        self.assertEqual(order, ['first', 'second'])
 
 
 def run_tests():

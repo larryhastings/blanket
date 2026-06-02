@@ -25,14 +25,45 @@ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 import blankettestlib
-blankettestlib.preload_local_blanket()
+import inspect
+import queue
+import sys
+import threading
 
 
-for test_module in """
-    test_injector
-    test_primitives
-""".strip().split():
-    module = __import__(test_module)
-    module.run_tests()
+def test_modules():
+    modules = [
+        "test_release_metadata",
+        "test_stdlib_fidelity",
+        "test_injector",
+    ]
+    if sys.version_info >= (3, 11):
+        modules.append("test_injector_py311_plus")
+    modules.append("test_primitives")
+    modules.append("test_primitives_internal_coverage")
+    if hasattr(queue, "SimpleQueue"):
+        modules.append("test_primitives_py37_plus")
+    if 'n' in inspect.signature(threading.Semaphore.release).parameters:
+        modules.append("test_primitives_py39_plus")
+    if hasattr(threading.Lock(), "acquire_lock"):
+        modules.append("test_primitives_cpython_lock_aliases")
+    if hasattr(queue.Queue, "shutdown"):
+        modules.append("test_primitives_py313_plus")
+    modules.append("test_harness")
+    return modules
 
-blankettestlib.finish()
+
+def run_modules(modules):
+    for test_module in modules:
+        module = __import__(test_module)
+        module.run_tests()
+
+
+def main():
+    blankettestlib.preload_local_blanket()
+    run_modules(test_modules())
+    blankettestlib.finish()
+
+
+if __name__ == '__main__':
+    main()
