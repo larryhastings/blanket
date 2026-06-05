@@ -1374,103 +1374,106 @@ class Scenario:
         @base()
         @BoundInnerClass
         class Driver:
-            idle       = State(11, 'IDLE')
-            active     = State(12, 'ACTIVE')
-            skipping   = State(13, 'SKIPPING')
-            parking    = State(14, 'PARKING')
-            finishing  = State(15, 'FINISHING')
-            parked     = State(16, 'PARKED')
-            finished   = State(17, 'FINISHED')
+            """Explicit-command thread Driver.
+
+            Driver has one real state field: one of the states below.
+            A directive call stages one closure in ``self.closure``;
+            driving commits that closure, waits on the configured signal
+            set, and lands at a rest state.
+            """
+
+            undirected = State(11, 'UNDIRECTED')
+            driving    = State(12, 'DRIVING')
+            success    = State(13, 'SUCCESS')
+            returned   = State(14, 'RETURNED')
+            overshot   = State(15, 'OVERSHOT')
+            persisted  = State(16, 'PERSISTED')
+            mutated    = State(17, 'MUTATED')
             raised     = State(18, 'RAISED')
             terminated = State(19, 'TERMINATED')
-            nesting    = State(20, 'NESTING')
-            reentered  = State(22, 'REENTERED')
             impasse    = State(21, 'IMPASSE')
 
-            driving_states  = frozenset((skipping, parking, finishing))
-            active_states   = frozenset((active, nesting, reentered)) | driving_states
-            terminal_states = frozenset((parked, finished, raised, terminated, impasse))
+            terminal_states = frozenset((raised, terminated))
+            dead_states = frozenset((raised, terminated))
+            driving_states = frozenset((driving,))
 
-            base_impasse_states = frozenset(
+            blanket_controlled_states = frozenset(
                 (State.BLOCKED, State.STALLED, State.PAUSED))
-
-            # Canary states are the tx states past target that the tx
-            # might reach if it overshoots its intended park.  Named
-            # after the canary in the coal mine: when one is signaled
-            # while Driver is in PARKING, the tx transitioned past where
-            # we wanted it and Driver raises.
-            canaries = {
-                State.BLOCKED: frozenset((State.COMMIT, State.COMMITTED)),
-                State.COMMIT:  frozenset((State.COMMITTED,)),
-                State.WAITING: frozenset((State.COMMITTED,)),
-                State.STALLED: frozenset((State.COMMITTED,)),
-                State.PAUSED:  frozenset((State.EXITING,)),
-            }
+            externally_controlled_states = frozenset(
+                (State.COMMIT, State.WAITING))
+            parkable_states = frozenset(
+                (State.BLOCKED, State.COMMIT, State.WAITING,
+                 State.STALLED, State.PAUSED))
+            driver_release_states = frozenset(
+                (State.BLOCKED, State.STALLED, State.PAUSED))
+            base_impasse_states = blanket_controlled_states
 
             def __init__(self, score, thread, tx=None):
                 if thread is threading.current_thread():
                     raise ValueError("can't create a Driver for the current thread")
+                if tx is not None:
+                    if tx.thread is not thread:
+                        raise ValueError(
+                            f"base tx belongs to thread {tx.thread.name!r}, "
+                            f"not {thread.name!r}")
+                    if tx.done:
+                        raise ValueError("base tx must be active")
 
                 self.score = score
                 self.thread = thread
                 self.base_tx = tx
-
                 self.owner = None
 
                 self.base_thread_signal = {Terminated: Terminated(thread)}
                 self.thread_signal = self.base_thread_signal
-                terminated = self.base_thread_signal[Terminated]
+                self._base_nested = None if tx is None else Nested(tx.api)
 
-                self.state_signals = {
-                    self.idle:       frozenset((terminated, thread)),
-                    self.active:     frozenset(),
-                    self.skipping:   frozenset((terminated,)),
-                    self.parking:    frozenset((terminated,)),
-                    self.finishing:  frozenset((terminated,)),
-                    self.parked:     frozenset(),
-                    self.finished:   frozenset(),
-                    self.nesting:    frozenset(),
-                    self.reentered:  frozenset(),
-                    self.terminated: frozenset(),
-                }
-
-                self._base_nested = None
-                if tx is not None:
-                    self._base_nested = Nested(tx.api)
-                    self.state_signals[self.idle] = frozenset(
-                        (terminated, self._base_nested, tx))
                 self.txs_seen = {}
                 self.txs = []
 
-                self.initialized = False
-                self.state = None
+                self.state = self.undirected
                 self.tx = None
-                self.target = None
                 self.base = None
-                self.stack = []
+                self.target = None
                 self.signals = frozenset()
-                self.ready = False
-                self.lazy_work = None
-                self.lazy_verb = None
-                # When set (by a cycle's scheduler= path), parking also
-                # listens for Predicate(tx): the worker entering a
-                # wait_for predicate yields the Driver at REENTERED so
-                # the scheduler can drive what the predicate spawns.
-                self.listen_predicate = False
+                self.signaled = frozenset()
 
-                # Set by pausing() (the blanket-internal PAUSED incref):
-                # the Driver remembers it added exactly one pausing
-                # increment and auto-releases it -- on the next imperative
-                # drive if it landed at PAUSED as asked, or immediately on
-                # yield if it landed elsewhere.  pausing_tx is the tx that
-                # was incremented, so the release targets the right one.
+                # Published description of the most recent directive.
+                self.directive = None
+                self.directive_args = ()
+                # Staged deferred work.  A directive call installs a
+                # closure; driving consumes it.
+                self.closure = None
+                self.closure_is_route = False
+
+                self.current_directive = None
+                self.current_directive_args = ()
+                self.current_verb = None
+                self.drive_kind = None
+                self.drive_tx = None
+                self.scan_target = None
+                self.callback_signal = None
+                self.listen_predicate = False
+                self.listen_action = False
+
+                self.wait_keys = frozenset()
+                self.wait_unbox = {}
+                self.wait_description = None
+
+                self.snapshot_terminated = False
+                self.snapshot_tx = None
+                self.snapshot_state = None
+
+                self.route_iterator = None
+                self.route_subject = None
+                self.being_driven = False
+                self.iterating_thread = None
+
+                # Internal PAUSED incref used by cycle helpers.
                 self.held_pausing = False
                 self.pausing_tx = None
 
-
             def __eq__(self, other):
-                # Two Drivers compare equal when they wrap the same
-                # thread (regardless of base_tx or drive state).
                 if type(self) is not type(other):
                     return NotImplemented
                 return self.thread is other.thread
@@ -1484,115 +1487,6 @@ class Scenario:
             def __hash__(self):
                 return hash(self.thread)
 
-
-            def claim_slot(self):
-                """Register this Driver as the active driver for its
-                thread.  Idempotent for self; raises CompetingDriversError
-                if a *different* Driver is currently actively driving the
-                same thread.  A Driver holds the slot only while actively
-                driving: it releases it when it yields (active / nesting /
-                reentered) or reaches a terminal state (see to()), so
-                another Driver -- e.g. one the user built via skip() --
-                can drive the thread while this one is parked.  Two
-                Drivers may coexist for a thread; only one may drive at a
-                time."""
-                existing = self.score.drivers.get(self.thread)
-                if existing is self:
-                    return
-                if existing is not None:
-                    raise CompetingDriversError(
-                        f"thread {self.thread.name!r} already has an active "
-                        f"Driver {existing!r}")
-                self.score.drivers[self.thread] = self
-
-            def initialize(self):
-                if self.initialized:
-                    return
-                self.initialized = True
-
-                if not self.score.entered:
-                    raise RuntimeError(f"can't use driver, scenario not entered")
-
-                # special sentinel value so we'll properly
-                # set all the thread signals to None
-                self.tx = self
-                self.cache_tx()
-
-                if self.tx is not None:
-                    # Driver is taking over from the user.  Clear user
-                    # pauses up the tx stack so prior user-set pauses
-                    # don't interfere with imperatives.  This is the
-                    # only place Driver clears tx.pause; anywhere
-                    # else, assume Driver is in charge and didn't set
-                    # it.  Each cleared flag matches one user
-                    # contribution to pausing, so decrement.  We do
-                    # NOT unpark here even if pausing hits zero on a
-                    # tx parked at PAUSED: the Driver imperative
-                    # about to be invoked will drive past PAUSED via
-                    # the auto-advance frog-march, which clears flag
-                    # and counter together.  If no imperative drives
-                    # (e.g. caller raises before issuing one), the tx
-                    # is left at PAUSED with counter zero -- caller
-                    # cleans up by driving the tx (skip), not
-                    # tx.unpause().
-                    cursor = self.tx
-                    while cursor is not None:
-                        if cursor.pause:
-                            cursor.pause = False
-                            cursor.pausing -= 1
-                        cursor = cursor.parent
-
-                self.stack = []
-
-                self.state = self.idle
-                # target is only used for parking state, not for skipping/finishing
-                self.target = None
-                # base is the operational base of the current pursue
-                # context -- the tx whose state/target the driver is
-                # ultimately driving toward.  Maintained as an
-                # invariant: set on every transition into active state
-                # (initialize, idle->active), rotated to a delegate
-                # child by the Nested-fire handler, and restored from
-                # the 4th field of stack frames on every pop.  In
-                # active state, self.base equals self.tx; the two
-                # diverge only while skipping through a non-delegate
-                # child (self.tx is the child, self.base is the saved
-                # parent on the stack).
-                self.base = None
-
-                self.signals = frozenset()
-                self.ready = False
-                # Deferred work staged by pursue: a zero-argument
-                # callable (typically tx.unblock as a bound method;
-                # closure if it ever needs to be more) that fires
-                # the moment the driver actually starts being
-                # driven -- on entry into Driver.__call__, or on the
-                # next Dispatch.__next__ drain of recent.  None means
-                # nothing staged.  See Driver.drive.
-                self.lazy_work = self.lazy_verb = None
-                # autoskip: per-pursue flag.  False (default) surfaces
-                # child txs in NESTING for the caller to drive; True
-                # drives each child to its own terminal automatically.
-                # Reset to the default on every fresh active session.
-                self.autoskip = False
-
-                # set by cache_tx
-                tx = self.tx
-                if tx is None:
-                    # base_tx parked in a blanket-controlled state and we
-                    # never touch base: no child can surface, base can't
-                    # end on its own -- nothing to drive, so we hit an
-                    # impasse (base is out of our purview, not dead).
-                    if (self.base_tx is not None
-                            and self.base_tx.state in self.base_impasse_states):
-                        self.to(self.impasse)
-                        return
-                    self.to(self.idle)
-                    return
-
-                self.base = tx
-                self.to(self.active)
-
             def __repr__(self):
                 state = self.state.name if self.state is not None else 'uninitialized'
                 target = f' -> {self.target.name}' if self.target else ''
@@ -1603,63 +1497,81 @@ class Scenario:
             def done(self):
                 return self.state in self.terminal_states
 
+            @property
+            def routed(self):
+                return self.route_iterator is not None or self.closure_is_route
+
             def register(self, owner):
                 if self.owner is not None:
                     raise RuntimeError(f"driver is already owned by {self.owner!r}")
                 self.owner = owner
                 return self.signals
 
-            def drive(self):
-                """Fire and clear the deferred-work callable, if any.
-                Called automatically by Driver.__call__ at entry, and
-                by Dispatch's drain_recent at the top of each
-                Dispatch.__next__ -- the two paths through which a
-                driver actually starts being driven."""
-                self.initialize()
-                lazy_work = self.lazy_work
-                if lazy_work is None:
-                    return
-                self.lazy_work = self.lazy_verb = None
-                lazy_work()
-
             def unregister(self):
                 if self.owner is None:
-                    raise RuntimeError(f"driver is not owned")
+                    raise RuntimeError("driver is not owned")
                 self.owner = None
 
-            def reactivate(self):
-                if not self.state in self.terminal_states:
-                    raise RuntimeError(f"can't reactivate, already in {self.state!r} state")
-                self.initialize()
-
-            def cache_tx(self):
-                tx = self.score.transaction(self.thread)
-
-                # base_tx mode: only adopt a proper descendant of
-                # base_tx (the nested op we're here to drive).  base_tx
-                # itself, or any tx not under it, means "nothing to
-                # drive yet" -- stay/return to idle and wait on Nested.
-                if self.base_tx is not None and tx is not None:
-                    cursor = tx.parent
-                    while cursor is not None and cursor is not self.base_tx:
-                        cursor = cursor.parent
-                    if cursor is None:
-                        tx = None
-
-                if self.tx == tx:
+            def claim_slot(self):
+                existing = self.score.drivers.get(self.thread)
+                if existing is self:
                     return
+                if existing is not None:
+                    raise CompetingDriversError(
+                        f"thread {self.thread.name!r} already has an active "
+                        f"Driver {existing!r}")
+                self.score.drivers[self.thread] = self
 
+            def release_slot(self):
+                self.score.drivers.pop(self.thread, None)
+
+            def close(self, *, route=True):
+                if route:
+                    self.clear_route(close=True)
+                self.signals = frozenset()
+                self.clear_wait()
+                self.closure = None
+                self.closure_is_route = False
+                self.release_slot()
+
+            def is_descendant(self, tx, ancestor):
+                cur = tx
+                while cur is not None:
+                    if cur is ancestor:
+                        return True
+                    cur = cur.parent
+                return False
+
+            def is_proper_descendant(self, tx, ancestor):
+                return tx is not ancestor and self.is_descendant(tx, ancestor)
+
+            def live_top_tx(self):
+                return self.score.transaction(self.thread)
+
+            def live_scoped_tx(self):
+                tx = self.live_top_tx()
+                base_tx = self.base_tx
+                if tx is None or base_tx is None:
+                    return tx
+                return tx if self.is_proper_descendant(tx, base_tx) else None
+
+            def live_child_of(self, parent):
+                tx = self.live_top_tx()
+                if tx is None:
+                    return None
+                return tx if self.is_proper_descendant(tx, parent) else None
+
+            def select_tx(self, tx):
                 self.tx = tx
+                self.base = tx
                 if tx is None:
                     self.thread_signal = self.base_thread_signal
                     return
-
                 if tx in self.txs_seen:
                     self.thread_signal = self.txs_seen[tx]
                     return
 
                 self.txs.append(tx)
-
                 api = tx.api
                 ts = self.thread_signal = self.base_thread_signal.copy()
                 ts[State.BLOCKED]   = Blocked(api)
@@ -1671,482 +1583,834 @@ class Scenario:
                 ts[State.EXITING]   = Exiting(api)
                 ts[Nested]          = Nested(api)
                 ts[Predicate]       = Predicate(api)
+                ts[Action]          = Action(api)
                 self.txs_seen[tx] = ts
 
+            def update_snapshot(self):
+                self.snapshot_terminated = self.base_thread_signal[Terminated].sample(self.score.api)
+                live = self.live_scoped_tx()
+                self.snapshot_tx = live
+                self.snapshot_state = None if live is None else live.state
 
-            def close(self):
-                """Cleanup on entering a terminal state.  Idempotent:
-                to() calls this when transitioning into a terminal
-                state, and external callers can call it too without
-                worrying whether to() has already done so.  (Still
-                not exposed on the Driver api object -- this is
-                blanket-internal; the api never calls it.)"""
-                assert self.ready is False
-                self.initialized = False
-                self.target = None
-                self.signals = frozenset()
-                # Release the score's slot.  pop-with-default makes
-                # this idempotent: a second call (or a call after
-                # to(terminal) already ran) is a no-op.
-                self.score.drivers.pop(self.thread, None)
+            def live_base_blocks(self):
+                base_tx = self.base_tx
+                if base_tx is None:
+                    return False
+                return base_tx.done or base_tx.state in self.blanket_controlled_states
 
-            def to(self, state):
-                self.state = state
-
-                if state in self.terminal_states:
-                    # Clear stale signals from prior state BEFORE
-                    # _update_owner, or it would call owner.listen()
-                    # with the old signals right before owner.done().
-                    # Tell owner we're done before close().  If there's
-                    # no owner, the pending 'done' has nowhere to go;
-                    # clear it ourselves to maintain close()'s invariant.
-                    self.close()
+            def check_base_or_raise(self, verb, *, aiming_at_impasse=False):
+                if self.base_tx is None or aiming_at_impasse:
                     return
-
-                signals = self.state_signals[state]
-
-                if state is not self.idle:
-                    if state in self.driving_states:
-                        # Actively driving: hold the score slot.
-                        self.claim_slot()
-                        def transaction_states_set(states):
-                            return set(self.thread_signal[s] for s in states)
-                        parking_signals = transaction_states_set(
-                            (State.BLOCKED, State.STALLED, State.PAUSED))
-
-                        signals = set(signals)
-                        signals.add(self.tx)
-                        signals |= parking_signals
-                        signals.add(self.thread_signal[Nested])
-                        # A wait_for runs its predicate while being
-                        # driven toward COMMITTED (finishing) -- and a
-                        # predicate could in principle fire during any
-                        # drive -- so arm Predicate for every driving
-                        # state when the cycle asked us to listen.  It
-                        # only ever goes high for a wait_for predicate,
-                        # so this is inert for everything else.
-                        if self.listen_predicate:
-                            signals.add(self.thread_signal[Predicate])
-                        if state is self.parking:
-                            signals.add(self.thread_signal[self.target])
-                            signals |= transaction_states_set(self.canaries[self.target])
-                    # else: active -> empty signals (yield to caller so
-                    # they can issue the next imperative); nesting ->
-                    # empty signals (yield with the child surfaced).
+                if self.live_base_blocks():
+                    if self.base_tx.done:
+                        reason = 'done'
                     else:
-                        # Yielded -- not actively driving -- so release
-                        # the score slot, letting another Driver (e.g. a
-                        # user skip()) drive this thread meanwhile.  We
-                        # reclaim on the next drive (claim_slot above).
-                        self.score.drivers.pop(self.thread, None)
-                        # Landed somewhere other than PAUSED (active /
-                        # nesting / reentered): a pausing() that didn't
-                        # reach its target releases its incref now.
-                        self.release_pausing()
-                    signals = frozenset(signals)
+                        reason = f"blanket-parked ({self.base_tx.state.name})"
+                    raise RuntimeError(
+                        f"can't {verb}, base transaction is currently {reason}")
 
-                self.signals = signals
-                return signals
+            def validate_scan_target(self, watch):
+                if watch is None:
+                    return None
+                if not isinstance(watch, self.score.Transaction):
+                    raise TypeError(f"scan target must be a Transaction or None, not {watch!r}")
+                if watch.thread is not self.thread:
+                    raise ValueError(
+                        f"scan target belongs to thread {watch.thread.name!r}, "
+                        f"not {self.thread.name!r}")
+                if watch.done:
+                    raise ValueError("scan target must be active")
+                base_tx = self.base_tx
+                if base_tx is not None:
+                    if watch is base_tx:
+                        raise ValueError("scan target may not be the Driver's base tx; use scan(None)")
+                    if not self.is_proper_descendant(watch, base_tx):
+                        raise ValueError("scan target must be strictly inside Driver scope")
+                return watch
 
+            def check_busy(self, verb):
+                if not self.score.entered:
+                    raise RuntimeError("can't use driver, scenario not entered")
+                current = threading.current_thread()
+                if self.being_driven and current is not self.iterating_thread:
+                    raise RuntimeError(
+                        f"can't {verb}, Driver is being driven right now")
 
-            def signal(self, signals):
-                ts = self.thread_signal
+            def check_directive(self, verb, *, needs_tx=False, target=None,
+                                allow_mutated_scan=False, aiming_at_impasse=False):
+                self.check_busy(verb)
+                if self.state in self.dead_states:
+                    raise RuntimeError(f"can't {verb}, currently in {self.state}")
+                if self.state is self.mutated and not allow_mutated_scan:
+                    raise RuntimeError("can't drive, Driver state is mutated; scan first")
+                self.check_base_or_raise(verb, aiming_at_impasse=aiming_at_impasse)
 
-                # IDLE has limited listening; handle separately.
-                if self.state is self.idle:
-                    if ts[Terminated] in signals:
-                        return self.to(self.terminated)
-                    if self.base_tx is not None:
-                        # base_tx mode: idle observes Nested(base_tx),
-                        # base_tx-terminal, and Terminated(thread).
-                        if self.base_tx in signals:
-                            # base tx exited -> this Driver is done; its
-                            # subtree is necessarily closed too.  A fresh
-                            # Driver handles the next phase.
-                            return self.to(self.terminated)
-                        # Nested(base_tx) fired: a child appeared under
-                        # base_tx.  Surface it -- cache_tx picks up the
-                        # child (now the topmost proper descendant) and
-                        # we go active so the caller can drive it.  When
-                        # the child exits, cache_tx finds base_tx again
-                        # (not a descendant) -> None -> back to idle for
-                        # the next child.
-                        assert self._base_nested in signals
-                        self.cache_tx()
-                        assert self.tx is not None
-                        self.base = self.tx
-                        return self.to(self.active)
-                    assert self.thread in signals
-                    assert self.tx is None
-                    self.cache_tx()
-                    self.base = self.tx
-                    return self.to(self.active)
+                if needs_tx:
+                    tx = self.tx
+                    if tx is None or tx.done:
+                        raise RuntimeError(f"can't {verb}, scan first")
+                    # Early mutation detection: a tx left one of the states
+                    # blanket controls without this Driver releasing it.
+                    if (self.snapshot_tx is tx
+                            and self.snapshot_state in self.blanket_controlled_states
+                            and tx.state is not self.snapshot_state):
+                        raise RuntimeError(
+                            f"can't {verb}, Driver model is mutated: tx moved "
+                            f"from {self.snapshot_state.name} to {tx.state.name}")
+                    if target is not None and tx.state.index > target.index:
+                        raise RuntimeError(
+                            f"can't {verb}, tx currently in {tx.state.name}; "
+                            f"target {target.name} is behind it")
 
-                assert self.state in self.active_states
-                assert self.tx
+            def stage(self, method, args, closure, *, route=False):
+                self.closure = closure
+                self.closure_is_route = route
+                self.directive = method
+                self.directive_args = tuple(args)
+                self.signaled = frozenset()
 
-                # Predicate fired: while driving the wait_for to COMMIT
-                # the worker entered its predicate.  Only arms when
-                # listen_predicate is set (the cycle's scheduler= path),
-                # and goes high before the predicate can spawn anything,
-                # so we check it before Nested.  Yield at REENTERED with
-                # self.tx unchanged (still the wait_for, which stays at
-                # COMMIT) so the caller's scheduler can drive whatever the
-                # predicate spawns, then resume the drive.
-                if ts[Predicate] in signals:
-                    return self.to(self.reentered)
+            def slot_empty(self):
+                return self.closure is None
 
-                # Nested is a child-push event, distinct from tx-state
-                # signals.
-                if ts[Nested] in signals:
-                    # A child tx has been pushed on top of self.tx
-                    # while the Driver was active.  Save the current
-                    # pursue context (tx, state, target, base) so it
-                    # can be restored when the child eventually pops.
-                    self.stack.append(
-                        (self.tx, self.state, self.target, self.base))
-                    parent = self.tx
-                    self.cache_tx()
-                    # Delegate-parking: when parking toward a tx state
-                    # and the parent says the child is the delegate it
-                    # parks *through*, the target applies to the child.
-                    # This is how THIS tx parks (a regulated wait parks
-                    # through its cond.wait child), not child disposal,
-                    # so it holds regardless of autoskip.  Rotate base
-                    # to the child and re-enter parking; the child's
-                    # state signals replace the parent's via cache_tx.
-                    if (self.state is self.parking
-                            and parent.is_delegate(self.tx)):
-                        self.base = self.tx
-                        return self.to(self.parking)
-                    # autoskip: caller opted to dispose children -- drive
-                    # the child through to its own terminal (the old
-                    # default).  Otherwise surface it: rotate base to
-                    # the child (active-state invariant base == tx) and
-                    # yield in NESTING (empty signals) so the caller can
-                    # drive the child themselves.  The parent context is
-                    # preserved on the stack frame for restore at tx-end.
-                    if self.autoskip:
-                        return self.to(self.skipping)
-                    self.base = self.tx
-                    return self.to(self.nesting)
+            def clear_slot(self):
+                self.closure = None
+                self.closure_is_route = False
 
-                # tx-end is the most-progressed possible signal: the
-                # tx is done walking states.  Handle specially because
-                # the dispatch depends on Driver state and the stack.
-                if self.tx in signals:
-                    if self.stack:
-                        tx, state, target, base = self.stack.pop()
-                        assert self.tx.parent is tx
-                        # cache_tx() refreshes self.tx and the
-                        # thread_signal namespace against the now-
-                        # current top of the thread's tx stack.
-                        self.cache_tx()
-                        if self.tx is not tx:
-                            # Parent also terminated while we were
-                            # skipping through the child.  Whatever
-                            # we were resuming the parent toward, the
-                            # parent's terminal moots it.  For
-                            # finishing, the terminal IS the target;
-                            # for parking, the parent overshot to a
-                            # terminal instead of our target state;
-                            # for skipping, we just continue (next
-                            # pop or idle).
-                            if state is self.finishing:
-                                return self.to(self.finished)
-                            if state is self.parking:
-                                raise self.overshot(tx.state.name)
-                            assert state is self.skipping
-                            if self.stack:
-                                # Re-pop: the next ancestor is the
-                                # actual resume point.  (Multi-level
-                                # nested where intermediates all
-                                # closed.)  We rely on cache_tx having
-                                # surfaced whichever tx is current
-                                # (which may itself be the next pop's
-                                # tx, or further up).  Loop until we
-                                # find a match or run out of stack.
-                                while self.stack:
-                                    tx, state, target, base = self.stack.pop()
-                                    if self.tx is tx:
-                                        self.target = target
-                                        self.base = base
-                                        return self.to(state)
-                                    if state is self.finishing:
-                                        return self.to(self.finished)
-                                    if state is self.parking:
-                                        raise self.overshot(tx.state.name)
-                            # Cascade walked off the bottom of the
-                            # stack without a match: every saved
-                            # ancestor has also closed and the
-                            # worker has advanced past them all.
-                            # self.tx (from the earlier cache_tx)
-                            # holds whatever it surfaced.  Yield
-                            # ACTIVE on that tx if it exists; only
-                            # IDLE if the thread truly has no
-                            # current tx (IDLE asserts self.tx is
-                            # None).
-                            if self.tx is None:
-                                return self.to(self.idle)
-                            self.base = self.tx
-                            return self.to(self.active)
-                        self.target = target
-                        self.base = base
-                        return self.to(state)
-                    if self.state is self.parking:
-                        # tx terminated while we were trying to park.
-                        # The ultimate overshoot.  Pass the actual
-                        # terminal state (RETURNED or RAISED) for
-                        # diagnostic clarity.
-                        raise self.overshot(self.tx.state.name)
-                    if self.state is self.finishing:
-                        return self.to(self.finished)
-                    if self.state is self.active:
-                        # The scheduler is in ACTIVE because the user
-                        # paused to inspect the tx, which means the tx
-                        # is at BLOCKED waiting for the scheduler to
-                        # advance it.  If the tx terminated anyway,
-                        # either Loki is interfering or there's a race
-                        # -- either way the scheduler isn't actually
-                        # in control.  Complain.
-                        self.to(self.raised)
-                        raise RuntimeError(f"{self}: tx terminated while Driver was ACTIVE (tx now {self.tx.state.name})")
+            def clear_route(self, close=False):
+                iterator = self.route_iterator
+                if close and iterator is not None:
+                    close_method = getattr(iterator, 'close', None)
+                    if close_method is not None:
+                        try:
+                            with unlock(self.score.lock):
+                                close_method()
+                        finally:
+                            self.route_iterator = None
+                            self.route_subject = None
+                        return
+                self.route_iterator = None
+                self.route_subject = None
 
-                    assert self.state is self.skipping
-                    self.cache_tx()
-                    # cache_tx may have surfaced a fresh tx (worker
-                    # has already advanced to a subsequent regulated
-                    # call after the skipped tx terminated).  IDLE
-                    # asserts self.tx is None; transition there only
-                    # if cache_tx confirms the thread has no current
-                    # tx, otherwise yield ACTIVE on the new tx so the
-                    # caller can issue the next imperative.
-                    if self.tx is None:
-                        return self.to(self.idle)
-                    self.base = self.tx
-                    return self.to(self.active)
-
-                # Among the non-end tx-state signals, find the most-
-                # progressed.  When multiple state signals fire in the
-                # same wake (the tx ran past several states quickly),
-                # earlier ones are stale and we process only the
-                # furthest.  Listed highest-progression first so the
-                # first match short-circuits.
-                for state in (State.EXITING, State.PAUSED, State.COMMITTED,
-                              State.STALLED, State.WAITING, State.COMMIT, State.BLOCKED):
-                    if ts[state] in signals:
-                        current_state = state
-                        break
-                else:
-                    assert ts[Terminated] in signals
-                    return self.to(self.terminated)
-
-                if self.state is self.parking:
-                    # self.tx is the pursue base.  It may have a
-                    # parent if the base was selected via is_delegate
-                    # (e.g. a cond.wait child whose wait_for parent
-                    # delegates park-state semantics to it); otherwise
-                    # walk-up reached the actual root.
-
-                    if current_state in self.canaries[self.target]:
-                        # Canary: we overshot the target state.
-                        raise self.overshot(current_state.name)
-
-                    if self.target is current_state:
-                        return self.to(self.parked)
-
-                # Transit states: scheduler advances the tx past these.
-                # COMMIT, COMMITTED, and EXITING are caught above as
-                # canaries (the only paths that put them in listening),
-                # and target match has handled the case where one of
-                # the four parking states was the user's target in
-                # PARKING.  Auto-advance past whichever fired and keep
-                # listening: driver state is unchanged, the tx is now
-                # in flight again, and the next signal (the next park
-                # or target match) will route here again.
-                # Including PAUSED: if Loki sets pause on a tx the
-                # scheduler is driving, the scheduler wins.
-                if current_state is State.BLOCKED:
-                    self.tx.unblock()
-                elif current_state is State.STALLED:
-                    self.tx.unstall()
-                else:
-                    assert current_state is State.PAUSED
-                    # Frog-march past PAUSED: scheduler wins over a
-                    # user-set pause.  Clear both flag and counter,
-                    # then unpark to EXITING.
-                    self.tx.pause = False
-                    self.tx.pausing = 0
-                    self.tx.unpark(State.EXITING)
+            def rest(self, state):
+                self.state = state
+                self.signals = frozenset()
+                self.drive_kind = None
+                self.current_verb = None
+                self.current_directive = None
+                self.current_directive_args = ()
+                self.target = None if state is not self.overshot else self.target
+                self.release_slot()
+                if state is not self.success:
+                    self.release_pausing()
+                self.update_snapshot()
                 return self.signals
 
-            def overshot(self, state_name):
-                """Driver reached state_name unexpectedly (canary
-                signaled, or tx terminated while trying to park).
-                Transition to RAISED and return the exception, which
-                the caller raises."""
-                msg = f"{self} reached {state_name}, overshot target {self.target.name}"
-                self.to(self.raised)
-                return RuntimeError(msg)
+            def wait_on(self, signals):
+                self.state = self.driving
+                self.claim_slot()
+                self.signals = frozenset(signals)
+                return self.signals
 
-            def pursue(self, to_state, verb, *, tx_cls=None, setup=None, target=None, unblock=True, autoskip=False):
-                if self.lazy_work is not None:
-                    raise RuntimeError(f"can't {verb}, haven't run {self.lazy_verb} yet")
+            def prepare_drive_start(self):
+                """Detect post-stage mutation/overshoot before a directive releases anything."""
+                tx = self.drive_tx
+                target = self.target
+                if tx is None or tx.done:
+                    return True
+                live = self.live_top_tx()
+                if live is not tx and live is not None and self.is_proper_descendant(live, tx):
+                    # A child appeared in the post-stage window.  Surface it;
+                    # the caller can explicitly drive it and later scan back.
+                    self.select_tx(live)
+                    self.rest(self.success)
+                    return False
+                if self.snapshot_tx is tx:
+                    old = self.snapshot_state
+                    new = tx.state
+                    if old is not None and new is not old:
+                        if old in self.blanket_controlled_states:
+                            self.rest(self.mutated)
+                            return False
+                        if (target is not None
+                                and old.index <= target.index < new.index):
+                            if target in self.externally_controlled_states:
+                                self.rest(self.overshot)
+                            else:
+                                self.rest(self.mutated)
+                            return False
+                        self.update_snapshot()
+                return True
 
-                # A new imperative is driving the Driver onward: release
-                # any pausing incref a prior pausing() recorded and landed
-                # at PAUSED.  (Fires before setup() below stages this
-                # call's own incref, so it only ever catches a prior one.)
-                self.release_pausing()
-
-                if self.state is None:
-                    self.initialize()
-                elif self.state in (self.parked, self.finished):
-                    self.reactivate()
-
-                # Record the child-handling policy for this drive (after
-                # init/reactivate, which reset it to the default): the
-                # Nested-fire handler reads self.autoskip to decide
-                # surface (default) vs auto-skip each child.
-                self.autoskip = autoskip
-                if self.state in (self.active, self.nesting, self.reentered):
-                    self.cache_tx()
-                    if self.tx is None:
-                        return self.to(self.finished)
-
-                tx = self.tx
-
-                if self.state not in (self.active, self.nesting, self.reentered):
-                    raise RuntimeError(f"can't {verb}, currently in {self.state}")
-                if tx_cls and not isinstance(tx, tx_cls):
-                    raise RuntimeError(
-                        f"can't {verb}, tx doesn't park in {target.name} state, tx={tx!r}")
-
-                # Driver is sophisticated enough to take a tx that's
-                # already in flight and drive it to a target state.
-                # Including the parked state PAUSED: if the caller's
-                # target IS the parked state, the cascade yields parked
-                # immediately on first signal; if the target is past
-                # the parked state, the cascade auto-unparks via the
-                # transit handler.  We only refuse if the tx is past
-                # any state Driver can handle.
-                if tx.state not in (State.BLOCKED, State.COMMIT, State.WAITING, State.STALLED, State.PAUSED):
-                    raise RuntimeError(f"can't {verb}, tx currently in {tx.state}")
-
-                # Eagerly advance past BLOCKED -- saves one round of
-                # wake-up-and-analyze-signals when the cascade kicks
-                # in.  Safe because BLOCKED is never a parking
-                # target (no imperative sets target=BLOCKED), so the
-                # tx never wants to stay there.  We could do the
-                # same for STALLED and PAUSED, but those rarely fire
-                # (STALLED is post-notify, PAUSED is post-prior-
-                # drive; neither dominates the common case the way
-                # BLOCKED does), PAUSED's frog-march is more
-                # involved (clear flag + zero counter + unpark),
-                # and signal()'s elif chain already covers all
-                # three uniformly -- so we only optimize the cheap,
-                # high-frequency case here.
-                unblock = unblock and tx.state is State.BLOCKED
-
-                # Everything an imperative does -- mutate driver
-                # state (target, state-via-to), mutate tx state
-                # (unblock), run imperative-specific setup (e.g.
-                # pause's pausing-counter increment) -- is staged as
-                # a closure on self.lazy_work.  The closure fires
-                # when the driver actually starts being driven: by
-                # Driver.__call__ at entry, or by Dispatch.__next__'s
-                # drain of recent.  A driver is uniformly lazy:
-                # nothing observable changes on the driver or its tx
-                # between the imperative call and the drive.
-                def lazy_work():
-                    if setup is not None:
-                        setup()
-                    if target is not None:
-                        self.target = target
-                    if unblock:
-                        tx.unblock()
-                    self.to(to_state)
-
-                self.lazy_work = lazy_work
-                self.lazy_verb = verb
-
-
-            def skip(self, autoskip=False):
-                return self.pursue(self.skipping, 'skip', autoskip=autoskip)
-
-            def block(self):
-                return self.pursue(self.parked, 'block', unblock=False)
-
-            def commit(self, autoskip=False):
-                return self.pursue(self.parking, 'commit', target=State.COMMIT, tx_cls=self.score.Core.TimeoutTransaction, autoskip=autoskip)
-
-            def wait(self, autoskip=False):
-                return self.pursue(self.parking, 'wait', target=State.WAITING, tx_cls=self.score.WaitingTransaction, autoskip=autoskip)
-
-            def stall(self, autoskip=False):
-                return self.pursue(self.parking, 'stall', target=State.STALLED, tx_cls=self.score.Core.StallingTransaction, autoskip=autoskip)
-
-            def pause(self, autoskip=False):
-                # User-facing: incref pausing AND set the user pause
-                # flag, so the user can later release via the matching
-                # api.unpause / tx.api.pause = False decref.  Stage
-                # the tx-side mutations in pursue's setup hook so
-                # everything fires together when the driver is run.
-                # Note we read self.base inside setup() (at fire
-                # time), not here at imperative-call time: with lazy
-                # Driver init, self.base may not be set until pursue
-                # runs initialize.
-                def setup():
-                    base = self.base
-                    base.pause = True
-                    base.pausing += 1
-                return self.pursue(self.parking, 'pause',
-                                   target=State.PAUSED, setup=setup, autoskip=autoskip)
-
-            def pausing(self):
-                # Blanket-internal: incref pausing without touching the
-                # pause flag.  Used by scheduler-side code (Cycle init,
-                # Lock.relay) that holds a tx at PAUSED on its own
-                # bookkeeping.  The Driver auto-releases this one incref
-                # (see release_pausing): callers no longer balance it
-                # themselves.  Not exposed on the Driver api.
-                def setup():
-                    self.base.pausing += 1
-                    self.held_pausing = True
-                    self.pausing_tx = self.base
-                return self.pursue(self.parking, 'pausing',
-                                   target=State.PAUSED, setup=setup)
+            def maybe_impasse_at_commit(self, *, success_if_impasse=False):
+                if self.base_tx is None:
+                    return False
+                if self.live_base_blocks():
+                    self.rest(self.success if success_if_impasse else self.impasse)
+                    return True
+                return False
 
             def release_pausing(self):
-                """Release the one pausing incref recorded by pausing(),
-                if any.  Decrement only -- never unparks: the imperative
-                that's driving the Driver onward (or the caller's
-                frog-march) moves the tx past PAUSED.  Idempotent."""
                 if not self.held_pausing:
                     return
                 self.held_pausing = False
                 tx = self.pausing_tx
                 self.pausing_tx = None
-                tx.pausing -= 1
-                assert tx.pausing >= 0, f"pausing went negative: {tx.pausing}"
+                if tx is not None:
+                    tx.pausing -= 1
+                    assert tx.pausing >= 0, f"pausing went negative: {tx.pausing}"
 
-            def finish(self, autoskip=False):
-                return self.pursue(self.finishing, 'finish', autoskip=autoskip)
+            def auto_release_current_state(self):
+                tx = self.tx
+                state = tx.state
+                if state is State.BLOCKED:
+                    tx.unblock()
+                elif state is State.STALLED:
+                    tx.unstall()
+                elif state is State.PAUSED:
+                    tx.pause = False
+                    tx.pausing = 0
+                    tx.unpark(State.EXITING)
+                else:
+                    raise RuntimeError(f"can't release tx in {state.name}")
+
+            def make_tx_signals(self, tx):
+                if tx is not self.tx:
+                    self.select_tx(tx)
+                ts = self.thread_signal
+                return ts
+
+            def drive_scan(self):
+                self.release_pausing()
+                self.drive_kind = 'scan'
+                self.drive_tx = None
+                watch = self.scan_target
+                self.target = None
+
+                if self.maybe_impasse_at_commit():
+                    return
+
+                if watch is None:
+                    tx = self.live_scoped_tx()
+                else:
+                    tx = self.live_child_of(watch)
+                if tx is not None:
+                    if tx.pause and tx.state is not State.PAUSED:
+                        tx.pause = False
+                    self.select_tx(tx)
+                    self.rest(self.success)
+                    return
+
+                if self.base_thread_signal[Terminated].sample(self.score.api):
+                    self.rest(self.terminated)
+                    return
+
+                signals = {self.base_thread_signal[Terminated]}
+                if watch is None:
+                    if self.base_tx is None:
+                        signals.add(self.thread)
+                    else:
+                        signals.add(Nested(self.base_tx.api))
+                        signals.add(self.base_tx.api)
+                else:
+                    signals.add(Nested(watch.api))
+                    signals.add(watch.api)
+                self.wait_on(signals)
+
+            def scan(self, base_tx=None):
+                self.check_directive('scan', allow_mutated_scan=True)
+                watch = self.validate_scan_target(base_tx)
+
+                def closure():
+                    self.scan_target = watch
+                    self.drive_scan()
+
+                self.stage(self.scan, (base_tx,), closure)
+
+            def reactivate(self):
+                self.scan()
+
+            def park(self, verb, target, *, tx_cls=None, setup=None, unblock=True):
+                self.check_directive(verb, needs_tx=True, target=target)
+                tx = self.tx
+                if tx_cls and not isinstance(tx, tx_cls):
+                    raise RuntimeError(
+                        f"can't {verb}, tx doesn't park in {target.name} state, tx={tx!r}")
+                if tx.state not in self.parkable_states:
+                    raise RuntimeError(f"can't {verb}, tx currently in {tx.state.name}")
+
+                def closure():
+                    self.release_pausing()
+                    self.drive_kind = 'park'
+                    self.drive_tx = tx
+                    self.target = target
+                    if self.maybe_impasse_at_commit():
+                        return
+                    if not self.prepare_drive_start():
+                        return
+                    if setup is not None:
+                        setup()
+                    if tx.state is target:
+                        self.rest(self.success)
+                        return
+                    if unblock and tx.state is State.BLOCKED:
+                        tx.unblock()
+                    self.configure_park_wait(tx, target)
+
+                self.stage(getattr(self, verb), (), closure)
+
+            def configure_park_wait(self, tx, target):
+                self.select_tx(tx)
+                success = (Reached(tx.api, target)
+                           if target in self.externally_controlled_states
+                           else TransactionState(tx.api, target))
+                signals = {success, self.base_thread_signal[Terminated], tx, tx.api,
+                           Nested(tx.api)}
+                if self.listen_predicate:
+                    signals.add(self.thread_signal[Predicate])
+                if self.listen_action:
+                    signals.add(self.thread_signal[Action])
+                # State signals needed for transit release and for quick
+                # detection of raised/terminal before target.
+                ts = self.thread_signal
+                signals.update(ts[state] for state in (
+                    State.BLOCKED, State.STALLED, State.PAUSED,
+                    State.COMMITTED, State.EXITING))
+                self.success_signal = success
+                self.wait_on(signals)
+
+            def block(self):
+                return self.park('block', State.BLOCKED, unblock=False)
+
+            def commit(self):
+                return self.park('commit', State.COMMIT,
+                                 tx_cls=self.score.Core.TimeoutTransaction)
+
+            def waiting(self):
+                return self.park('waiting', State.WAITING,
+                                 tx_cls=self.score.WaitingTransaction)
+
+            def stall(self):
+                return self.park('stall', State.STALLED,
+                                 tx_cls=self.score.Core.StallingTransaction)
+
+            def pause(self):
+                def setup():
+                    tx = self.drive_tx
+                    tx.pause = True
+                    tx.pausing += 1
+                return self.park('pause', State.PAUSED, setup=setup)
+
+            def pausing(self):
+                def setup():
+                    tx = self.drive_tx
+                    tx.pausing += 1
+                    self.held_pausing = True
+                    self.pausing_tx = tx
+                return self.park('pausing', State.PAUSED, setup=setup)
+
+            def finish(self):
+                self.check_directive('finish', needs_tx=True)
+                tx = self.tx
+
+                def closure():
+                    self.release_pausing()
+                    self.drive_kind = 'finish'
+                    self.drive_tx = tx
+                    self.target = None
+                    if self.maybe_impasse_at_commit():
+                        return
+                    if not self.prepare_drive_start():
+                        return
+                    self.configure_finish_wait(tx)
+
+                self.stage(self.finish, (), closure)
+
+            def configure_finish_wait(self, tx):
+                self.select_tx(tx)
+                if tx.done:
+                    self.finish_tx_done(tx, normal_success=True)
+                    return
+                signals = {tx, tx.api, self.base_thread_signal[Terminated], Nested(tx.api)}
+                ts = self.thread_signal
+                if self.listen_predicate:
+                    signals.add(ts[Predicate])
+                if self.listen_action:
+                    signals.add(ts[Action])
+                signals.update(ts[state] for state in (
+                    State.BLOCKED, State.STALLED, State.PAUSED))
+                self.wait_on(signals)
+
+            def until(self, state):
+                if state is self.terminated:
+                    self.check_directive('until', aiming_at_impasse=False)
+                elif state is self.raised:
+                    self.check_directive('until', needs_tx=True)
+                elif state is self.impasse:
+                    if self.base_tx is None:
+                        raise RuntimeError("until(impasse) requires a scoped Driver")
+                    self.check_directive('until', aiming_at_impasse=True)
+                else:
+                    raise ValueError("until() target must be terminated, raised, or impasse")
+                target = state
+                tx = self.tx
+
+                def closure():
+                    self.release_pausing()
+                    self.drive_kind = 'until'
+                    self.drive_tx = tx
+                    self.target = target
+                    if target is self.impasse:
+                        if self.maybe_impasse_at_commit(success_if_impasse=True):
+                            return
+                        self.configure_until_impasse_wait()
+                        return
+                    if self.maybe_impasse_at_commit():
+                        return
+                    if target is self.terminated:
+                        self.configure_until_terminated_wait(tx)
+                    else:
+                        self.configure_until_raised_wait(tx)
+
+                self.stage(self.until, (state,), closure)
+
+            def configure_until_terminated_wait(self, tx):
+                if tx is not None and not tx.done:
+                    self.select_tx(tx)
+                    self.drive_kind = 'until-terminated-finish'
+                    self.configure_finish_wait(tx)
+                    return
+                if self.base_thread_signal[Terminated].sample(self.score.api):
+                    self.rest(self.success)
+                    return
+                if self.live_scoped_tx() is not None:
+                    self.rest(self.persisted)
+                    return
+                signals = {self.base_thread_signal[Terminated]}
+                signals.add(self.thread if self.base_tx is None else Nested(self.base_tx.api))
+                self.wait_on(signals)
+
+            def configure_until_raised_wait(self, tx):
+                self.select_tx(tx)
+                if tx.done:
+                    self.finish_tx_done(tx, normal_success=False, raised_success=True)
+                    return
+                signals = {tx, tx.api, self.base_thread_signal[Terminated], Nested(tx.api)}
+                ts = self.thread_signal
+                if self.listen_predicate:
+                    signals.add(ts[Predicate])
+                if self.listen_action:
+                    signals.add(ts[Action])
+                signals.update(ts[state] for state in (
+                    State.BLOCKED, State.STALLED, State.PAUSED))
+                self.wait_on(signals)
+
+            def configure_until_impasse_wait(self):
+                tx = self.live_scoped_tx()
+                if tx is not None:
+                    self.select_tx(tx)
+                    self.drive_kind = 'until-impasse'
+                    signals = {self.base_tx.api, self.base_thread_signal[Terminated], Nested(tx.api), tx, tx.api}
+                    ts = self.thread_signal
+                    signals.update(ts[state] for state in (State.BLOCKED, State.STALLED, State.PAUSED))
+                    self.wait_on(signals)
+                    return
+                signals = {self.base_thread_signal[Terminated], self.base_tx.api, Nested(self.base_tx.api)}
+                self.wait_on(signals)
+
+            def wait(self, *items):
+                self.check_directive('wait')
+                if not items:
+                    raise ValueError("must specify at least one signal")
+                wtx = self.score.WaitTransaction(set(items))
+                wait_keys = wtx.keys
+                wait_unbox = wtx.unbox
+                wait_description = repr(tuple(items))
+
+                def closure():
+                    self.drive_kind = 'wait'
+                    self.target = None
+                    self.wait_keys = wait_keys
+                    self.wait_unbox = wait_unbox
+                    self.wait_description = wait_description
+                    if self.tx is None or self.tx.done:
+                        live = self.live_scoped_tx()
+                        if live is not None:
+                            self.select_tx(live)
+                    signals = set(wait_keys)
+                    signals.add(self.base_thread_signal[Terminated])
+                    if self.tx is not None and not self.tx.done:
+                        self.select_tx(self.tx)
+                        ts = self.thread_signal
+                        signals.add(self.tx)
+                        signals.add(self.tx.api)
+                        signals.add(ts[Nested])
+                        signals.update(ts[state] for state in (
+                            State.BLOCKED, State.STALLED, State.PAUSED))
+                    elif self.base_tx is not None:
+                        signals.add(self._base_nested)
+                        signals.add(self.base_tx.api)
+                    else:
+                        signals.add(self.thread)
+                    self.wait_on(signals)
+
+                self.stage(self.wait, items, closure)
+
+            def reenter(self):
+                self.check_directive('reenter', needs_tx=True)
+                tx = self.tx
+
+                def closure():
+                    self.drive_kind = 'reenter'
+                    self.drive_tx = tx
+                    self.target = None
+                    if self.maybe_impasse_at_commit():
+                        return
+                    if not self.prepare_drive_start():
+                        return
+                    self.select_tx(tx)
+                    ts = self.thread_signal
+                    signals = {self.base_thread_signal[Terminated], tx, tx.api,
+                               Nested(tx.api), ts[Predicate], ts[Action]}
+                    signals.update(ts[state] for state in (
+                        State.BLOCKED, State.STALLED, State.PAUSED))
+                    self.wait_on(signals)
+
+                self.stage(self.reenter, (), closure)
+
+            def resume(self):
+                self.check_directive('resume')
+                signal = self.callback_signal
+                if signal is None:
+                    raise RuntimeError("can't resume, Driver is not in a callback")
+                wtx = self.score.WaitTransaction({Not(signal)})
+                wait_keys = wtx.keys
+                wait_unbox = wtx.unbox
+                wait_description = repr((Not(signal),))
+
+                def closure():
+                    self.drive_kind = 'resume'
+                    self.wait_keys = wait_keys
+                    self.wait_unbox = wait_unbox
+                    self.wait_description = wait_description
+                    if self.tx is None or self.tx.done:
+                        live = self.live_scoped_tx()
+                        if live is not None:
+                            self.select_tx(live)
+                    signals = set(wait_keys)
+                    signals.add(self.base_thread_signal[Terminated])
+                    if self.tx is not None and not self.tx.done:
+                        self.select_tx(self.tx)
+                        signals.add(self.tx)
+                        signals.add(self.tx.api)
+                        signals.add(self.thread_signal[Nested])
+                    self.wait_on(signals)
+
+                self.stage(self.resume, (), closure)
+
+            def wait_signaled(self, fired):
+                return frozenset(
+                    original
+                    for key in fired
+                    for original in self.wait_unbox.get(key, ()))
+
+            def clear_wait(self):
+                self.wait_keys = frozenset()
+                self.wait_unbox = {}
+                self.wait_description = None
+
+            def route(self, route, subject=None):
+                self.check_directive('route')
+                if not callable(route):
+                    raise TypeError(f"route must be callable, not {route!r}")
+                subject = self if subject is None else subject
+                iterator = route(subject)
+                try:
+                    iterator_iter = iter(iterator)
+                except TypeError:
+                    raise TypeError("route must return an iterator") from None
+                if iterator_iter is not iterator:
+                    raise TypeError("route must return an iterator")
+
+                self.clear_route()
+                previous_state = self.state
+
+                def closure():
+                    self.route_iterator = iterator
+                    self.route_subject = subject
+                    # Installing a route is not itself a Driver outcome.
+                    self.state = previous_state
+
+                self.stage(self.route, (route,), closure, route=True)
+
+            def drive(self):
+                closure = self.closure
+                if closure is None:
+                    self.state = self.undirected
+                    raise RuntimeError(f"{self}: no Driver directive staged")
+                is_route = self.closure_is_route
+                self.clear_slot()
+                self.current_directive = self.directive
+                self.current_directive_args = self.directive_args
+                if not is_route:
+                    self.state = self.driving
+                    self.claim_slot()
+                closure()
+
+            def resume_route(self):
+                while self.closure is None:
+                    iterator = self.route_iterator
+                    if iterator is None:
+                        self.state = self.undirected
+                        raise RuntimeError(f"{self}: no Driver directive staged")
+
+                    stopped = False
+                    self.iterating_thread = threading.current_thread()
+                    try:
+                        try:
+                            with unlock(self.score.lock):
+                                next(iterator)
+                        except StopIteration:
+                            stopped = True
+                        except BaseException:
+                            self.clear_route(close=True)
+                            self.rest(self.raised)
+                            raise
+                    finally:
+                        self.iterating_thread = None
+
+                    if self.closure is not None:
+                        if stopped:
+                            self.clear_route()
+                        return True
+
+                    if stopped:
+                        self.clear_route()
+                        return False
+
+                    self.clear_route(close=True)
+                    self.state = self.undirected
+                    raise RuntimeError(
+                        "route yielded without issuing a Driver directive")
+                return True
+
+            def proceed(self):
+                while True:
+                    if self.signals:
+                        return self.signals
+                    if self.route_iterator is not None and self.closure is None:
+                        if not self.resume_route():
+                            return self.signals
+                        continue
+                    if self.closure is None:
+                        self.state = self.undirected
+                        raise RuntimeError(f"{self}: no Driver directive staged")
+                    self.drive()
+                    if self.signals:
+                        return self.signals
+                    if self.route_iterator is not None:
+                        continue
+                    return self.signals
+
+            def finish_tx_done(self, tx, *, normal_success, raised_success=False):
+                if tx.state is State.RAISED:
+                    return self.rest(self.success if raised_success else self.raised)
+                if raised_success:
+                    return self.rest(self.returned)
+                return self.rest(self.success if normal_success else self.returned)
+
+            def surface_nested_child(self):
+                parent = self.tx
+                self.select_tx(self.live_top_tx())
+                if self.tx is parent or self.tx is None:
+                    return False
+                self.rest(self.success)
+                return True
+
+            def signal_scan(self, fired):
+                watch = self.scan_target
+                if watch is None:
+                    tx = self.live_scoped_tx()
+                else:
+                    tx = self.live_child_of(watch)
+                if tx is not None:
+                    self.select_tx(tx)
+                    return self.rest(self.success)
+                if self.base_thread_signal[Terminated] in fired:
+                    return self.rest(self.terminated)
+                if watch is not None and watch.done:
+                    return self.rest(self.impasse)
+                if self.base_tx is not None and self.live_base_blocks():
+                    return self.rest(self.impasse)
+                return self.drive_scan()
+
+            def signal_wait(self, fired):
+                explicit = set(fired) & set(self.wait_keys)
+                if explicit:
+                    self.signaled = self.wait_signaled(explicit)
+                    self.clear_wait()
+                    self.callback_signal = None if self.current_directive == self.resume else self.callback_signal
+                    self.update_snapshot()
+                    return self.rest(self.success)
+
+                if self.base_thread_signal[Terminated] in fired:
+                    self.signaled = frozenset()
+                    self.clear_wait()
+                    return self.rest(self.terminated)
+
+                description = self.wait_description
+                if self.tx is not None:
+                    ts = self.thread_signal
+                    if self.tx in fired or self.tx.api in fired:
+                        self.signaled = frozenset()
+                        self.clear_wait()
+                        self.rest(self.raised)
+                        raise RuntimeError(
+                            f"{self}: transaction exited during wait for {description}")
+                    if not self.tx.done:
+                        if ts[Nested] in fired:
+                            self.signaled = frozenset()
+                            self.clear_wait()
+                            self.rest(self.raised)
+                            raise RuntimeError(
+                                f"{self}: nested transaction during wait for "
+                                f"{description}; include {ts[Nested]!r} if "
+                                "the route means to handle it")
+                        for state in (State.PAUSED, State.STALLED, State.BLOCKED):
+                            if ts[state] in fired:
+                                self.auto_release_current_state()
+                                return self.signals
+
+                if self.tx is None:
+                    tx = self.live_scoped_tx()
+                    if tx is not None:
+                        self.select_tx(tx)
+                        return self.wait_on(self.signals)
+
+                raise RuntimeError(f"{self}: unexpected signal while waiting: {fired!r}")
+
+            def signal_reenter(self, fired):
+                ts = self.thread_signal
+                if ts[Predicate] in fired:
+                    self.callback_signal = ts[Predicate]
+                    return self.rest(self.success)
+                if ts[Action] in fired:
+                    self.callback_signal = ts[Action]
+                    return self.rest(self.success)
+                return self.signal_tx_drive(fired)
+
+            def signal_until_terminated(self, fired):
+                if self.base_thread_signal[Terminated] in fired:
+                    return self.rest(self.success)
+                tx = self.live_scoped_tx()
+                if tx is not None:
+                    self.select_tx(tx)
+                    return self.rest(self.persisted)
+                return self.configure_until_terminated_wait(None)
+
+            def signal_tx_drive(self, fired):
+                tx = self.tx
+                ts = self.thread_signal
+
+                if tx is not None and self.listen_predicate and ts[Predicate] in fired:
+                    self.callback_signal = ts[Predicate]
+                    return self.rest(self.success)
+                if tx is not None and self.listen_action and ts[Action] in fired:
+                    self.callback_signal = ts[Action]
+                    return self.rest(self.success)
+
+                if tx is not None and ts[Nested] in fired:
+                    if self.surface_nested_child():
+                        return self.signals
+
+                if self.drive_kind == 'park':
+                    success = self.success_signal
+                    if success in fired or success.sample(self.score.api):
+                        # Attainment targets latch; occupancy targets must
+                        # still be sitting there.
+                        if self.target in self.blanket_controlled_states:
+                            if self.tx.state is self.target:
+                                return self.rest(self.success)
+                        else:
+                            return self.rest(self.success)
+
+                if tx is not None and (tx in fired or tx.api in fired or tx.done):
+                    if self.drive_kind == 'finish':
+                        return self.finish_tx_done(tx, normal_success=True)
+                    if self.drive_kind == 'until-terminated-finish':
+                        if tx.state is State.RAISED:
+                            return self.rest(self.raised)
+                        self.drive_kind = 'until-terminated-watch'
+                        return self.configure_until_terminated_wait(None)
+                    if self.drive_kind == 'until':
+                        if self.target is self.raised:
+                            return self.finish_tx_done(tx, normal_success=False, raised_success=True)
+                    if self.drive_kind == 'park':
+                        return self.rest(self.raised if tx.state is State.RAISED else self.overshot)
+                    if self.drive_kind in ('reenter', 'resume'):
+                        return self.rest(self.raised if tx.state is State.RAISED else self.success)
+                    return self.rest(self.success)
+
+                if self.base_thread_signal[Terminated] in fired:
+                    return self.rest(self.terminated)
+
+                for state in (State.PAUSED, State.STALLED, State.BLOCKED):
+                    if ts[state] in fired:
+                        # If this is the requested occupancy target, success;
+                        # otherwise release and continue driving.
+                        if self.drive_kind == 'park' and self.target is state:
+                            return self.rest(self.success)
+                        self.auto_release_current_state()
+                        return self.signals
+
+                # Reached/transaction state signals may have fired but been
+                # superseded; resample the current directive's success.
+                if self.drive_kind == 'park' and self.success_signal.sample(self.score.api):
+                    return self.rest(self.success)
+
+                return self.signals
+
+            def signal_until_impasse(self, fired):
+                if self.live_base_blocks():
+                    return self.rest(self.success)
+                if self.base_thread_signal[Terminated] in fired:
+                    return self.rest(self.terminated)
+                return self.signal_tx_drive(fired)
+
+            def signal(self, signals):
+                fired = set(signals)
+                if self.drive_kind == 'scan':
+                    return self.signal_scan(fired)
+                if self.drive_kind == 'wait' or self.drive_kind == 'resume':
+                    was_resume = self.drive_kind == 'resume'
+                    result = self.signal_wait(fired)
+                    if was_resume and self.state is self.success:
+                        self.callback_signal = None
+                    return result
+                if self.drive_kind == 'reenter':
+                    return self.signal_reenter(fired)
+                if self.drive_kind == 'until-terminated-watch':
+                    return self.signal_until_terminated(fired)
+                if self.drive_kind == 'until-impasse':
+                    return self.signal_until_impasse(fired)
+                return self.signal_tx_drive(fired)
 
             def __call__(self):
-                """Standalone alternative to Dispatch iteration: block
-                until this Driver yields (becomes ACTIVE or reaches a
-                terminal state).  Loops calling score.wait on the
-                Driver's published signals and feeding the fired
-                signals back to self.signal; exits when self.signals
-                goes empty, which is the same "ready to yield" marker
-                Dispatch uses."""
-                if self.done:
-                    self.reactivate()
-                self.drive()
-                while self.signals:
-                    fired = set(self.score.wait(self.signals))
-                    self.signal(fired)
+                if self.being_driven:
+                    raise RuntimeError(f"{self}: Driver is already being driven")
+                self.being_driven = True
+                try:
+                    while True:
+                        signals = self.proceed()
+                        if not signals:
+                            return
+                        fired = set(self.score.wait(signals))
+                        self.signal(fired)
+                        if not self.signals and self.route_iterator is None:
+                            return
+                finally:
+                    self.being_driven = False
+                    self.iterating_thread = None
+
 
 
         @base()
@@ -2356,6 +2620,20 @@ class Scenario:
                 # by dispatch.add(driver); dispatch.remove(driver)
                 # never fires the staged tx.unblock.
                 self.recent = deque()
+                self.driving = False
+                self.busy_drivers = set()
+
+            def mark_busy(self, driver):
+                if self.driving:
+                    driver.being_driven = True
+                    self.busy_drivers.add(driver)
+
+            def clear_busy(self):
+                for driver in self.busy_drivers:
+                    driver.being_driven = False
+                    driver.iterating_thread = None
+                self.busy_drivers.clear()
+                self.driving = False
 
             def __repr__(self):
                 return f"<Dispatch {len(self.drivers)} drivers {len(self.queue)} ready>"
@@ -2373,6 +2651,7 @@ class Scenario:
                     or any(item is driver for item in self.recent)):
                     return
                 driver.register(self)
+                self.mark_busy(driver)
                 self.recent.append(driver)
 
             def advance_chain_after(self, driver):
@@ -2493,64 +2772,81 @@ class Scenario:
                         d = item.promote()
                         if d is not None:
                             d.register(self)  # now owned by this Dispatch
+                            self.mark_busy(d)
                             self.driver_to_chain[d] = item
                             self.recent.append(d)
                         continue
                     # Driver.
-                    if item.done:
-                        item.reactivate()
-                    item.drive()
-                    signals = item.signals
+                    signals = item.proceed()
                     if signals:
                         self.drivers[item] = signals
                     else:
                         self.queue.append(item)
 
             def __next__(self):
-                while True:
-                    self.drain_recent()
-                    if self.queue:
-                        driver = self.queue.popleft()
-                        driver.unregister()
-                        # If the yielded driver was the current of a
-                        # Chain, advance the chain: clear its current
-                        # and, if pending isn't empty, put the chain
-                        # back in recent so the next iteration's drain
-                        # promotes the new head.  Chain stays owned
-                        # by this Dispatch even when it ends up empty.
-                        if driver in self.driver_to_chain:
-                            self.advance_chain_after(driver)
-                        return driver
+                if self.driving:
+                    raise RuntimeError("can't iterate Dispatch recursively")
+                self.driving = True
+                try:
+                    for driver in list(self.drivers) + list(self.queue):
+                        self.mark_busy(driver)
+                    for item in self.recent:
+                        if not isinstance(item, self.score.Chain):
+                            self.mark_busy(item)
 
-                    if not self.drivers:
-                        raise StopIteration
+                    while True:
+                        self.drain_recent()
+                        if self.queue:
+                            driver = self.queue.popleft()
+                            driver.unregister()
+                            # If the yielded driver was the current of a
+                            # Chain, advance the chain: clear its current
+                            # and, if pending isn't empty, put the chain
+                            # back in recent so the next iteration's drain
+                            # promotes the new head.  Chain stays owned
+                            # by this Dispatch even when it ends up empty.
+                            if driver in self.driver_to_chain:
+                                self.advance_chain_after(driver)
+                            return driver
 
-                    all_signals = set()
-                    signal_to_driver = {}
-                    for driver, signals in self.drivers.items():
-                        assert not (all_signals & signals)
-                        all_signals |= signals
-                        for signal in signals:
-                            signal_to_driver[signal] = driver
+                        if not self.drivers:
+                            raise StopIteration
 
-                    signaled = list(self.score.wait(all_signals))
+                        all_signals = set()
+                        signal_to_driver = {}
+                        for driver, signals in self.drivers.items():
+                            assert not (all_signals & signals)
+                            all_signals |= signals
+                            for signal in signals:
+                                signal_to_driver[signal] = driver
 
-                    ready = defaultdict(set)
-                    for signal in signaled:
-                        driver = signal_to_driver[signal]
-                        ready[driver].add(signal)
+                        signaled = list(self.score.wait(all_signals))
 
-                    for driver, signals in ready.items():
-                        if driver not in self.drivers:
-                            # driver was removed while we were asleep
-                            continue
+                        ready = defaultdict(set)
+                        for signal in signaled:
+                            driver = signal_to_driver[signal]
+                            ready[driver].add(signal)
 
-                        signals = driver.signal(signals)
-                        if signals:
-                            self.drivers[driver] = signals
-                        else:
+                        for driver, signals in ready.items():
+                            if driver not in self.drivers:
+                                # driver was removed while we were asleep
+                                continue
+
+                            driver.signal(signals)
+                            if driver.signals:
+                                self.drivers[driver] = driver.signals
+                                continue
+
+                            if driver.route_iterator is not None or not driver.slot_empty():
+                                signals = driver.proceed()
+                                if signals:
+                                    self.drivers[driver] = signals
+                                    continue
+
                             del self.drivers[driver]
                             self.queue.append(driver)
+                finally:
+                    self.clear_busy()
 
             def close(self):
                 """Close all objects (Chains and Drivers) inside
@@ -2737,7 +3033,7 @@ class Scenario:
                 d = self.Driver(entry.thread, entry.base_tx)
                 entry.driver = d
                 drivers.append(d)
-                d()
+                d.scan(); d()
                 if d.state is d.impasse:
                     raise RuntimeError(
                         f"deliver: thread {entry.thread.name!r} base tx is "
@@ -2750,7 +3046,7 @@ class Scenario:
                     raise RuntimeError(
                         f"deliver: thread {entry.thread.name!r} terminated "
                         f"before pushing a queue call")
-                if d.state is not d.active:
+                if d.state is not d.success or d.tx is None or d.tx.done:
                     raise RuntimeError(
                         f"deliver: thread {entry.thread.name!r} stopped in "
                         f"unexpected Driver state {d.state.name}")
@@ -2792,12 +3088,11 @@ class Scenario:
                         entry = pending.pop(0)
 
                     d = entry.driver
-                    d.finish(autoskip=True)
-                    d()
+                    self.driver_finish_deep(d)
                     tx = entry.tx
                     if tx.state is State.RAISED:
                         raise tx.result
-                    if d.state is not d.finished:
+                    if not tx.done or d.state is not d.success:
                         raise RuntimeError(
                             f"deliver: thread {entry.thread.name!r} stopped "
                             f"in unexpected Driver state {d.state.name}")
@@ -2818,6 +3113,86 @@ class Scenario:
                     if not d.done:
                         d.close()
 
+
+        def driver_finish_deep(self, d):
+            """Drive d.tx and any surfaced children to terminal explicitly.
+
+            This is the internal replacement for the old Driver.skip /
+            autoskip behavior.  It uses ordinary Driver directives: a
+            surfaced child is finished, then scan() reselects the parent.
+            """
+            root = d.tx
+            if root is None:
+                raise RuntimeError("finish_deep requires a selected transaction")
+            while not root.done:
+                if d.tx is None or d.tx.done:
+                    d.scan(); d()
+                    if d.state is not d.success:
+                        return
+                d.finish(); d()
+                if d.state in (d.terminated, d.raised, d.impasse,
+                               d.overshot, d.mutated):
+                    return
+                if d.tx is not root:
+                    continue
+            return
+
+        def driver_pause_deep(self, d):
+            """Drive d.tx to PAUSED, explicitly disposing surfaced children."""
+            root = d.tx
+            if root is None:
+                raise RuntimeError("pause_deep requires a selected transaction")
+            while True:
+                if d.tx is None or d.tx.done:
+                    d.scan(); d()
+                    if d.state is not d.success:
+                        return
+                if d.tx is not root:
+                    self.driver_finish_deep(d)
+                    continue
+                d.pause(); d()
+                if d.state is not d.success:
+                    return
+                if d.tx is root and root.state is State.PAUSED:
+                    return
+                # A child surfaced while trying to pause root.
+                continue
+
+
+        def route_finish_deep(self, d):
+            root = d.tx
+            while root is not None and not root.done:
+                if d.tx is None or d.tx.done:
+                    d.scan()
+                    yield
+                    if d.state is not d.success:
+                        return
+                d.finish()
+                yield
+                if d.state is not d.success:
+                    return
+                # If a child surfaced, loop finishes it.  If a child just
+                # finished, the next scan reselects the parent.
+
+        def route_pause_deep(self, d):
+            root = d.tx
+            while root is not None:
+                if d.tx is None or d.tx.done:
+                    d.scan()
+                    yield
+                    if d.state is not d.success:
+                        return
+                if d.tx is not root:
+                    yield from self.route_finish_deep(d)
+                    if d.state is not d.success:
+                        return
+                    continue
+                d.pause()
+                yield
+                if d.state is not d.success:
+                    return
+                if root.state is State.PAUSED:
+                    return
 
         def _drive_named(self, plan, caller):
             """Shared engine for skip / park / pause.  Drives the named
@@ -2873,6 +3248,21 @@ class Scenario:
                     d = self.Driver(thread, base_tx)
                     drivers.append(d)
                     tasks[d] = [thread, base_tx, methods, 0]
+                    try:
+                        d.scan()
+                    except RuntimeError as e:
+                        if base_tx is not None:  # pragma: no cover
+                            method = methods[0]
+                            if base_tx.done:  # coverage: defensive
+                                raise RuntimeError(
+                                    f"{caller}: thread {thread.name!r} base tx ended "
+                                    f"before reaching nested {method.__name__!r}") from None
+                            if base_tx.state in self.Driver.blanket_controlled_states:  # coverage: defensive
+                                raise RuntimeError(
+                                    f"{caller}: thread {thread.name!r} base tx is "
+                                    f"blanket-parked, can't reach nested "
+                                    f"{method.__name__!r}") from None
+                        raise  # pragma: no cover
                     dispatch.add(d)
 
                 for d in dispatch:
@@ -2880,69 +3270,101 @@ class Scenario:
                     method = methods[index]
                     state = d.state
 
-                    if state is d.impasse:
+                    if state is d.impasse:  # coverage: defensive
                         raise RuntimeError(
                             f"{caller}: thread {thread.name!r} base tx is "
                             f"blanket-parked, can't reach nested "
                             f"{method.__name__!r}")
                     if state is d.terminated:
-                        if base_tx is not None:
+                        if base_tx is not None:  # pragma: no cover  # coverage: defensive
                             raise RuntimeError(
                                 f"{caller}: thread {thread.name!r} base tx ended "
                                 f"before reaching nested {method.__name__!r}")
                         raise RuntimeError(
                             f"{caller}: thread {thread.name!r} terminated before "
                             f"reaching {method.__name__!r}")
+                    if (state is d.raised
+                            and d.tx is not None
+                            and d.tx.done
+                            and result.get(thread) is d.tx):
+                        state = d.success
+                    elif state in (d.raised, d.overshot, d.mutated, d.returned):  # coverage: defensive
+                        raise RuntimeError(
+                            f"{caller}: thread {thread.name!r} stopped in "
+                            f"unexpected Driver state {state.name}")
 
-                    if state is d.finished:
-                        # skip drove the current method's tx to terminal;
-                        # advance to the next method (or finish the task).
-                        index += 1
-                        tasks[d][3] = index
-                        if index < len(methods):
-                            dispatch.add(d)   # drain reactivates + surfaces next
+                    if state is not d.success:  # coverage: defensive
+                        raise RuntimeError(
+                            f"{caller}: thread {thread.name!r} stopped in "
+                            f"unexpected Driver state {state.name}")
+
+                    tx = d.tx
+                    if tx is None:  # coverage: defensive
+                        d.scan()
+                        dispatch.add(d)
                         continue
 
-                    if state is d.parked:
-                        # park / pause landed (block / pause); task done.
+                    if tx.done:
+                        if caller == 'skip' and result.get(thread) is tx:
+                            index += 1
+                            tasks[d][3] = index
+                            if index < len(methods):
+                                d.scan()
+                                dispatch.add(d)
+                            continue
+                        # park drove over a nonmatching transaction.
+                        if base_tx is not None and base_tx.done:
+                            raise RuntimeError(
+                                f"{caller}: thread {thread.name!r} base tx ended "
+                                f"before reaching nested {method.__name__!r}")
+                        d.scan()
+                        dispatch.add(d)
                         continue
 
-                    assert state is d.active
-                    d_tx_method_matches = d.tx.method == method
+                    if result.get(thread) is tx:
+                        if caller in ('park', 'block'):  # coverage: defensive
+                            # The matched tx is already parked at BLOCKED;
+                            # the operation is complete.
+                            continue
+                        if caller == 'pause':  # coverage: defensive
+                            if tx.state is not State.PAUSED:  # coverage: defensive
+                                raise RuntimeError(
+                                    f"{caller}: thread {thread.name!r} stopped "
+                                    f"at {tx.state.name}, expected PAUSED")
+                            continue
+
+                    d_tx_method_matches = tx.method == method
                     if not d_tx_method_matches:
                         core = method.__self__._core
-                        method = core.normalize(method)
-                        d_tx_method_matches = d.tx.normalized_method == method
+                        cooked = core.normalize(method)
+                        d_tx_method_matches = tx.normalized_method == cooked
 
                     if d_tx_method_matches:
-                        result[thread] = d.tx
+                        result[thread] = tx
                         if caller == 'skip':
-                            d.finish(autoskip=True)
+                            d.route(lambda dd, self=self: self.route_finish_deep(dd))
                             dispatch.add(d)
                         elif caller in ('park', 'block'):
-                            if d.tx.state != State.BLOCKED:
+                            if tx.state != State.BLOCKED:
                                 raise RuntimeError(
                                     f"{caller}: thread {thread.name!r} reached "
                                     f"{method.__name__!r} but it is in "
-                                    f"{d.tx.state.name} state, not BLOCKED state")
-                            d.block()
-                            dispatch.add(d)
+                                    f"{tx.state.name} state, not BLOCKED state")
+                            # scan() succeeded with the matched tx already
+                            # parked at BLOCKED.  Leave it there and finish.
+                            continue
                         else:   # pause
-                            d.pause(autoskip=True)
+                            d.route(lambda dd, self=self: self.route_pause_deep(dd))
                             dispatch.add(d)
                     elif caller == 'park':
-                        # drive over the non-matching tx (skip lands IDLE,
-                        # so the next tx / child surfaces) and keep looking.
-                        d.skip(autoskip=True)
+                        d.route(lambda dd, self=self: self.route_finish_deep(dd))
                         dispatch.add(d)
                     else:
-                        # skip / pause are strict: the named call must be
-                        # next; anything else is a divergence.
                         where = ("base tx's next child" if base_tx is not None
                                  else "next tx")
                         raise RuntimeError(
                             f"{caller}: thread {thread.name!r} {where} was "
-                            f"{d.tx.method.__name__!r}, expected "
+                            f"{tx.method.__name__!r}, expected "
                             f"{method.__name__!r}")
             finally:
                 for d in drivers:
@@ -4272,6 +4694,11 @@ class Scenario:
 
                 return (threads, txs)
 
+            def thread_to_tx(self, thread, caller):
+                """Translate one user-facing thread spec into an active tx core."""
+                _threads, txs = self.threads_to_txs((thread,), caller)
+                return txs[0]
+
 
             @base()
             @BoundInnerClass
@@ -4363,7 +4790,6 @@ class Scenario:
                         self.core_parent = self.find_parent_core(parent, core)
                         self.method_parent = self.find_parent_method(parent, method)
                         self.depth = 0 if self.method_parent is None else self.method_parent.depth + 1
-                        parent.child = self
                     else:
                         self.core_parent = None
                         self.method_parent = None
@@ -4415,11 +4841,10 @@ class Scenario:
                     return None
 
                 def is_delegate(self, child):
-                    """Return True if `child` is a nested tx that
-                    represents delegated work this tx wants the Driver
-                    to drive as if it were a top-level tx.  Default
-                    False: nested children are surfaced to the caller
-                    unless the active Driver imperative enabled autoskip.
+                    """Return True if `child` is nested work this tx
+                    wants Driver helpers to drive as if it were a
+                    top-level tx.  Default False: nested children are
+                    surfaced to the caller.
 
                     Override on parent tx classes whose children are
                     operationally significant -- the children visit
@@ -4428,15 +4853,9 @@ class Scenario:
                     Example: cond.wait_for whose body iterates,
                     spawning a child cond.wait per iteration.
 
-                    Driver consults this at two points:
-                      * Walk-up in pursue: walk-up stops if the
-                        current tx's parent says it's a delegate
-                        (and pursue's target is a tx state, not a
-                        driver-terminal).
-                      * Nested-fire signal handler: when a child is
-                        born mid-pursue and the current tx (parent)
-                        says it's a delegate, redirect focus to the
-                        child without going to skipping.
+                    Internal route/deep-drive helpers consult this when
+                    deciding whether to follow a surfaced child or return
+                    to the scheduler for explicit direction.
                     """
                     return False
 
@@ -4753,7 +5172,7 @@ class Scenario:
                             f"scheduler-controlled parking state "
                             f"(in {state.name})")
 
-                def validate(self, *, method=None, state=None, method_description=None, caller):
+                def validate(self, *, method=None, state=None, method_description=None, caller=None):
                     """Validate a tx's method/state.
 
                     Called with score.lock held.  Returns tx for convenient
@@ -4771,8 +5190,11 @@ class Scenario:
                         mine = self.normalized_method
                         method_matches = False
                         for candidate in methods:
-                            core = candidate.__self__._core
-                            cooked = core.normalize(candidate)
+                            try:
+                                core = candidate.__self__._core
+                                cooked = core.normalize(candidate)
+                            except AttributeError:
+                                continue
                             if self.method == candidate or mine == cooked:
                                 method_matches = True
                                 break
@@ -4832,6 +5254,8 @@ class Scenario:
                         score.transactions[thread] = self
                         core.transactions[thread] = self
                         score.transaction_apis[thread] = self.api
+                        if parent is not None:
+                            parent.child = self
 
                         self.signals_thread = parent is None
 
@@ -4960,12 +5384,6 @@ class Scenario:
 
                     score.log.append(self.api)
 
-                    # tx and tx.api both signal when the tx terminates
-                    # and stay signaled forever after.  Cleared by
-                    # scenario.reset() (auto-called on context exit).
-                    score.signal(self)
-                    score.signal(self.api)
-
                     assert not self.state_observers
 
                     # Clear parent.child unconditionally.  __init__ sets
@@ -5030,6 +5448,15 @@ class Scenario:
                             # the chain change above already took Thread(t)
                             # low so the assertion holds.
                             score.signal(Not(thread))
+
+                    # tx and tx.api both signal when the tx terminates
+                    # and stay signaled forever after.  Cleared by
+                    # scenario.reset() (auto-called on context exit).
+                    # This is deliberately after transaction registry
+                    # updates, so observers never see tx-end before the
+                    # thread's current transaction has been unpublished.
+                    score.signal(self)
+                    score.signal(self.api)
 
             @base()
             @BoundInnerClass
@@ -5544,19 +5971,19 @@ class Scenario:
                 releaser_driver = None
                 if releaser:
                     releaser_driver = score.Driver(releaser, releaser_base)
+                    releaser_driver.scan()
                     dispatch.add(releaser_driver)
                 acquirer_driver = score.Driver(acquirer, acquirer_base)
+                acquirer_driver.scan()
                 dispatch.add(acquirer_driver)
                 bases = {releaser_driver: releaser_base,
                          acquirer_driver: acquirer_base}
 
-                # Phase 1: validate each driver as it yields ACTIVE.
-                # Both are in dispatch from the start; yield order
-                # doesn't matter -- each is validated against its
-                # expected role, and either failing raises before any
-                # tx makes progress.  With a base tx, a driver may
-                # instead land IMPASSE (base blanket-parked) or
-                # TERMINATED (base exited first); both raise cleanly.
+                # Phase 1: validate each driver as it yields success
+                # with an active transaction selected.  Both are in
+                # dispatch from the start; yield order doesn't matter --
+                # each is validated against its expected role, and either
+                # failing raises before any tx makes progress.
                 for d in dispatch:
                     if d is releaser_driver:
                         thread = releaser
@@ -5567,7 +5994,7 @@ class Scenario:
                         thread = acquirer
                         method = self.primitive.acquire
                         role = 'acquire'
-                    if d.state is d.impasse:
+                    if d.state is d.impasse:  # coverage: defensive
                         raise RuntimeError(
                             f"assign: thread {thread.name!r} base tx is "
                             f"blanket-parked, can't reach its {role}")
@@ -5579,7 +6006,7 @@ class Scenario:
                         raise RuntimeError(
                             f"assign: thread {thread.name!r} terminated before "
                             f"reaching its {role}")
-                    assert d.state is d.active, f"expected {role} driver to be in active state, not {d.state!r}"
+                    assert d.state is d.success and d.tx is not None and not d.tx.done, f"expected {role} driver to have an active tx, not {d.state!r}"
                     if d.tx.method != method:
                         raise RuntimeError(f"expected {thread.name!r} to call {method}, not {d.tx.method}")
                     if d.tx.state is not State.BLOCKED:
@@ -5587,11 +6014,11 @@ class Scenario:
                             f"expected {thread.name!r} {role} tx to be BLOCKED, "
                             f"not {d.tx.state.name}")
 
-                # Phase 2: drive the releaser (if any) to finished.
+                # Phase 2: drive the releaser (if any) through its
+                # current transaction.
                 if releaser_driver:
-                    releaser_driver.finish()
-                    releaser_driver()
-                    assert releaser_driver.state is d.finished, f"expected releaser driver to be finished, not {releaser_driver.state!r}"
+                    score.driver_finish_deep(releaser_driver)
+                    assert releaser_driver.tx.done and releaser_driver.state is releaser_driver.success, f"expected releaser driver to finish, not {releaser_driver.state!r}"
                     # release can raise (lock not held, RLock not
                     # owned by us, etc.).  The worker thread saw the
                     # real exception; we surface a chained RuntimeError
@@ -5604,13 +6031,10 @@ class Scenario:
 
                 # Phase 3: drive the acquirer to its final state.
                 if pause:
-                    acquirer_driver.pause()
-                    final_state = acquirer_driver.parked
+                    score.driver_pause_deep(acquirer_driver)
                 else:
-                    acquirer_driver.finish()
-                    final_state = acquirer_driver.finished
-                acquirer_driver()
-                assert acquirer_driver.state is final_state, f"expected acquirer driver to be {final_state.name}, not {acquirer_driver.state!r}"
+                    score.driver_finish_deep(acquirer_driver)
+                assert acquirer_driver.state is acquirer_driver.success, f"expected acquirer driver to succeed, not {acquirer_driver.state!r}"
                 # acquire returning False means the actual.X call
                 # timed out (either originally or via tx.expire()).
                 # Detect and raise at the scheduler.
@@ -5657,11 +6081,9 @@ class Scenario:
                 iteration's releaser.
 
                 For iter > 0, the releaser is the prior iter's
-                acquirer in `finished` state; dispatch.add reactivates
-                it (refreshing cache_tx).  If the worker hasn't yet
-                called release(), the Driver lands in `idle` and
-                dispatch waits on its thread signal until the new
-                release tx is created.
+                acquirer after a successful drive.  scan() is used to
+                select its next release transaction before validating
+                the role.
 
                 Caller (API method) holds score.lock through setup.
                 The returned generator manages score.lock itself
@@ -5679,7 +6101,7 @@ class Scenario:
                 TERMINATED (base_tx exited first, or the thread died
                 before reaching its op).  Called after driving, before
                 validate, at each relay drive point."""
-                if driver.state is driver.impasse:
+                if driver.state is driver.impasse:  # coverage: defensive
                     raise RuntimeError(
                         f"relay: thread {driver.thread.name!r} base tx is "
                         f"blanket-parked, can't reach its {role}")
@@ -5701,9 +6123,9 @@ class Scenario:
                     lock.acquire()
                     locked = True
 
-                    # Drive initial validate its role.  ACTIVE Driver:
-                    # drain_recent yields it immediately, no drive.
+                    # Drive initial and validate its role.
                     initial = drivers[0]
+                    initial.scan()
                     initial()
                     self._relay_check(initial, 'release or acquire')
                     initial.tx.validate(
@@ -5732,6 +6154,7 @@ class Scenario:
 
                         if releaser is not None:
                             if drive_and_validate_releaser:
+                                releaser.scan()
                                 releaser()
                                 self._relay_check(releaser, 'release')
                                 releaser.tx.validate(
@@ -5753,6 +6176,7 @@ class Scenario:
                                 ) from releaser.tx.result
 
                         if drive_and_validate_acquirer:
+                            acquirer.scan()
                             acquirer()
                             self._relay_check(acquirer, 'acquire')
                             acquirer.tx.validate(
@@ -5766,8 +6190,8 @@ class Scenario:
                         # timeout on the acquire tx so a pending
                         # timeout doesn't preempt the relay.
                         # d.pausing() increments tx.pausing (scheduler-
-                        # side, no flag) and unblocks atomically inside
-                        # pursue, so the acquirer parks at PAUSED when
+                        # side, no flag) and unblocks atomically when
+                        # driven, so the acquirer parks at PAUSED when
                         # actual.acquire returns.
                         acquirer.tx.disregard()
                         acquirer.pausing()
@@ -5795,13 +6219,13 @@ class Scenario:
 
                         # This iter's acquirer becomes next iter's
                         # releaser.  Same Driver, same thread; the
-                        # next loop top reactivates it onto the new
+                        # next loop top scans it onto the new
                         # release tx.
                         releaser = acquirer
                 finally:
                     # Driver close needs score.lock; acquire if not
                     # currently held.  Happy path: every Driver is
-                    # parked/finished (terminal) and close() already
+                    # success/terminal and close() already
                     # ran from Driver.to(), so the loop below is a
                     # no-op.  Exception or early generator close
                     # path: non-terminal Drivers get their slots
@@ -5811,7 +6235,7 @@ class Scenario:
                         lock.acquire()
                     try:
                         for d in drivers:
-                            if not d.done:
+                            if not d.done:  # pragma: no cover
                                 d.close()
                     finally:
                         lock.release()
@@ -6142,12 +6566,10 @@ class Scenario:
 
                 self.ready is a dict mapping thread to Driver,
                 in spec order (dicts preserve insertion order).  The
-                Drivers are in `parked` state (their score-slots
-                already released by Driver.close, which runs on
-                entering any terminal state including parked).  The
-                wake/pause/close methods reactivate each Driver (via
-                pursue's auto-reactivate from parked) before driving
-                it past PAUSED.
+                Drivers are at `success`, with their transactions
+                parked at the cycle's post-trigger state.  The
+                wake/pause/close methods issue explicit directives to
+                drive those transactions onward.
 
                 Subclasses must implement __init__ (which validates
                 inputs, fires the wake-causing event, and publishes
@@ -6193,6 +6615,7 @@ class Scenario:
                         seen.add(t)
                         d = score.Driver(t, base)
                         self.drivers.append(d)
+                        d.scan()
                         self.dispatch.add(d)
 
                 def check_base(self, d, role):
@@ -6256,10 +6679,9 @@ class Scenario:
                         #   * tx.pausing += 1       -- user's incref balances
                         #   * tx.unpausing()        -- cycle releases its incref
                         # Net counter unchanged, flag now True.  The
-                        # Driver stays in its parked terminal state
-                        # (close already ran via to(parked) when it
-                        # reached PAUSED during cycle init -- no need
-                        # to call it again).
+                        # Driver stays at success; the transaction
+                        # remains parked at PAUSED and is now owned by
+                        # the caller's pause flag/incref.
                         for d in drivers:
                             tx = d.tx
                             tx.pause = True
@@ -6772,13 +7194,13 @@ class Scenario:
                     self.notified = False
 
                     try:
-                        # Drain to ACTIVE and validate each against its
+                        # Drain to success and validate each against its
                         # role.  The waker is last.
                         waker = self.incoming[-1]
                         for d in self.dispatch:
                             self.check_base(
                                 d, 'cond.notify' if d is waker else 'cond.wait')
-                            assert d.state is d.active
+                            assert d.state is d.success and d.tx is not None and not d.tx.done
                             if d is waker:
                                 d.tx.validate(
                                     method=core.notify_methods + (self.ul_acquire,),
@@ -6820,7 +7242,7 @@ class Scenario:
                         # incoming, all to be drained later -- so we do
                         # NOT close on success.)
                         for d in self.drivers:
-                            if not d.done:
+                            if not d.done:  # pragma: no cover
                                 d.close()
                         raise
 
@@ -6853,7 +7275,7 @@ class Scenario:
                                 state=State.STALLED,
                                 method_description='cond.wait',
                                 caller=self.caller)
-                            assert yielded.state is yielded.parked
+                            assert yielded.state is yielded.success
                         self.ready.extend(self.waiting)
                         self.waiting = []
 
@@ -6868,16 +7290,16 @@ class Scenario:
                     caller = self.caller
 
                     # If it entered at UL.acquire, free UL, drive the
-                    # acquire to terminal, and reactivate into the
+                    # acquire to terminal, then scan into the
                     # cond.wait / wait_for that follows.
                     if d.tx.method == self.ul_acquire:
                         self.ensure_ul_free()
                         d.finish()
                         d()
-                        assert d.state is d.finished
+                        assert d.state is d.success and d.tx.done
                         d.reactivate()
                         d()
-                        assert d.state is d.active
+                        assert d.state is d.success and d.tx is not None and not d.tx.done
                         d.tx.validate(
                             method=core.wait_entry_methods,
                             state=(State.BLOCKED, State.COMMIT, State.WAITING),
@@ -6899,48 +7321,47 @@ class Scenario:
                         d.listen_predicate = True
                         d.pausing()
                         d()
-                        while d.state is d.reentered:
+                        if d.tx.state is State.PAUSED:
+                            d.listen_predicate = False
+                            return 'ready'
+                        while d.callback_signal == Predicate(wf):
                             if self.scheduler is not _do_nothing:
                                 with unlock(score.lock):
                                     self.scheduler(wf)
-                            score.wait((Not(Predicate(wf)),))
-                            fired = score.wait((Nested(wf), Paused(wf), wf))
-                            if Paused(wf) in fired:
+                            d.resume()
+                            d()
+                            d.wait(Nested(wf), Paused(wf), wf)
+                            d()
+                            fired = d.signaled
+                            if Paused(wf) in fired:  # coverage: defensive
                                 d.listen_predicate = False
-                                # Immediate success: predicate true, so the
-                                # wait_for is heading to PAUSED.  The first
-                                # pausing() above auto-released its incref
-                                # when the Driver yielded at REENTERED, so
-                                # re-issue pausing() to park at PAUSED with
-                                # exactly one incref -- the Driver holds it
-                                # until act_one wakes the waiter.
                                 d.pausing()
                                 d()
-                                assert d.state is d.parked
+                                assert d.state is d.success
                                 assert d.tx.state is State.PAUSED
                                 return 'ready'
-                            # Nested(wf) can go high as soon as the
-                            # child object is attached, just before it is
-                            # published as the thread's current tx.  Wait
-                            # for the actual cond.wait child to reach
-                            # BLOCKED before asking the Driver to park it
-                            # at WAITING.
-                            score.wait((Call(d.thread, core.primitive.wait, State.BLOCKED),))
-                            d.listen_predicate = False
-                            d.wait()
-                            d()
-                            assert d.state is d.parked
-                            assert d.tx.state is State.WAITING
-                            self.wait_for_drivers.add(d)
-                            return 'waiting'
+                            if Nested(wf) in fired:
+                                d.listen_predicate = False
+                                d.scan(d.tx)
+                                d()
+                                d.waiting()
+                                d()
+                                assert d.state is d.success
+                                assert d.tx.state is State.WAITING
+                                self.wait_for_drivers.add(d)
+                                return 'waiting'
+                            if wf in fired:  # coverage: defensive
+                                d.listen_predicate = False
+                                return 'ready'
+                        d.listen_predicate = False
                         raise RuntimeError(
                             f"{caller}: wait_for predicate neither waited "
                             "nor succeeded")
 
-                    # Plain cond.wait -> drive to parked@WAITING.
-                    d.wait()
+                    # Plain cond.wait -> drive to WAITING.
+                    d.waiting()
                     d()
-                    assert d.state is d.parked
+                    assert d.state is d.success
                     assert d.tx.state is State.WAITING
                     return 'waiting'
 
@@ -6960,10 +7381,10 @@ class Scenario:
                         self.ensure_ul_free()
                         waker.finish()
                         waker()
-                        assert waker.state is waker.finished
+                        assert waker.state is waker.success and waker.tx.done
                         waker.reactivate()
                         waker()
-                        assert waker.state is waker.active
+                        assert waker.state is waker.success and waker.tx is not None and not waker.tx.done
                         waker.tx.validate(
                             method=core.notify_methods,
                             state=State.BLOCKED,
@@ -7011,7 +7432,7 @@ class Scenario:
                     # Fire notify by driving the waker to terminal.
                     waker.finish()
                     waker()
-                    assert waker.state is waker.finished
+                    assert waker.state is waker.success and waker.tx.done
                     if waker.tx.state == State.RAISED:
                         raise waker.tx.result
                     self.notified = True
@@ -7035,7 +7456,9 @@ class Scenario:
                         raise RuntimeError(
                             f"{caller}: the underlying lock is held but "
                             "there is no previous thread to release it")
-                    prev()
+                    if prev.tx is None or prev.tx.done:
+                        prev.scan()
+                        prev()
                     if prev.state is prev.terminated:
                         raise RuntimeError(
                             f"{caller}: previous thread {prev.thread.name!r} "
@@ -7047,9 +7470,8 @@ class Scenario:
                             f"{caller}: can't free the underlying lock; "
                             f"previous thread {prev.thread.name!r} is not at "
                             "lock.release")
-                    prev.finish()
-                    prev()
-                    assert prev.state is prev.finished
+                    self.core.score.driver_finish_deep(prev)
+                    assert prev.state is prev.success and prev.tx.done
                     assert not core.underlying.actual_held()
 
                 def find_ready(self, thread):
@@ -7157,10 +7579,9 @@ class Scenario:
                         # wake: skip past the already-succeeded wait_for
                         # (skip frog-marches past PAUSED, releasing the
                         # cycle's pausing incref) so the thread runs on to
-                        # its lock.release, where the Driver yields ACTIVE
+                        # its lock.release, where scan yields success
                         # -- left for the relay (or close()).
-                        d.skip()
-                        d()
+                        score.driver_finish_deep(d)
                         self.previous = d
                         return
 
@@ -7180,9 +7601,8 @@ class Scenario:
                         # wake: skip the (post-notify) cond.wait so it
                         # reacquires UL, returns, and the thread runs on
                         # to its lock.release, where the Driver yields
-                        # ACTIVE -- left for the relay (or close()).
-                        d.skip()
-                        d()
+                        # success -- left for the relay (or close()).
+                        score.driver_finish_deep(d)
                         self.previous = d
                         return
 
@@ -7221,10 +7641,12 @@ class Scenario:
                                 # Nested(wf) can beat publication of the
                                 # actual cond.wait child as the current tx;
                                 # wait for the child to be parked at BLOCKED
-                                # before Driver.wait() tries to drive it to
+                                # before Driver.waiting() tries to drive it to
                                 # WAITING.
                                 score.wait((Call(d.thread, core.primitive.wait, State.BLOCKED),))
-                                d.wait()
+                                d.scan()
+                                d()
+                                d.waiting()
                                 d()
                                 self.previous = d
                                 return
@@ -7239,42 +7661,54 @@ class Scenario:
                                 "cycle: wait() expected the predicate to "
                                 "wait again, but the wait_for exited")
 
-                    d.listen_predicate = True
+                    # Finish the just-notified inner wait.  The parent
+                    # wait_for may re-run its predicate immediately after
+                    # the child exits, before a subsequent scan() can catch
+                    # it, so arm the requested PAUSED hold up front for
+                    # pause() and then watch the parent signals directly.
+                    parent = wf._core
+                    armed_pause = False
                     if verb == 'pause':
-                        d.pause()
-                    else:
-                        d.finish()
+                        parent.pause = True
+                        parent.pausing += 1
+                        armed_pause = True
+
+                    d.finish()
                     d()
-                    while d.state is d.reentered:
-                        with unlock(score.lock):
-                            if self.scheduler is not _do_nothing:
-                                self.scheduler(wf)
-                        score.wait((Not(Predicate(wf)),))
-                        signals = (Nested(wf), Paused(wf), wf,
-                                   Terminated(d.thread))
-                        fired = score.wait(signals)
+                    signals = (Predicate(wf), Nested(wf), Paused(wf), wf,
+                               Terminated(d.thread))
+                    while True:
+                        d.wait(*signals)
+                        d()
+                        fired = d.signaled
+                        if Predicate(wf) in fired:
+                            with unlock(score.lock):
+                                if self.scheduler is not _do_nothing:
+                                    self.scheduler(wf)
+                            score.wait((Not(Predicate(wf)),))
+                            continue
                         if Terminated(d.thread) in fired:
-                            d.listen_predicate = False
+                            if armed_pause and not parent.done:  # coverage: defensive
+                                parent.pause = False
+                                parent.pausing -= 1
                             self.previous = d
                             return
                         if verb == 'pause':
                             if Paused(wf) in fired:
-                                d.listen_predicate = False
                                 self.previous = d
                                 return
+                            if armed_pause and not parent.done:  # coverage: defensive
+                                parent.pause = False
+                                parent.pausing -= 1
                             raise RuntimeError(
                                 "cycle: pause() expected the wait_for to "
                                 "exit at PAUSED, but it waited again")
-                        # wake
                         if wf in fired:
-                            d.listen_predicate = False
                             self.previous = d
                             return
                         raise RuntimeError(
                             "cycle: wake() expected the wait_for to exit, "
                             "but it waited again")
-                    d.listen_predicate = False
-                    self.previous = d
 
                 def wake(self, threads):
                     return self.act(threads, 'wake')
@@ -7750,8 +8184,9 @@ class Scenario:
                     d = score.Driver(entry.thread, entry.base_tx)
                     entry.driver = d
                     drivers.append(d)
+                    d.scan()
                     d()
-                    if d.state is d.impasse:
+                    if d.state is d.impasse:  # coverage: defensive
                         raise RuntimeError(
                             f"allocate: thread {entry.thread.name!r} base tx "
                             f"is blanket-parked, can't reach its acquire "
@@ -7764,7 +8199,7 @@ class Scenario:
                         raise RuntimeError(
                             f"allocate: thread {entry.thread.name!r} "
                             f"terminated before pushing a tx")
-                    if d.state is not d.active:
+                    if d.state is not d.success or d.tx is None or d.tx.done:
                         raise RuntimeError(
                             f"allocate: thread {entry.thread.name!r} stopped "
                             f"in unexpected Driver state {d.state.name}")
@@ -7818,10 +8253,9 @@ class Scenario:
 
                         d = entry.driver
                         if entry.role == 'acquire' and pause:
-                            d.pause(autoskip=True)
+                            score.driver_pause_deep(d)
                         else:
-                            d.finish(autoskip=True)
-                        d()
+                            score.driver_finish_deep(d)
 
                         tx = entry.tx
                         if tx.state is State.RAISED:
@@ -7831,11 +8265,11 @@ class Scenario:
                             raise RuntimeError(
                                 f"allocate: acquire thread {entry.thread.name!r} {status}")
                         if entry.role == 'acquire' and pause:
-                            if d.state is not d.parked:
+                            if d.state is not d.success or tx.state is not State.PAUSED:
                                 raise RuntimeError(
                                     f"allocate: thread {entry.thread.name!r} stopped "
                                     f"in unexpected Driver state {d.state.name}")
-                        elif d.state is not d.finished:
+                        elif d.state is not d.success or not tx.done:
                             raise RuntimeError(
                                 f"allocate: thread {entry.thread.name!r} stopped "
                                 f"in unexpected Driver state {d.state.name}")
@@ -8860,11 +9294,11 @@ class Scenario:
                                 caller=caller)
 
                         for w in waiters:
-                            w.wait()
+                            w.waiting()
                             self.dispatch.add(w)
 
                         for d in self.dispatch:
-                            assert d.state is d.parked, f"expected parked, got {d.state}"
+                            assert d.state is d.success, f"expected parked, got {d.state}"
                             assert d.tx.state is State.WAITING, f"expected tx WAITING, got {d.tx.state}"
                         for d in waiters:
                             d.pausing()
@@ -8888,21 +9322,21 @@ class Scenario:
                         self.dispatch.add(setter)
 
                         for d in self.dispatch:
-                            assert d.state is d.parked, f"expected parked, got {d.state}"
+                            assert d.state is d.success, f"expected parked, got {d.state}"
                             assert d.tx.state is State.PAUSED, f"expected tx PAUSED, got {d.tx.state}"
                             assert d.tx.succeeded, f"tx didn't succeed (state {d.tx.state.name})"
 
                         # remaining = thread -> Driver mapping in
                         # specified order (waiters first, setter last);
                         # dicts preserve insertion order.
-                        self.ready = {d.thread: d for d in self.drivers}
+                        self.ready = {d.thread: d for d in self.drivers}  # pragma: no branch
                         self.extra_waiters = extra_waiters
                     finally:
                         # Close any Driver still holding a slot.  Happy
                         # path: every Driver is parked@PAUSED (terminal),
                         # close() already ran from Driver.to(), no-op.
                         for d in self.drivers:
-                            if not d.done:
+                            if not d.done:  # pragma: no cover
                                 d.close()
 
                 def repr(self):
@@ -9160,14 +9594,9 @@ class Scenario:
                     score = core.score
                     caller = 'cycle'
 
-                    # Scheduler without an action is meaningless: the
-                    # scheduler is the cycle's handle for driving any
-                    # regulated children the action spawns; if the
-                    # barrier has no action, no children get spawned,
-                    # so a scheduler would never be invoked for the
-                    # nested-tx case AND its action-complete late
-                    # call would have nothing to scheduler-ish around.
-                    if scheduler is not _do_nothing and core.user_action is None:
+                    have_action = core.user_action is not None
+
+                    if (scheduler is not _do_nothing) and (not have_action):
                         raise ValueError(
                             "cycle: scheduler= requires the Barrier "
                             "to have an action")
@@ -9209,6 +9638,8 @@ class Scenario:
                         waiting_count = 0
                         for d in self.dispatch:
                             self.check_base(d, 'barrier.wait')
+                            if d.tx.state is State.RAISED:  # coverage: defensive
+                                raise d.tx.result
                             d.tx.validate(
                                 method=primitives,
                                 state=(State.BLOCKED, State.WAITING),
@@ -9237,21 +9668,20 @@ class Scenario:
                         # lets OS scheduling interleave the actual.wait
                         # calls and randomizes index assignment.
                         # If the barrier breaks mid-drive, the
-                        # offending wait tx goes RAISED and pursue's
-                        # parking handler surfaces a RuntimeError
-                        # (overshoot); convert it to the underlying
-                        # BrokenBarrierError for caller clarity.
+                        # offending wait tx goes RAISED; convert that to
+                        # the underlying BrokenBarrierError for caller
+                        # clarity.
                         try:
                             for d in waiters:
                                 if d.tx.state is State.BLOCKED:
-                                    d.wait()
+                                    d.waiting()
                                     d()
                                 d.tx.validate(
                                     method=primitives,
                                     state=State.WAITING,
                                     caller=caller,
                                 )
-                        except RuntimeError:
+                        except (RuntimeError, ValueError):
                             for w in waiters:
                                 if w.tx.state == State.RAISED:
                                     raise w.tx.result
@@ -9259,24 +9689,39 @@ class Scenario:
 
                         for d in waiters:
                             d.pausing()
+                            self.dispatch.add(d)
+
+                        # Arm the waiter PAUSED holds before the opener
+                        # opens the barrier.  Otherwise a waiter can be
+                        # released by the underlying Barrier and return
+                        # before its cycle-owned PAUSED hold has been
+                        # installed.
+                        self.dispatch.drain_recent()
 
                         opener.pausing()
 
-                        # Fire each driver's staged lazy_work without
-                        # waiting on its yield-condition: dispatch.add
-                        # is bookkeeping, iteration would block in
-                        # score.wait, and the scheduler callback below
-                        # is the actor that advances state the wait
-                        # would block on (e.g. driving a child tx
-                        # spawned by the opener's action).  Drain
-                        # fires the work; the post-scheduler iteration
-                        # consumes the now-ready drivers.
-                        self.dispatch.update(self.drivers)
-                        self.dispatch.drain_recent()
+                        if have_action:
+                            opener.listen_action = True
+                            opener()
+                            assert opener.state is opener.success
+                            assert opener.callback_signal == Action(opener.tx.api)
+                            try:
+                                with unlock(score.lock):
+                                    scheduler(opener.tx.api)
+                            finally:
+                                opener.listen_action = False
 
-                        if scheduler is not _do_nothing:
-                            with unlock(score.lock):
-                                scheduler(opener.tx.api)
+                            opener.resume()
+                            opener()
+                            opener.wait(Paused(opener.tx.api), opener.tx.api,
+                                        Terminated(opener.thread))
+                            opener()
+                            if Paused(opener.tx.api) not in opener.signaled:  # coverage: defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener did not park "
+                                    "at PAUSED")
+                        else:
+                            self.dispatch.add(opener)
 
                         for d in self.dispatch:
                             d.tx.validate(
@@ -9288,11 +9733,11 @@ class Scenario:
                         # remaining = thread -> Driver mapping in spec
                         # order (waiters first, opener last); dicts
                         # preserve insertion order.
-                        self.ready = {d.thread: d for d in self.drivers}
+                        self.ready = {d.thread: d for d in self.drivers}  # pragma: no branch
                         self.extra_waiters = 0
                     finally:
                         for d in self.drivers:
-                            if not d.done:
+                            if not d.done:  # pragma: no cover
                                 d.close()
 
                 def repr(self):
@@ -9407,49 +9852,41 @@ class Scenario:
         """User-facing wrapper around the Driver state machine.
 
         A Driver attaches to a worker thread and drives it through
-        named transaction-state transitions: SKIPPING (let the tx
-        finish), PARKING (stop at a parking state and stay there),
-        FINISHING (stop after the tx exits), and so on.  Imperatives
-        on the Driver (skip, finish, block, commit, wait, stall,
-        pause) request a state transition; the Driver
-        advances the underlying tx and validates the result.
+        explicit staged directives.  A fresh Driver is undirected; use
+        scan() to select the thread's current published transaction,
+        then stage follow-up directives such as finish(), pause(),
+        wait(*signals), reenter(), resume(), until(), or route().
 
         Construct with a worker thread, optionally with a base
         transaction.  Driver objects claim the score's per-thread
-        driving slot only while actively driving, so multiple idle
-        Driver objects for a thread may coexist.  When a nested tx
-        appears, a raw Driver yields in NESTING state for the
-        caller to steer.  When the driven transaction is running a
-        user callback and that callback asks blanket for scheduler
-        help, a raw Driver yields in REENTERED.  High-level scenario
-        imperatives opt into autoskip where that is their documented
-        behavior.
+        driving slot only while actively driving, so multiple Driver
+        objects for a thread may coexist as long as only one is driven
+        at a time.
         """
 
         # State constants, accessible at instance OR class level.
-        idle       = base.Driver.idle
-        active     = base.Driver.active
-        skipping   = base.Driver.skipping
-        parking    = base.Driver.parking
-        finishing  = base.Driver.finishing
-        parked     = base.Driver.parked
-        finished   = base.Driver.finished
+        undirected = base.Driver.undirected
+        driving    = base.Driver.driving
+        success    = base.Driver.success
+        returned   = base.Driver.returned
+        overshot   = base.Driver.overshot
+        persisted  = base.Driver.persisted
+        mutated    = base.Driver.mutated
         raised     = base.Driver.raised
         terminated = base.Driver.terminated
-        impasse    = base.Driver.impasse  # base out of purview, frozen
-        nesting    = base.Driver.nesting  # NESTING state (child surfaced)
-        reentered  = base.Driver.reentered  # REENTERED state (callback reentry)
+        impasse    = base.Driver.impasse
 
-        driving_states  = base.Driver.driving_states
-        active_states   = base.Driver.active_states
+        driving_states  = frozenset((driving,))
         terminal_states = base.Driver.terminal_states
 
-        def __init__(self, scenario, thread, tx=None):
+        def __init__(self, scenario, thread, tx=None, *, route=None):
             score = scenario._core
             self._lock = score.lock
             with self._lock:
                 self._core = score.Driver(thread, tx._core if tx is not None else None)
                 score.driver_apis[self._core] = self
+                if route is not None:
+                    self._core.route(route, self)
 
         def __repr__(self):
             with self._lock:
@@ -9482,37 +9919,78 @@ class Scenario:
                 return tuple(t.api for t in self._core.txs)
 
         @property
+        def signaled(self):
+            with self._lock:
+                return self._core.signaled
+
+        @property
+        def directive(self):
+            with self._lock:
+                directive = self._core.directive
+                if directive is None:
+                    return None
+                return getattr(self, directive.__name__)
+
+        @property
+        def directive_args(self):
+            with self._lock:
+                return tuple(
+                    arg.api if isinstance(arg, self._core.score.Transaction) else arg
+                    for arg in self._core.directive_args)
+
+        @property
+        def routed(self):
+            with self._lock:
+                return self._core.routed
+
+        @property
         def done(self):
             with self._lock:
                 return self._core.done
 
-        def skip(self, autoskip=False):
+        def scan(self, base_tx=None):
             with self._lock:
-                self._core.skip(autoskip=autoskip)
+                self._core.scan(base_tx._core if base_tx is not None else None)
 
-        def finish(self, autoskip=False):
+        def finish(self):
             with self._lock:
-                self._core.finish(autoskip=autoskip)
+                self._core.finish()
 
         def block(self):
             with self._lock:
                 self._core.block()
 
-        def commit(self, autoskip=False):
+        def commit(self):
             with self._lock:
-                self._core.commit(autoskip=autoskip)
+                self._core.commit()
 
-        def wait(self, autoskip=False):
+        def wait(self, *signals):
             with self._lock:
-                self._core.wait(autoskip=autoskip)
+                self._core.wait(*signals)
 
-        def stall(self, autoskip=False):
+        def route(self, route):
             with self._lock:
-                self._core.stall(autoskip=autoskip)
+                self._core.route(route, self)
 
-        def pause(self, autoskip=False):
+        def reenter(self):
             with self._lock:
-                self._core.pause(autoskip=autoskip)
+                self._core.reenter()
+
+        def resume(self):
+            with self._lock:
+                self._core.resume()
+
+        def until(self, state):
+            with self._lock:
+                self._core.until(state)
+
+        def stall(self):
+            with self._lock:
+                self._core.stall()
+
+        def pause(self):
+            with self._lock:
+                self._core.pause()
 
         def __call__(self):
             with self._lock:
@@ -9657,8 +10135,7 @@ class Scenario:
 
         def update(self, drivers):
             with self._lock:
-                for driver in drivers:
-                    self._core.add(driver._core)
+                self._core.update(driver._core for driver in drivers)
 
         def remove(self, driver):
             with self._lock:

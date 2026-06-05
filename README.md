@@ -831,31 +831,33 @@ need them.
 
 A `Driver` attaches to a single worker thread. You construct one with
 `scenario.Driver(thread)`, or with `scenario.Driver(thread, base_tx)` to
-drive only descendant transactions under `base_tx`. Drivers are lazy;
-nothing really happens until you "drive" one, either by calling the
-object `driver()`, or by giving it to a `Dispatch` and iterating over the
-dispatch.
+drive only descendant transactions under `base_tx`. You can also pass
+`route=` to give the Driver a little per-driver scheduler. Drivers are
+lazy; nothing really happens until you "drive" one, either by calling
+the object `driver()`, or by giving it to a `Dispatch` and iterating over
+the dispatch.
 
-This is a breaking change in 1.1: a Driver no longer silently skips
-nested transactions by default.  When a nested transaction appears, the
-Driver surfaces it and asks the scheduler for direction.  When the driven
-transaction is running a user callback and that callback asks **blanket**
-for scheduler help, the Driver surfaces that too, in `reentered` state.
-Most high-level imperatives still opt into automatic child skipping where
-that is the right behavior, but code using `Driver` directly should
-expect nested work to be visible.
+This is a breaking change in 1.1: a Driver no longer silently looks
+for the next transaction on its own.  Even scanning for the current
+transaction is explicit: call `driver.scan()`, then drive the Driver.
+Nested work is visible too; if a child transaction appears while the
+Driver is carrying out a directive, the Driver reports back instead of
+silently skipping it.  Most high-level imperatives still opt into
+automatic child skipping where that is the right behavior, but code using
+`Driver` directly should expect to steer nested work.
 
-A Driver gives you a set of imperatives--`skip()`, `finish()`, `block()`,
-`commit()`, `wait()`, `stall()`, `pause()`--each of which requests a
-state transition or series of transitions. Again, this isn't done
-eagerly; the `Driver` remembers the request, then makes it happen the
-next time it's driven. You can only call one imperative at a time; if you
-call a second imperative before the first one has been driven, the driver
-raises.
+A Driver gives you a set of imperatives--`scan()`, `finish()`,
+`until(state)`, `block()`, `commit()`, `wait(*signals)`, `reenter()`,
+`resume()`, `stall()`, `pause()`, and `route()`--each of which requests
+a scan, a state transition, a signal wait, a callback edge, or a route
+install.
+Again, this isn't done eagerly; the `Driver` remembers the request, then
+makes it happen the next time it's driven.  If you stage a second
+imperative before driving, the second one replaces the first one.
 
 A `Chain` is an ordered sequence of `Driver` objects. Adding a Chain to a
-Dispatch activates the chain's first driver; when that driver reaches a
-terminal state, the next driver in the chain takes its place; and so on,
+Dispatch promotes the chain's first driver; when that driver reaches its
+next ask point, the next driver in the chain takes its place; and so on,
 until the chain is empty. You can also iterate over a Chain directly, or
 pop drivers off the head manually with `chain.promote()`.
 
@@ -871,14 +873,16 @@ The typical pattern looks something like this:
 with scenario:
     d1 = scenario.Driver(t1)
     d2 = scenario.Driver(t2)
-    d1.skip()
-    d2.skip()
+    d1.scan()
+    d2.scan()
     dispatch = scenario.Dispatch()
     dispatch.add(d1)
     dispatch.add(d2)
     for d in dispatch:
-        # d is a Driver that needs attention
-        ...
+        # d is a Driver that has completed its scan.
+        # Stage the next directive explicitly.
+        d.finish()
+        d()
 ```
 
 Note that if you only need to interact with one driver, you can skip the
@@ -887,6 +891,8 @@ Note that if you only need to interact with one driver, you can skip the
 ```
 with scenario:
     d = scenario.Driver(t1)
+    d.scan()
+    d()
     d.finish()
     d()
     # d has been driven and you can now inspect it
@@ -1170,14 +1176,13 @@ driver = scenario.Driver(thread, outer)
 ```
 
 A plain `Driver(thread)` no longer silently skips nested transactions in
-1.1.  If it runs into one, it reports back in `nesting` state and waits
-for instructions.  If the transaction currently being driven calls back
-into user code, and that callback asks **blanket** for scheduler help, the
-Driver reports back in `reentered` state.  A scoped Driver that can't
-reach nested work because the base transaction is parked in the wrong
-place, or has already gone away, ends in `impasse`.  That's **blanket**
-saying: with the scope you gave me, there is no transaction here that I
-can drive.
+1.1.  If it runs into one, it reports back with the child selected as
+`driver.tx`; read `driver.tx.parent` when you need to distinguish a child
+from a top-level transaction.  A scoped Driver that can't reach nested
+work because the base transaction is parked in the wrong place, or because
+the base transaction has already gone away, ends in `impasse`.  That's
+**blanket** saying: with the scope you gave me, there is no transaction
+here that I can drive.
 
 The practical advice: when you're testing callbacks, keep the outer
 transaction in a variable, and use `(thread, outer)` whenever you mean
@@ -1243,16 +1248,17 @@ same underlying primitive can coexist in the same test.
 
 ### Lazy Imperatives
 
-The `Driver` imperatives (`skip`, `finish`, `block`, `commit`,
-`wait`, `stall`, `pause`) are *lazy*. They request a state
-transition, but they don't fire the underlying work until the driver
-is actually driven--by calling `driver()`, or by a `Dispatch`
-driving it. A driver carries at most one staged imperative at a
-time: calling a second imperative before the first one is driven
-raises. The point of laziness isn't to let you stack imperatives;
-it's to separate *what should happen next* from *when it happens*,
-so that `Dispatch` can be the one to fire the work in coordination
-with whatever other drivers are also active.
+The `Driver` imperatives (`scan`, `finish`, `until`, `block`, `commit`,
+`wait`, `reenter`, `resume`, `stall`, `pause`, and `route`) are *lazy*.
+They request a scan, a state transition, a signal wait, a callback edge,
+or a route install, but they don't fire the underlying work until the
+driver is actually driven--by calling `driver()`, or by a `Dispatch`
+driving it. A driver carries at most one staged imperative at a time:
+calling a second imperative before the first one is driven replaces the
+first. The point of laziness isn't to let you stack imperatives; it's to
+separate *what should happen next* from *when it happens*, so that
+`Dispatch` can be the one to fire the work in coordination with whatever
+other drivers are also active.
 
 If you're working at the middle level, this rarely matters--`park`
 and `skip` handle the driving for you. But if you reach for explicit
@@ -1559,10 +1565,10 @@ done by the underlying `threading.Condition`.
 ### Why The Driver Is Lazy
 
 The `Driver` state machine stages a single pending imperative
-rather than firing it eagerly. The point isn't to let you batch
-multiple intents (you can't--a second imperative on a driver with
-one still pending raises), it's simply to delay setting state on
-the Driver and the transaction until we're actively driving them.
+rather than firing it eagerly.  If you stage another imperative before
+firing the first one, the later imperative wins.  The point isn't to
+batch work; it's to delay setting state on the Driver and the
+transaction until we're actively driving them.
 
 Making the `Driver` lazy was important to making `Chain` useful.
 If you use `Chain` to drive a number of threads serially,
@@ -2089,10 +2095,12 @@ Methods:
 
 ### Scenario.Driver
 
-**`scenario.Driver(thread, base_tx=None)`**
+**`scenario.Driver(thread, base_tx=None, *, route=None)`**
 
 Construct a Driver attached to `thread`.  If `base_tx` is provided, the
 Driver is scoped to descendant transactions under that base transaction.
+If `route` is provided, it must be a generator function accepting the
+Driver; the route steers the Driver until the route returns.
 A Driver "drives" a thread, which is to say, it causes method calls made
 on primitives by the thread to make progress. You can tell the Driver
 what you want the thread, or the tx running on the thread, to do, and the
@@ -2105,75 +2113,115 @@ actually driven.  Constructing more than one Driver for a thread is okay;
 trying to drive the same thread with two active Drivers at the same time
 raises `CompetingDriversError`.
 
-Breaking change in 1.1: Driver no longer silently auto-skips nested
-transactions by default.  If a child transaction appears, the Driver
-surfaces it in `nesting` state and waits for scheduler direction.  If the
-driven transaction is running a user callback and that callback asks
-**blanket** for scheduler help, the Driver surfaces that in `reentered`
-state.  The high-level imperatives still opt into autoskip where
-appropriate.
+Breaking change in 1.1: Driver no longer does anything on its own.
+A fresh Driver starts in `undirected`; call `scan()` and then drive it to
+select the thread's current published transaction.  Driver also no longer
+silently skips nested transactions by default.  If a child transaction
+appears while Driver is carrying out a directive, it reports back with
+that child selected as `driver.tx`.  The high-level APIs still drive
+through child transactions where their public contract requires it.
 
 Properties:
 
 - **`driver.thread`** - the thread.
 - **`driver.base_tx`** - the base transaction, or `None`.
-- **`driver.state`** - the driver state (`None` until first driven).
+- **`driver.state`** - the driver state.  A fresh Driver starts in
+  `undirected`.
 - **`driver.tx`** - the current transaction (`None` if none).
 - **`driver.txs`** - tuple of all transactions seen so far.
+- **`driver.signaled`** - the explicit signals that fired during the
+  most recent `driver.wait(*signals)`.
+- **`driver.directive`** - the most recently staged Driver method, as a
+  bound method.
+- **`driver.directive_args`** - the positional arguments from the most
+  recently staged directive, as a tuple.
+- **`driver.routed`** - `True` while a route is installed and still
+  active.
 - **`driver.done`** - `True` if in a terminal driver state.
 
 Driver has these states:
 
-- `idle`, no selected tx is observed on the thread.
-- `active`, a selected tx is observed on the thread, and the driver
-  hasn't been instructed to drive it.
-- `skipping`, driver has been instructed to drive the tx to completion.
-- `parking`, driver has been instructed to park the tx in a particular tx
-  state.
-- `finishing`, driver has been instructed to drive the tx until it reaches
-  a terminal state.
-- `nesting`, a nested transaction has surfaced and requires direction.
-- `reentered`, the transaction being driven is running a user callback
-  that has asked **blanket** for scheduler help--for example, a
-  `Condition.wait_for` predicate that calls a regulated primitive.  This
-  normally matters only to code using a `scheduler=` callback.
-- `parked`, terminal state after successfully parking.
-- `finished`, terminal state after successfully finishing.
-- `raised`, terminal state if the tx transitions to `RAISED`.
-- `terminated`, terminal state if the thread terminates.
-- `impasse`, terminal state used when a scoped driver cannot reach its
-  target because the base transaction is parked or gone.
+- `undirected`, no directive is staged.  This is the initial state, and
+  also the state after trying to drive with an empty directive slot.
+- `driving`, a directive is currently being executed.  You normally won't
+  see this state from scheduler code, because the worker thread has
+  control while the Driver is driving.
+- `success`, the last committed directive reached its target.  This covers
+  a successful scan, park, finish, `until`, callback edge, and signal wait.
+- `returned`, `until(raised)` expected the transaction to raise, but it
+  returned cleanly instead.
+- `overshot`, the transaction self-progressed past an externally-controlled
+  target (`COMMIT` or `WAITING`) during the window since the Driver last
+  looked.
+- `persisted`, `until(terminated)` expected the thread to stop transacting,
+  but the thread began another transaction instead.
+- `mutated`, another actor moved a thread past a blanket-controlled point
+  this Driver had parked it at.  Recover by scanning again.
+- `raised`, the driven transaction transitioned to `RAISED`.
+- `terminated`, the thread terminated.
+- `impasse`, a scoped Driver can't currently reach nested work because the
+  base transaction is parked in a blanket-controlled state or has gone away.
 
-Driver also publishes the sets `driving_states`, `active_states`, and
-`terminal_states`, which are `frozenset` objects containing those states.
+Driver also publishes `driving_states` and `terminal_states` as
+`frozenset` objects containing the public driving and dead-end states.
 
 Driver supports several "imperatives"; these are instructions for what
 you want the driver to accomplish when driving the thread.  Note that
-these simply set internal state, instructing Driver what you want done;
-Driver doesn't change any state on a transaction until you let it start
-driving:
+these simply stage a directive; Driver doesn't change any state on a
+transaction until you let it start driving.  There is one pending slot,
+and the last staged imperative wins:
 
-- **`driver.skip(autoskip=False)`** - let the current transaction
-  complete normally.
-- **`driver.finish(autoskip=False)`** - drive the worker to a terminal
-  driver state.
+- **`driver.scan(base_tx=None)`** - find a published transaction.  With no
+  argument, scan under the Driver's scope floor; with a transaction, scan
+  for a child of that transaction.  This is how a fresh Driver starts doing
+  useful work.  After driving a transaction to completion, call `scan()`
+  again to pick up the next one.
+- **`driver.finish()`** - drive the current transaction to a terminal
+  transaction state.
+- **`driver.until(state)`** - drive toward one of `driver.terminated`,
+  `driver.raised`, or `driver.impasse`, and report `success` if that
+  requested state is reached.
 - **`driver.block()`** - park the worker at the scheduler block, without
   unblocking.
 - **`driver.commit()`** - drive the current transaction to `COMMIT`
   (timeout-bearing only).
-- **`driver.wait()`** - drive the current transaction to `WAITING`
-  (waiting-supporting only).
+- **`driver.wait(*signals)`** - drive until one of the named signals
+  fires. The signal set is normalized the same way `scenario.wait`
+  normalizes signals, and the explicit signals that fired are stored in
+  `driver.signaled`. If you want the old "drive to WAITING" behavior,
+  say that explicitly after scanning: `driver.wait(Waiting(driver.tx))`.
+- **`driver.reenter()`** - drive until the current transaction enters a
+  user callback that can itself ask **blanket** for scheduler help.
+- **`driver.resume()`** - after `reenter()`, drive until that callback
+  returns to the transaction.
 - **`driver.stall()`** - drive the current transaction to `STALLED`
   (stalling-supporting only).
-- **`driver.pause(autoskip=False)`** - drive the current transaction to
-  `PAUSED`.
+- **`driver.pause()`** - drive the current transaction to `PAUSED`.
+- **`driver.route(route)`** - install a route. A route is a generator
+  function with the shape `def route(driver):`. At each point where the
+  Driver would normally ask the caller for instructions, the Driver calls
+  the route instead. The route inspects the Driver, issues a Driver
+  imperative, and yields. When the route returns, the Driver goes back to
+  normal behavior and reports to its caller at the current ask point.
+  Routes compose naturally with `yield from`, and branch naturally with
+  ordinary `if` / `while` statements. `route(X)` inside a route is a hard
+  hand-off to a new route; `yield from subroute(driver)` is a subroutine
+  call that comes back.  A route may issue one directive and then yield;
+  yielding without a directive raises.
+
+`driver.wait(*signals)` also watches a couple of escape hatches so a bad
+signal list doesn't turn into a silent deadlock. If the thread terminates
+and you didn't list `Terminated(thread)`, the Driver enters `terminated`.
+If the current transaction exits before any of your named signals fire,
+the Driver raises; list the transaction itself if you mean to handle that
+case and branch on `driver.signaled`.
 
 Other methods:
 
-- Calling the driver itself (a la `driver()`) drives the driver until the
-  driver needs further instructions: it has succeeded in your requested
-  imperative, it can no longer succeed with your requested imperative, or
-  a new transaction has started and it doesn't know what you want done.
+- Calling the driver itself (a la `driver()`) commits the staged directive
+  and drives until that directive reaches an ask point: success, raised,
+  termination, impasse, or a route ending.  Calling it with no staged
+  directive raises and leaves the Driver `undirected`.
 
 ### Scenario.Chain
 
@@ -2196,8 +2244,8 @@ Methods:
   Useful for custom iteration patterns.
 - **`driver in chain`** - membership test.
 - **`for d in chain:`** - iterate, yielding the Driver at the
-  head of `pending` each time, driving it forward and waiting
-  for it to reach a terminal state before moving to the next.
+  head of `pending` each time, driving it forward to its next ask point
+  before moving to the next.
 - **`len(chain)`** - total count of drivers.
 - **`bool(chain)`** - true if any drivers remain.
 - **`chain.close()`** - close every Driver owned by this Chain.
@@ -2273,150 +2321,190 @@ Use case: execute `ev = threading.Event()`, and inject a call to
 another thread.  You know the thread is now parked at the `ev.wait()`
 call, and will only resume when you call `ev.set()`.
 
-## Transaction State Reference
+## Method Reference
 
 This is the full state-by-state and method-by-method reference for
-**blanket** transactions.  Most users will only need the breezy
-overview in *Terminology* and *The Three Layers Of The API* near the top
-of the document; this section is for when you want to know exactly what
-each state means and which states a given method visits.
+**blanket** regulated methods and the transactions they use.
+If you're only using the high-level APIs, you probably don't need
+this; this section is for when you want to know
+exactly what each state means and which states a given method visits.
 
 ### Transaction States
 
-- **`BLOCKED`** - the *scheduler block*.  Every transaction starts
-  here.  The method has been called, but no work has happened yet:
-  the worker is asleep inside **blanket** and the underlying real
-  primitive hasn't been touched.  The scheduler can inspect the
-  transaction, expire or disregard a pending timeout, and ultimately
-  unblock to let it proceed.
+Transactions are implemented as state machines.  The machine has a total
+of ten states, including the start state (**`BLOCKED`**) to the terminal
+states (**`RETURNED`** and **`RAISED`**).  These states are *ordered;*
+the transaction state machine only transitions to a subsequent state.
+(There are no back-transitions; a transaction will never transition
+from a later state back to an earlier one.)  Every transaction starts at
+**`BLOCKED`** and ends at either **`RETURNED`** or **`RAISED`**; the
+states in between depend on which method was called.
 
-- **`COMMIT`** - a parking state for timeout-bearing transactions
-  (`Lock.acquire(timeout=...)`, `Condition.wait(timeout=...)`,
-  `Barrier.wait(timeout=...)`, and so on).  The transaction is
-  committed to its action and is about to attempt it.  The scheduler
-  can choose to hold the transaction here for explicit
-  commit-vs-timeout decisions, then unblock to proceed.
+- **`BLOCKED`** - the *scheduler block*.  The initial state--every
+  transaction starts here.  Always visited.  When the thread calls a
+  **blanket** method wrapper, say `lock.acquire()`, that starts a
+  transaction, which immediately goes into **`BLOCKED`** state.  Note
+  that no real work has been done yet--the actual method on the real
+  underlying synchronization primitive hasn't been touched yet.  The
+  scheduler can inspect the transaction, call `expire` or `disregard`
+  (if the method call supports timeouts), and ultimately must "unblock"
+  the transaction to let it make progress.
 
-- **`WAITING`** - a parking state for transactions blocked inside
-  the underlying real primitive.  The transaction has called into
-  the real `condition.wait()`, the real contended `lock.acquire()`,
-  the real `barrier.wait()`, etc., and is now genuinely asleep
-  inside the primitive.  This state is *not* directly under the
-  scheduler's control--it's the underlying primitive's to manage.
-  The scheduler can observe that the transaction is in `WAITING`
-  and use that as a signal, but it can't `unblock` it.  The primitive
-  has to choose to wake up, by way of a notify, a release, the last
-  barrier party arriving, or a timeout expiring.
+- **`COMMIT`** - Signifies calling the actual method on the underlying
+  synchronization primitive.  When you call `lock.acquire`, you're
+  calling a wrapper; when the transaction enters this state, that means
+  it's called the real `acquire` method on the real `Lock` object.
+  Depending on the method called, this *can* be a "parking state",
+  meaning the transaction will block--some methods never block in this
+  state, some methods might block or might not.  The scheduler can't
+  directly unpark a transaction parked in **`COMMIT`** state; the
+  method will unpark itself when its conditions are met.  For example,
+  if `lock_q` is currently locked, and thread A calls `lock_q.acquire`,
+  that transaction will park in **`COMMIT`** state until some other
+  thread unlocks `lock_q` and thread A's call to `lock_q.acquire` returns.
+  Transactions that have been forced to time out using `expire` still
+  enter **`COMMIT`** state, but they do so with an immediate timeout.
 
-  (For `Condition.wait` specifically, `WAITING` is also where the
-  underlying lock is dropped while waiting--the real `condition.wait`
-  releases the lock as part of waiting and re-acquires it on wake.
-  The re-acquire is itself a transaction, nested inside the `wait`.)
+- **`WAITING`** - Similar to **`COMMIT`** state: a special parking
+  state reached while calling the actual method on the actual primitive,
+  not directly under the control of the scheduler.
+  **`WAITING`** is only visited by a few transactions, and those
+  transactions represent blocking method calls that can get into a race.
+  The classic example here is `Condition.wait` vs `Condition.notify`.
+  If thread A is calling `cond_x.wait`, and thread B is calling `cond_x.notify`,
+  will the notify call wake up the wait call, or not?  You can tell
+  by examining the state of the transaction on thread A.  If thread
+  A's transaction has reached **`WAITING`** state, it has registered
+  itself as a "waiter" internally on the primitive, and will be awakened
+  by a subsequent "notify" call.
 
-- **`STALLED`** - the *scheduler stall*.  The transaction has woken
-  up from `WAITING` (or from `COMMIT`) and is now back under the
-  scheduler's direct control, but hasn't yet been permitted to
-  proceed to its commit work.  This is where you can intercept a
-  thread *after* it's woken up from a real primitive wait but
-  *before* it's done any post-wake bookkeeping.
+- **`STALLED`** - the *scheduler stall*.  Only visited by `Condition.wait`
+  transactions.  The underlying method call has woken up, and
+  transitioned out of `WAITING` state, and is now attempting to
+  reacquire the underlying lock.  When the scheduler *unstalls*
+  the transaction (unparks the transaction from **`STALLED`** state)
+  the `Condition.wait` call will immediately call `acquire` on that
+  condition's underlying lock.
 
-- **`RESUMED`** - a transit state.  The transaction has come out
-  of `WAITING` (or `COMMIT`) and is in flight again.
+- **`RESUMED`** - a transitory state.  Only visited by `Condition.wait`
+  transactions.  The transaction has been "unstalled"; at the moment
+  the transaction enters this state, it's likely still executing the
+  actual method on the actual primitive, but there are no more parking
+  states, and the actual method should return soon.
 
-- **`COMMITTED`** - a transit state.  The transaction has executed
-  its commit work and is heading toward exit.
+- **`COMMITTED`** - a transitory state.  Always visited.  The transaction
+  has finished calling the actual method on the actual primitive, and
+  you may now examine the `result` on the transaction.
 
-- **`PAUSED`** - the *scheduler pause*.  A general-purpose park
-  point applicable at any point along the lifecycle: the scheduler
-  can request a transaction park here by setting `tx.pause = True`,
-  and the transaction won't continue until every party that set
-  the flag has cleared it.  Used heavily by the high-level helpers.
+- **`PAUSED`** - the *scheduler pause*.  A parking state managed
+  by *blanket*.  The scheduler can request that a transaction park
+  here by setting `tx.pause = True`; *blanket* high-level APIs also
+  often cause a transaction to park in **`PAUSED`** state.  The
+  transaction parked in **`PAUSED`** state will be held in that state
+  as long as any functionality is requesting that state.
 
-- **`EXITING`** - a transit state.  The transaction is on its final
-  flight to terminal.
+- **`EXITING`** - a transitory state.  Always visited.  The transaction
+  is nearly done, and will immediately transition either **`RETURNED`**
+  or **`RAISED`**.
 
-- **`RETURNED`** - terminal.  The method returned normally.
+- **`RETURNED`** - a terminal state.  The method returned a value.
 
-- **`RAISED`** - terminal.  The method raised an exception.
+- **`RAISED`** - a terminal state.  The method raised an exception.
 
-### Method States
+### Notable Primitive Methods
 
-This subsection documents, primitive by primitive, anything unusual
-about each method's transaction.  Methods not listed are mundane
-(they pass through the lifecycle without surprises).
+This subsection documents all the primitive methods that do anything
+unusual.  Methods not listed here are conventional and don't do anything
+interesting.  (Also known as "boring" transactions.)
 
-#### Lock
+#### Lock and RLock
 
-- `acquire(blocking=True, timeout=-1)`: timeout-bearing
-  (visits `COMMIT`).  Has a real `WAITING` when the lock is
-  contended: the transaction is asleep inside the real
-  `threading.Lock.acquire`, waiting for the lock to become
-  available.  Wakes on lock availability or timeout.
-- `release()`: passes through without parking after the scheduler
-  block; doesn't visit `WAITING`, `COMMIT`, or `STALLED`.
-
-#### RLock
-
-The same as `Lock`, with reentrancy handled by the underlying real
-`threading.RLock`.
+- `acquire`: Can time out.  Parks in **`COMMIT`** state if the lock
+  is already locked.
 
 #### Condition
 
-- `acquire`, `release`: the same as `Lock.acquire`/`Lock.release`.
-- `wait(timeout=None)`: timeout-bearing (visits `COMMIT`).  Has a
-  real `WAITING` (asleep inside `threading.Condition.wait`, with
-  the underlying lock dropped).  Visits `STALLED` post-wake, before
-  the internal lock re-acquire is allowed to proceed.  The lock
-  re-acquire is a nested transaction; while it's running,
-  `Nested(wait_tx)` signals high.
-- `wait_for(predicate, timeout=None)`: timeout-bearing.  Calls the
-  predicate first.  If the predicate is already true, there is no
-  nested `Condition.wait` at all.  If the predicate is false, it nests
-  `Condition.wait` transactions until the predicate succeeds or the
-  wait times out.  If the user-supplied `predicate` calls primitive
-  methods, those become nested transactions too.
-- `notify(n=1)`, `notify_all()`: pass through after the scheduler
-  block.
+- `__init__`: *blanket* imposes an additional restriction on `Condition`
+  objects not imposed by the `threading` module.  You can pass in your
+  own lock object in to `threading.Condition`, and it doesn't even need
+  to be a real `Lock` or `RLock`; `threading.Condition` allows duck-typed
+  lock objects, and introspects the object to discover which methods it
+  supports.  *blanket* is more restrictive: although you can pass your
+  own lock object into `scenario.Condition`, it *must* be an instance
+  of either `scenario.Lock` or `scenario.RLock` from the same scenario.
 
-#### Semaphore
+- `acquire`: Identical to `acquire` on a `Lock` or `RLock`.
+  (Literally calls `acquire` on the underlying lock, which must
+  be a `Lock` or `RLock`.)
+  Can time out.  Parks in **`COMMIT`** state if the lock is already locked.
 
-- `acquire(blocking=True, timeout=None)`: timeout-bearing.  Has
-  a real `WAITING` when the semaphore counter is zero.
-- `release(n=1)` where the stdlib supports `n`, otherwise `release()`:
-  passes through.
+- `wait`: Can time out.  Parks in **`WAITING`** state after registering
+  as a waiter internally and releasing the underlying lock.  If a
+  `Condition.wait` transaction has reached **`WAITING`** state, it's
+  eligible to be awakened by a `Condition.notify` or `Condition.notify_all`
+  call running on another thread.  Parks in `STALLED` state after the
+  underlying `wait` call is awakened by a `notify` call, immediately
+  before attempting to reacquire the condition's underlying lock.
 
-#### BoundedSemaphore
+  `wait` releases and reacquires the Condition's underlying lock,
+  but those operations are not visible as separate nested transactions.
+  It's the same `Condition.wait` transaction the whole time: it parks in
+  **`WAITING`** after releasing the lock, then parks in **`STALLED`**
+  after it wakes up and before it reacquires the lock.
 
-The same as `Semaphore`, except `release` raises if it would
-exceed the initial value.
+- `wait_for`: The most complex method in the `threading` module, and
+  therefore the most complex transaction in *blanket*.  Can time out.
+
+  `wait_for` enters **`COMMIT`** state before calling the actual
+  `wait_for` method on the actual `Condition` object, and stays there
+  until `wait_for` returns.  The real `wait_for` method is implemented
+  as a loop.  Inside the loop, it initially calls the `predicate` callable.
+  If the `predicate` returns a true value, it returns that value.  If the
+  `predicate` callable returns a false value, `wait_for` calls `self.wait`
+  then loops.  This means `wait_for` can potentially call the `predicate`
+  and `self.wait` an arbitrary number of times.
+
+  Whenever `wait_for` calls its `predicate` callback function, *blanket*
+  notifies the scheduler by signaling `Predicate(tx)`.  This is important
+  in case the `predicate` makes method calls on other primitives; the
+  scheduler will need to manage those method calls, too.  If the predicate
+  does call any other primitive methods, these will be *nested* transactions.
+
+  When `wait_for` calls `self.wait`, *blanket* creates a *nested transaction*
+  for that `Condition.wait` call.  This is how the scheduler
+  regulates access to the underlying lock in the middle of a `wait_for` call.
+  If thread A calls `wait_for`,
+  thread A will release the underlying
+  lock when the scheduler *unblocks* the nested `wait` transaction,
+  and
+  thread A will attempt to reacquire the underlying
+  lock when the scheduler *unstalls* the nested `wait` transaction.
+  (And, again: this can potentially happen *multiple times,* if the
+  `wait_for` call loops and reattempts the predicate and calls `wait`
+  multiple times.)
+
+#### Semaphore and BoundedSemaphore
+
+- `acquire`:  Can time out.  Parks in **`WAITING`** state when the
+  semaphore counter is zero.
 
 #### Event
 
-- `wait(timeout=None)`: timeout-bearing.  Has a real `WAITING`
-  while the event isn't set.
-- `is_set()`, `set()`, `clear()`: pass through.
+- `wait`:  Can time out.  Parks in **`WAITING`** state when the
+  event isn't set.
 
 #### Barrier
 
-- `wait(timeout=None)`: timeout-bearing.  Has a real `WAITING`
-  for the first `parties - 1` arrivers, until the last party
-  arrives.  If the barrier was constructed with an `action`
-  callback, the final arrival's transaction (the *opener*) runs
-  the action.  **blanket** calls the action with the opener's
-  transaction API object, and `Action(opener_tx)` signals high
-  while that callback is running.  Primitive calls made inside the
-  action become nested transactions under the opener; see *Nested
-  Transactions* above.
+- `wait`:  Can time out.  Parks in **`WAITING`** state while
+  waiting for the barrier to open.  The final call to `wait`--the
+  call that opens the barrier, nicknamed the "opener"--does *not*
+  enter **`WAITING`** state.
 
-  If code inside the action calls a regulated primitive and asks
-  **blanket** for scheduler help, `Barrier.cycle(...,
-  scheduler=scheduler)` calls `scheduler(opener_tx)`.  Use
-  `opener_tx.thread` to tell which thread is doing the asking.
-
-  Cycle validation: constructing a `Cycle` on a `Barrier` with
-  a `scheduler` argument requires the barrier to have been built
-  with an `action`.  Without one, the constructor raises.
-- `reset()`, `abort()`: pass through.
+  If the barrier was constructed with an `action` callback,
+  blanket will signal `Action(tx)` while calling the callback.
+  If the callback calls any regulated methods on *blanket*
+  primitives, these will create *nested transactions* on that
+  thread.
 
 
 ## Running The Tests
@@ -2494,13 +2582,32 @@ But the official test and coverage path is `tests/test_all.py`.
 
 - Changes to `Driver`:
 
-    - Changed `Driver` semantics: nested transactions are no longer automatically
-      silently skipped by default.  Now, when the driver detects a nested
-      transaction, it transitions to `nesting` state and returns to the scheduler
-      for further instructions.  Driver also supports a new `reentered` state,
-      which it enters when the transaction being driven runs a callback; this
-      facilitates using the driver to react to / drive nested transactions on
-      that thread.
+    - Reworked `Driver` around explicit staged directives.  A fresh Driver
+      starts in `undirected` and does nothing until directed; use `scan()` to
+      find the thread's current published transaction.  Driver's public states
+      are now `undirected`, `driving`, `success`, `returned`, `overshot`,
+      `persisted`, `mutated`, `raised`, `terminated`, and `impasse`.
+
+    - Changed nested-transaction semantics: nested transactions are no longer
+      automatically silently skipped by Driver.  When the driver detects a
+      nested transaction, it reports back with that child selected as
+      `driver.tx`; the scheduler decides what to do next.  Driver-level
+      `skip()` and every `autoskip=` parameter were removed.
+
+    - Driver directives are staged into one pending slot, and the last staged
+      directive wins.
+
+    - `Driver.wait` is now the Driver-level companion to `scenario.wait`:
+      `driver.wait(*signals)` drives the thread until one of the named signals
+      fires, then exposes the fired explicit signals via `driver.signaled`.
+      The old public "park at WAITING" shorthand was removed; use
+      `driver.wait(Waiting(driver.tx))` when that's what you mean.
+
+    - Added Driver routes.  Construct a Driver with `route=...`, or install one
+      later with `driver.route(route)`, where `route` is a generator function
+      accepting the Driver.  Routes get the Driver at each ask point, issue one
+      imperative, and yield; they can compose with `yield from` and branch with
+      ordinary Python control flow.
 
     - `Driver` is now more relaxed about multiple drivers operating on the
       same thread.  You can now have as many as you like, provided that only

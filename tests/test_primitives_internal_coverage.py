@@ -32,7 +32,7 @@ import queue
 import blankettestlib
 blankettestlib.preload_local_blanket()
 
-from blanket import Scenario, Not, Call, Use, State, Terminated, Nested, CompetingDriversError
+from blanket import Scenario, Not, Call, Use, State, Terminated, Nested, Waiting, Predicate, Action, CompetingDriversError
 from blanket import primitives as primitives_module
 
 NEVER = 1e9
@@ -42,10 +42,12 @@ class FakeDriver:
     def __init__(self, score, name, *, signals=(), done=False):
         self.score = score
         self.thread = types.SimpleNamespace(name=name)
-        self.state = score.Driver.idle
+        self.state = score.Driver.success
+        self.mode = self.state
         self.owner = None
         self.signals = frozenset(signals)
         self.done = done
+        self.routed = False
         self.closed = 0
         self.calls = []
         self.reactivated = 0
@@ -72,9 +74,16 @@ class FakeDriver:
     def __call__(self):
         self.calls.append(("call",))
 
+    def scan(self):
+        self.calls.append(("scan",))
+
     def drive(self):
         self.calls.append(("drive",))
         self.done = False
+
+    def proceed(self):
+        self.drive()
+        return self.signals
 
     def reactivate(self):
         self.reactivated += 1
@@ -98,6 +107,11 @@ class TestChainCoverage(unittest.TestCase):
         d.unregister()
         with self.assertRaisesRegex(RuntimeError, "not owned"):
             d.unregister()
+        d.scan()
+        d.reactivate()
+        self.assertEqual(d.reactivated, 1)
+        self.assertIn(("scan",), d.calls)
+        self.assertIn(("reactivate",), d.calls)
         self.assertEqual(d.signal({"signal"}), frozenset())
         self.assertIn(("signal", frozenset({"signal"})), d.calls)
 
@@ -197,7 +211,7 @@ class TestDispatchCoverage(unittest.TestCase):
         with self.assertRaises(StopIteration):
             next(dispatch)
 
-    def test_dispatch_drains_done_driver_by_reactivating(self):
+    def test_dispatch_drains_done_driver_by_proceeding(self):
         score = Scenario()._core
         dispatch = score.Dispatch()
         d = FakeDriver(score, "done", done=True)
@@ -205,7 +219,7 @@ class TestDispatchCoverage(unittest.TestCase):
 
         yielded = next(dispatch)
         self.assertIs(yielded, d)
-        self.assertEqual(d.reactivated, 1)
+        self.assertEqual(d.reactivated, 0)
         self.assertIn(("drive",), d.calls)
 
     def test_dispatch_chain_promotion_and_advance(self):
@@ -358,9 +372,14 @@ class TestDriverAndContextManagerInternals(unittest.TestCase):
         with self.assertRaises(CompetingDriversError):
             d2.claim_slot()
 
-        d1.state = d1.active
-        with self.assertRaisesRegex(RuntimeError, "already in"):
+        score.entered = True
+        try:
             d1.reactivate()
+            self.assertEqual(d1.directive, d1.scan)
+            self.assertEqual(d1.directive_args, (None,))
+            self.assertIsNotNone(d1.closure)
+        finally:
+            score.entered = False
 
     def test_context_manager_exit_closes_active_core_drivers(self):
         scenario = Scenario()
@@ -549,6 +568,110 @@ class TestScoreWaitInterestInternals(unittest.TestCase):
             score.signal(_ProbeSignal("low", False))
 
 
+class TestDriverWaitRouteInternals(unittest.TestCase):
+    def test_resume_route_without_route_raises_undirected(self):
+        score = Scenario()._core
+        score.entered = True
+        d = score.Driver(threading.Thread(target=lambda: None,
+                                          name="no-route"))
+        with self.assertRaisesRegex(RuntimeError, "no Driver directive staged"):
+            d.resume_route()
+        self.assertIs(d.state, d.undirected)
+
+    def test_wait_explicit_signal_from_live_tx(self):
+        scenario = Scenario()
+        ev = scenario.Event()
+        def worker():
+            ev.wait()
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.wait(t)
+            tx = scenario.transaction(t)
+            d = scenario.Driver(t)
+            d.wait(Waiting(tx))
+            d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.signaled, frozenset((Waiting(tx),)))
+            d.close()
+            scenario.raw(ev).set()
+
+    def test_wait_unlisted_termination_reports_terminated_without_signals(self):
+        class NeverSignal(primitives_module.Signaling):
+            def sample(self, scenario):
+                return False
+
+        scenario = Scenario()
+        with scenario:
+            t = scenario.thread(lambda: None)
+            d = scenario.Driver(t)
+            d.wait(NeverSignal())
+            d()
+            self.assertIs(d.state, d.terminated)
+            self.assertEqual(d.signaled, frozenset())
+
+    def test_wait_rejects_surprise_nested_and_unknown_signals(self):
+        scenario = Scenario()
+        ev = scenario.Event()
+        def worker():
+            ev.wait()
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.wait(t)
+            d = scenario.Driver(t)
+            d.wait(_ProbeSignal("never-nested", False))
+            with d._lock:
+                d._core.drive()
+                nested = d._core.thread_signal[Nested]
+                with self.assertRaisesRegex(RuntimeError, "nested transaction"):
+                    d._core.signal({nested})
+                self.assertIs(d._core.state, d._core.raised)
+            d.close()
+            scenario.raw(ev).set()
+
+        scenario = Scenario()
+        ev = scenario.Event()
+        def worker2():
+            ev.wait()
+        with scenario:
+            t = scenario.thread(worker2)
+            scenario.wait(t)
+            d = scenario.Driver(t)
+            d.wait(_ProbeSignal("never-unexpected", False))
+            with d._lock:
+                d._core.drive()
+                with self.assertRaisesRegex(RuntimeError, "unexpected signal"):
+                    d._core.signal({object()})
+                self.assertIs(d._core.state, d._core.driving)
+            d.close()
+            scenario.raw(ev).set()
+
+    def test_route_empty_yield_raises_but_empty_return_ends_route(self):
+        scenario = Scenario()
+        ev = scenario.Event()
+        def worker():
+            ev.wait()
+        def empty_yield(d):
+            yield
+        def empty_return(d):
+            if False:
+                yield
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.wait(t)
+            d = scenario.Driver(t, route=empty_yield)
+            with self.assertRaisesRegex(RuntimeError, "route yielded"):
+                d()
+            self.assertIs(d.state, d.undirected)
+            d.close()
+
+            d = scenario.Driver(t, route=empty_return)
+            d()
+            self.assertIs(d.state, d.undirected)
+            self.assertFalse(d.routed)
+            d.close()
+            scenario.raw(ev).set()
+
+
 class TestInjectionSmallEdges(unittest.TestCase):
     def test_injection_context_manager_repr_and_idempotent_close(self):
         target = types.ModuleType("injection_target")
@@ -582,6 +705,16 @@ class TestInjectionSmallEdges(unittest.TestCase):
 
 
 class TestPrimitiveCoreSmallEdges(unittest.TestCase):
+    def test_internal_primitive_signal_validation_and_repr(self):
+        scenario = Scenario()
+        lock = scenario.Lock()
+        signal = scenario._core.Primitive(lock)
+
+        self.assertEqual(signal.primitive, lock)
+        self.assertIn("_Primitive(", repr(signal))
+        with self.assertRaisesRegex(TypeError, "expected a primitive"):
+            scenario._core.Primitive(object())
+
     def test_threads_to_txs_validation_and_thread_to_tx(self):
         scenario = Scenario()
         lock = scenario.Lock()
@@ -863,6 +996,10 @@ class TestTransactionValidationAndObserverCoverage(unittest.TestCase):
         try:
             child = core.methods[lock.acquire](lock.acquire, time.monotonic(), regulated=False)
             self.assertIs(child.parent, parent)
+            # Transaction.__call__ now publishes .child; this synthetic
+            # direct-constructor test wires it manually to exercise abort
+            # cleanup of a published child chain.
+            parent.child = child
             self.assertIs(parent.child, child)
             child.aborted()
             self.assertTrue(child.done)
@@ -1192,7 +1329,13 @@ class TestConditionCycleCoreDirectCoverage(unittest.TestCase):
     def test_condition_cycle_ensure_ul_free_error_paths(self):
         cycle = self.make_condition_cycle()
         held = {"value": True}
+        def finish_deep(driver):
+            while driver.tx is not None and not driver.tx.done:
+                driver.finish()
+                driver()
+
         cycle.core = types.SimpleNamespace(
+            score=types.SimpleNamespace(driver_finish_deep=finish_deep),
             underlying=types.SimpleNamespace(
                 actual_held=lambda: held["value"]
             )
@@ -1208,12 +1351,23 @@ class TestConditionCycleCoreDirectCoverage(unittest.TestCase):
         class Previous:
             def __init__(self, state, tx):
                 self.thread = threading.Thread(target=lambda: None, name="previous")
-                self.state = state
+                self.success = object()
                 self.terminated = object()
-                self.finished = object()
+                self.raised = object()
+                self.impasse = object()
+                self.overshot = object()
+                self.mutated = object()
+                self.state = state
                 self.tx = tx
                 self.called = 0
                 self.finished_calls = 0
+
+            @property
+            def done(self):
+                return self.state in (self.terminated, self.raised)
+
+            def scan(self):
+                pass
 
             def __call__(self):
                 self.called += 1
@@ -1221,10 +1375,16 @@ class TestConditionCycleCoreDirectCoverage(unittest.TestCase):
             def finish(self):
                 self.finished_calls += 1
                 held["value"] = False
-                self.state = self.finished
+                self.tx.done = True
+                self.tx.state = State.RETURNED
+                self.state = self.success
 
-        prev = Previous(object(), types.SimpleNamespace(method=release_method))
+        def fake_tx(method=release_method, *, done=False):
+            return types.SimpleNamespace(method=method, done=done, state=State.BLOCKED)
+
+        prev = Previous(object(), fake_tx(done=True))
         prev.state = prev.terminated
+        self.assertTrue(prev.done)
         cycle.previous = prev
         with self.assertRaisesRegex(RuntimeError, "terminated"):
             cycle.ensure_ul_free()
@@ -1236,10 +1396,10 @@ class TestConditionCycleCoreDirectCoverage(unittest.TestCase):
             cycle.ensure_ul_free()
 
         held["value"] = True
-        prev = Previous(object(), types.SimpleNamespace(method=release_method))
+        prev = Previous(object(), fake_tx())
         cycle.previous = prev
         cycle.ensure_ul_free()
-        self.assertEqual(prev.called, 2)
+        self.assertEqual(prev.called, 1)
         self.assertEqual(prev.finished_calls, 1)
         self.assertFalse(held["value"])
 
@@ -1327,13 +1487,14 @@ class TestConditionCycleDriveWakerCoverage(unittest.TestCase):
             def __init__(self):
                 self.thread = threading.Thread(target=lambda: None, name="cycle-waker")
                 self.active = object()
-                self.finished = object()
+                self.success = object()
                 self.state = self.active
                 self.tx = types.SimpleNamespace(
                     method=notify_method,
                     n=notify_n,
                     state=State.BLOCKED,
                     result=raised,
+                    done=False,
                     validate=lambda **kwargs: None,
                 )
                 self.finish_calls = 0
@@ -1344,7 +1505,8 @@ class TestConditionCycleDriveWakerCoverage(unittest.TestCase):
 
             def __call__(self):
                 self.drive_calls += 1
-                self.state = self.finished
+                self.state = self.success
+                self.tx.done = True
                 if raised is not None:
                     self.tx.state = State.RAISED
 
@@ -1360,7 +1522,7 @@ class TestConditionCycleDriveWakerCoverage(unittest.TestCase):
             actual_waiters=2, managed_waiters=1, notify_n=1)
         with self.assertRaisesRegex(ValueError, "extra waiters"):
             cycle.drive_waker()
-        waker.state = waker.finished
+        waker.state = waker.success
         waker.reactivate()
         self.assertIs(waker.state, waker.active)
         self.assertEqual(waker.finish_calls, 0)
@@ -1771,28 +1933,40 @@ class TestScoreMonitorDefensiveCleanup(unittest.TestCase):
 
 
 class TestDriverStateMachineDirectCoverage(unittest.TestCase):
-    def make_driver_with_tx(self, *, base=False, tx_state=State.BLOCKED):
+    def make_driver_with_tx(self, *, base=False, tx_state=State.BLOCKED,
+                            primitive='lock'):
         import time
         scenario = Scenario()
-        lock = scenario.Lock()
         score = scenario._core
-        core = lock._core
+        if primitive == 'condition':
+            primitive_obj = scenario.Condition()
+            core = primitive_obj._core
+            method = primitive_obj.wait
+            tx = core.methods[primitive_obj.wait](
+                primitive_obj.wait, time.monotonic(), regulated=False)
+        else:
+            primitive_obj = scenario.Lock()
+            core = primitive_obj._core
+            method = primitive_obj.acquire
+            tx = core.methods[primitive_obj.acquire](
+                primitive_obj.acquire, time.monotonic(), regulated=False)
         thread = threading.Thread(target=lambda: None, name="driver-direct")
         parent = None
         if base:
-            parent = core.methods[lock.locked](
-                lock.locked, time.monotonic(), regulated=False)
-        tx = core.methods[lock.acquire](
-            lock.acquire, time.monotonic(), regulated=False)
-        tx.state = tx_state
-        if parent is not None:
+            parent = core.methods[getattr(primitive_obj, 'locked', method)](
+                getattr(primitive_obj, 'locked', method),
+                time.monotonic(), regulated=False)
+            parent.thread = thread
+            parent.state = State.WAITING
             tx.parent = parent
             parent.child = tx
+        tx.thread = thread
+        tx.state = tx_state
         score.transactions[thread] = tx
         score.transaction_apis[thread] = tx.api
         score.entered = True
         driver = score.Driver(thread, parent if parent is not None else None)
-        return scenario, lock, thread, parent, tx, driver
+        return scenario, primitive_obj, thread, parent, tx, driver
 
     def cleanup_driver_fixture(self, scenario, thread):
         scenario._core.transactions.pop(thread, None)
@@ -1800,66 +1974,996 @@ class TestDriverStateMachineDirectCoverage(unittest.TestCase):
         scenario._core.drivers.pop(thread, None)
         scenario._core.entered = False
 
-    def test_base_driver_idle_nested_signal_surfaces_child(self):
-        fixture = self.make_driver_with_tx(base=True)
-        scenario, lock, thread, base_tx, tx, driver = fixture
-        try:
-            driver.initialize()
-            self.assertIs(driver.state, driver.active)
-            driver.to(driver.idle)
-            self.assertIn(driver._base_nested, driver.signals)
-            driver.signal({driver._base_nested})
-            self.assertIs(driver.state, driver.active)
-            self.assertIs(driver.tx, tx)
-            self.assertIs(driver.base, tx)
-        finally:
-            self.cleanup_driver_fixture(scenario, thread)
-
-    def test_active_driver_terminated_signal_becomes_terminated(self):
+    def test_scan_is_explicit_and_published(self):
         fixture = self.make_driver_with_tx()
         scenario, lock, thread, base_tx, tx, driver = fixture
         try:
-            driver.initialize()
-            self.assertIs(driver.state, driver.active)
-            driver.signal({driver.thread_signal[Terminated]})
-            self.assertIs(driver.state, driver.terminated)
+            self.assertIs(driver.state, driver.undirected)
+            self.assertIsNone(driver.tx)
+            driver.scan()
+            self.assertEqual(driver.directive, driver.scan)
+            self.assertEqual(driver.directive_args, (None,))
+            driver.drive()
+            self.assertIs(driver.state, driver.success)
+            self.assertIs(driver.tx, tx)
+            self.assertIs(driver.snapshot_tx, tx)
+            self.assertIs(driver.snapshot_state, tx.state)
         finally:
             self.cleanup_driver_fixture(scenario, thread)
 
-    def test_active_driver_tx_terminal_signal_raises(self):
-        fixture = self.make_driver_with_tx(tx_state=State.RETURNED)
+    def test_empty_slot_drive_and_proceed_raise_undirected(self):
+        score = Scenario()._core
+        score.entered = True
+        driver = score.Driver(threading.Thread(target=lambda: None,
+                                               name="empty-direct"))
+        with self.assertRaisesRegex(RuntimeError, "no Driver directive staged"):
+            driver.drive()
+        self.assertIs(driver.state, driver.undirected)
+        with self.assertRaisesRegex(RuntimeError, "no Driver directive staged"):
+            driver.proceed()
+        self.assertIs(driver.state, driver.undirected)
+
+    def test_scan_target_scope_validation_and_recovery_from_mutated(self):
+        fixture = self.make_driver_with_tx(base=True)
         scenario, lock, thread, base_tx, tx, driver = fixture
         try:
-            driver.initialize()
-            with self.assertRaisesRegex(RuntimeError, "tx terminated while Driver was ACTIVE"):
+            foreign = threading.Thread(target=lambda: None, name="foreign")
+            tx.thread = foreign
+            with self.assertRaisesRegex(ValueError, "belongs to thread"):
+                driver.scan(tx)
+            tx.thread = thread
+            with self.assertRaisesRegex(ValueError, "base tx"):
+                driver.scan(base_tx)
+            tx.state = State.RETURNED
+            with self.assertRaisesRegex(ValueError, "scan target must be active"):
+                driver.scan(tx)
+            tx.state = State.BLOCKED
+            driver.state = driver.mutated
+            driver.scan(tx)
+            self.assertEqual(driver.directive, driver.scan)
+            self.assertEqual(driver.directive_args, (tx,))
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_constructor_rejects_off_thread_and_done_base(self):
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            other_thread = threading.Thread(target=lambda: None, name="other")
+            with self.assertRaisesRegex(ValueError, "belongs to thread"):
+                scenario._core.Driver(other_thread, base_tx)
+            base_tx.state = State.RETURNED
+            with self.assertRaisesRegex(ValueError, "base tx must be active"):
+                scenario._core.Driver(thread, base_tx)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_wait_signal_resolution_and_unlisted_tx_exit_error(self):
+        fixture = self.make_driver_with_tx()
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.wait(tx.api)
+            driver.drive()
+            driver.signal({tx.api})
+            self.assertIs(driver.state, driver.success)
+            self.assertEqual(driver.signaled, frozenset({tx.api}))
+
+            tx.state = State.BLOCKED
+            score = scenario._core
+            score.transactions[thread] = tx
+            score.transaction_apis[thread] = tx.api
+            driver.select_tx(tx)
+            driver.wait(_ProbeSignal("never", False))
+            driver.drive()
+            tx.state = State.RETURNED
+            with self.assertRaisesRegex(RuntimeError, "transaction exited during wait"):
                 driver.signal({tx})
             self.assertIs(driver.state, driver.raised)
         finally:
             self.cleanup_driver_fixture(scenario, thread)
 
-    def test_pursue_rejects_terminal_cached_tx(self):
-        fixture = self.make_driver_with_tx(tx_state=State.RETURNED)
-        scenario, lock, thread, base_tx, tx, driver = fixture
-        try:
-            driver.initialize()
-            self.assertIs(driver.state, driver.active)
-            with self.assertRaisesRegex(RuntimeError, "tx currently in"):
-                driver.finish()
-            self.assertIs(driver.state, driver.active)
-        finally:
-            self.cleanup_driver_fixture(scenario, thread)
-
-    def test_pursue_refreshes_stale_active_tx_to_finished(self):
+    def test_reenter_resume_and_until_stage_edges(self):
         fixture = self.make_driver_with_tx()
         scenario, lock, thread, base_tx, tx, driver = fixture
         try:
-            driver.initialize()
-            self.assertIs(driver.state, driver.active)
-            driver.cache_tx = lambda: setattr(driver, "tx", None)
-            self.assertIsNone(driver.finish())
-            self.assertIs(driver.state, driver.finished)
+            driver.scan(); driver.drive()
+            driver.reenter()
+            self.assertEqual(driver.directive, driver.reenter)
+            driver.drive()
+            self.assertIs(driver.state, driver.driving)
+            self.assertIn(driver.thread_signal[Predicate], driver.signals)
+            callback = driver.thread_signal[Predicate]
+            driver.signal({callback})
+            self.assertIs(driver.state, driver.success)
+            self.assertIs(driver.callback_signal, callback)
+            driver.resume()
+            self.assertEqual(driver.directive, driver.resume)
+            driver.drive()
+            self.assertIn(Not(callback), driver.wait_unbox)
+            driver.signal({Not(callback)})
+            self.assertIs(driver.state, driver.success)
+            self.assertIsNone(driver.callback_signal)
+
+            with self.assertRaisesRegex(RuntimeError, r"until\(impasse\) requires"):
+                driver.until(driver.impasse)
+            with self.assertRaisesRegex(ValueError, r"until\(\) target"):
+                driver.until(driver.success)
         finally:
             self.cleanup_driver_fixture(scenario, thread)
+
+    def test_mutated_and_overshot_drive_start_detection(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.pause()
+            tx.state = State.STALLED
+            driver.drive()
+            self.assertIs(driver.state, driver.mutated)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.COMMIT,
+                                           primitive='condition')
+        scenario, cond, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.waiting()
+            tx.state = State.STALLED
+            driver.drive()
+            self.assertIs(driver.state, driver.overshot)
+            self.assertIs(driver.target, State.WAITING)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+
+    def test_driver_helper_edges_and_stage_time_guards(self):
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            # Low-level helpers keep a truthful model of the selected tx.
+            self.assertIs(driver.live_child_of(None), None)
+            driver.select_tx(None)
+            self.assertIsNone(driver.tx)
+            self.assertIs(driver.thread_signal, driver.base_thread_signal)
+            self.assertFalse(driver.live_base_blocks())
+
+            with self.assertRaisesRegex(TypeError, "scan target"):
+                driver.validate_scan_target(object())
+            tx.parent = None
+            with self.assertRaisesRegex(ValueError, "strictly inside"):
+                driver.validate_scan_target(tx)
+            tx.parent = base_tx
+
+            # Dead / mutated states, base impasses, early mutation, and
+            # known-behind targets all fail at directive stage time.
+            driver.state = driver.raised
+            with self.assertRaisesRegex(RuntimeError, "currently"):
+                driver.scan()
+            driver.state = driver.mutated
+            with self.assertRaisesRegex(RuntimeError, "scan first"):
+                driver.wait(_ProbeSignal("mutated-wait", False))
+            driver.state = driver.success
+
+            base_tx.state = State.RETURNED
+            with self.assertRaisesRegex(RuntimeError, "currently done"):
+                driver.scan()
+            base_tx.state = State.PAUSED
+            with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
+                driver.scan()
+            base_tx.state = State.WAITING
+
+            driver.select_tx(tx)
+            driver.snapshot_tx = tx
+            driver.snapshot_state = State.BLOCKED
+            tx.state = State.STALLED
+            with self.assertRaisesRegex(RuntimeError, "model is mutated"):
+                driver.finish()
+
+            driver.snapshot_state = State.PAUSED
+            tx.state = State.PAUSED
+            with self.assertRaisesRegex(RuntimeError, "target BLOCKED is behind"):
+                driver.block()
+
+            driver.snapshot_state = State.COMMITTED
+            tx.state = State.COMMITTED
+            with self.assertRaisesRegex(RuntimeError, "currently in COMMITTED"):
+                driver.pause()
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_prepare_drive_start_and_release_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.select_tx(tx)
+            driver.drive_tx = tx
+            tx.state = State.RETURNED
+            self.assertTrue(driver.prepare_drive_start())
+
+            tx.state = State.STALLED
+            driver.snapshot_tx = tx
+            driver.snapshot_state = State.STALLED
+            driver.target = State.PAUSED
+            tx.state = State.EXITING
+            self.assertFalse(driver.prepare_drive_start())
+            self.assertIs(driver.state, driver.mutated)
+
+            driver.select_tx(tx)
+            driver.snapshot_tx = None
+            self.assertTrue(driver.prepare_drive_start())
+
+            with self.assertRaisesRegex(RuntimeError, "can't release"):
+                driver.auto_release_current_state()
+
+            other_tx = tx
+            driver.select_tx(None)
+            ts = driver.make_tx_signals(other_tx)
+            self.assertIs(driver.tx, other_tx)
+            self.assertIn(State.BLOCKED, ts)
+            self.assertIs(driver.make_tx_signals(other_tx), ts)
+
+            driver.held_pausing = True
+            driver.pausing_tx = None
+            driver.release_pausing()
+            self.assertFalse(driver.held_pausing)
+
+            driver.route_iterator = object()
+            driver.close(route=False)
+            self.assertIsNotNone(driver.route_iterator)
+            driver.clear_route()
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, child, driver = fixture
+        try:
+            driver.select_tx(base_tx)
+            driver.drive_tx = base_tx
+            self.assertFalse(driver.prepare_drive_start())
+            self.assertIs(driver.tx, child)
+            self.assertIs(driver.state, driver.success)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_scan_wait_and_impasse_edges(self):
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, child, driver = fixture
+        try:
+            # Scoped scan with no visible child waits on Nested(base_tx).
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.base_thread_signal[Terminated] = _ProbeSignal("base-alive", False)
+            driver.scan()
+            driver.drive()
+            self.assertIn(Nested(base_tx.api), driver.signals)
+
+            # If the base goes blanket-parked before commit, scan rests at impasse.
+            driver.rest(driver.success)
+            base_tx.state = State.WAITING
+            driver.scan()
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.impasse)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx()
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.base_thread_signal[Terminated] = _ProbeSignal("watch-alive", False)
+            driver.scan(tx)
+            driver.drive()
+            self.assertIn(Nested(tx.api), driver.signals)
+            driver.signal({driver.base_thread_signal[Terminated]})
+            self.assertIs(driver.state, driver.terminated)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_until_and_signal_resolution_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.listen_predicate = True
+            driver.listen_action = True
+            driver.finish()
+            driver.drive()
+            self.assertIn(driver.thread_signal[Predicate], driver.signals)
+            self.assertIn(driver.thread_signal[Action], driver.signals)
+            tx.state = State.RETURNED
+            driver.signal({tx})
+            self.assertIs(driver.state, driver.success)
+
+            # The immediate-done configure path resolves without waiting.
+            tx.state = State.RETURNED
+            driver.configure_finish_wait(tx)
+            self.assertIs(driver.state, driver.success)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.listen_predicate = True
+            driver.listen_action = True
+            driver.until(driver.raised)
+            driver.drive()
+            self.assertIn(driver.thread_signal[Predicate], driver.signals)
+            self.assertIn(driver.thread_signal[Action], driver.signals)
+            tx.state = State.RETURNED
+            driver.signal({tx})
+            self.assertIs(driver.state, driver.returned)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.until(driver.terminated)
+            driver.drive()
+            self.assertEqual(driver.drive_kind, 'until-terminated-finish')
+            tx.state = State.RETURNED
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.base_thread_signal[Terminated] = _ProbeSignal("until-alive", False)
+            driver.signal({tx})
+            self.assertEqual(driver.drive_kind, 'until-terminated-watch')
+            driver.signal({driver.base_thread_signal[Terminated]})
+            self.assertIs(driver.state, driver.success)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.until(driver.impasse)
+            driver.drive()
+            self.assertIn(base_tx.api, driver.signals)
+            base_tx.state = State.PAUSED
+            driver.signal({base_tx.api})
+            self.assertIs(driver.state, driver.success)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_callback_wait_route_and_signal_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            with self.assertRaisesRegex(RuntimeError, "not in a callback"):
+                driver.resume()
+
+            driver.reenter(); driver.drive()
+            action = driver.thread_signal[Action]
+            driver.signal({action})
+            self.assertIs(driver.state, driver.success)
+            self.assertIs(driver.callback_signal, action)
+            driver.resume(); driver.drive()
+            self.assertIn(Not(action), driver.wait_unbox)
+            driver.signal({Not(action)})
+            self.assertIs(driver.state, driver.success)
+            self.assertIsNone(driver.callback_signal)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            # wait() with no current tx but a scoped base watches the base child.
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.wait(_ProbeSignal("scoped-wait", False))
+            driver.drive()
+            self.assertIn(Nested(base_tx.api), driver.signals)
+
+            driver.callback_signal = _ProbeSignal("callback-no-live", True)
+            driver.tx = None
+            driver.resume()
+            driver.drive()
+            self.assertNotIn(base_tx.api, driver.signals)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            # A wait that starts with no selected tx reselects a live scoped tx.
+            driver.tx = None
+            driver.wait(_ProbeSignal("reselect", False))
+            driver.drive()
+            with self.assertRaisesRegex(RuntimeError, "unexpected signal"):
+                driver.signal({_ProbeSignal("unexpected", True)})
+            self.assertIs(driver.tx, tx)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_route_install_and_public_until_wrapper(self):
+        scenario = Scenario()
+        ev = scenario.Event()
+        seen = []
+        def worker():
+            ev.wait()
+        def route_a(d):
+            d.route(route_b)
+            return
+            yield
+        def route_b(d):
+            seen.append('b')
+            return
+            yield
+        with scenario:
+            t = scenario.thread(worker)
+            scenario.wait(t)
+            d = scenario.Driver(t)
+            d.route(route_a)
+            d()
+            self.assertEqual(seen, ['b'])
+            self.assertFalse(d.routed)
+            d.close()
+            scenario.raw(ev).set()
+
+        score = Scenario()._core
+        score.entered = True
+        core_driver = score.Driver(threading.Thread(target=lambda: None,
+                                                    name="route-direct"))
+        core_driver.closure = lambda: None
+        self.assertTrue(core_driver.resume_route())
+
+        wrapper = Scenario().Driver(threading.Thread(target=lambda: None,
+                                                    name="public-until"))
+        with self.assertRaisesRegex(RuntimeError, "scenario not entered"):
+            wrapper.until(wrapper.terminated)
+
+
+    def test_driver_remaining_direct_resolution_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            self.assertFalse(driver.live_base_blocks())
+
+            driver.select_tx(tx)
+            driver.drive_tx = tx
+            driver.snapshot_tx = tx
+            driver.snapshot_state = State.COMMITTED
+            driver.target = State.PAUSED
+            tx.state = State.EXITING
+            self.assertFalse(driver.prepare_drive_start())
+            self.assertIs(driver.state, driver.mutated)
+
+            driver.select_tx(tx)
+            scenario._core.transactions[thread] = tx
+            scenario._core.transaction_apis[thread] = tx.api
+            self.assertFalse(driver.surface_nested_child())
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True, tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.pause()
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.impasse)
+
+            base_tx.state = State.WAITING
+            driver.scan(); driver.drive()
+            driver.finish()
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.impasse)
+
+            base_tx.state = State.WAITING
+            driver.scan(); driver.drive()
+            driver.finish()
+            tx.state = State.STALLED
+            driver.drive()
+            self.assertIs(driver.state, driver.mutated)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_until_configure_edges(self):
+        fixture = self.make_driver_with_tx(base=True, tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.until(driver.impasse)
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.success)
+
+            base_tx.state = State.WAITING
+            driver.scan(); driver.drive()
+            driver.until(driver.terminated)
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.impasse)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.configure_until_terminated_wait(None)
+            self.assertIs(driver.state, driver.success)
+
+            driver.base_thread_signal[Terminated] = _ProbeSignal("alive", False)
+            scenario._core.transactions[thread] = tx
+            scenario._core.transaction_apis[thread] = tx.api
+            driver.configure_until_terminated_wait(None)
+            self.assertIs(driver.state, driver.persisted)
+
+            tx.state = State.RETURNED
+            driver.configure_until_raised_wait(tx)
+            self.assertIs(driver.state, driver.returned)
+
+            tx.state = State.BLOCKED
+            driver.listen_predicate = False
+            driver.listen_action = False
+            driver.configure_until_raised_wait(tx)
+            self.assertNotIn(driver.thread_signal[Predicate], driver.signals)
+            self.assertNotIn(driver.thread_signal[Action], driver.signals)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True, tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.base_thread_signal[Terminated] = _ProbeSignal("impasse-wait", False)
+            driver.configure_until_impasse_wait()
+            self.assertIn(base_tx.api, driver.signals)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_reenter_resume_and_scan_signal_edges(self):
+        fixture = self.make_driver_with_tx(base=True, tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan(); driver.drive()
+            driver.reenter()
+            base_tx.state = State.PAUSED
+            driver.drive()
+            self.assertIs(driver.state, driver.impasse)
+
+            base_tx.state = State.WAITING
+            driver.scan(); driver.drive()
+            driver.reenter()
+            tx.state = State.STALLED
+            driver.drive()
+            self.assertIs(driver.state, driver.mutated)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            signal = _ProbeSignal("callback", True)
+            driver.callback_signal = signal
+            driver.tx = None
+            driver.resume()
+            driver.drive()
+            self.assertIs(driver.tx, tx)
+            self.assertIn(tx, driver.signals)
+
+            driver.drive_kind = 'reenter'
+            driver.select_tx(tx)
+            term = driver.base_thread_signal[Terminated]
+            driver.signal_reenter({term})
+            self.assertIs(driver.state, driver.terminated)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(base=True, tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.scan_target = tx
+            tx.state = State.RETURNED
+            driver.signal_scan(set())
+            self.assertIs(driver.state, driver.impasse)
+
+            tx.state = State.BLOCKED
+            driver.scan_target = None
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            base_tx.state = State.PAUSED
+            driver.signal_scan(set())
+            self.assertIs(driver.state, driver.impasse)
+
+            base_tx.state = State.WAITING
+            driver.base_thread_signal[Terminated] = _ProbeSignal("scan-alive", False)
+            driver.signal_scan(set())
+            self.assertIs(driver.state, driver.driving)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_wait_and_tx_signal_resolution_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            never = _ProbeSignal("never", False)
+            driver.wait(never)
+            driver.drive()
+            driver.tx = None
+            driver.signal_wait(set())
+            self.assertIs(driver.tx, tx)
+            self.assertIs(driver.state, driver.driving)
+
+            tx.state = State.RETURNED
+            driver.select_tx(tx)
+            driver.drive_kind = 'wait'
+            driver.wait_keys = frozenset()
+            driver.signals = frozenset()
+            with self.assertRaisesRegex(RuntimeError, "unexpected signal"):
+                driver.signal_wait(set())
+
+            driver.tx = None
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.drive_kind = 'wait'
+            with self.assertRaisesRegex(RuntimeError, "unexpected signal"):
+                driver.signal_wait(set())
+
+            tx.state = State.BLOCKED
+            scenario._core.transactions[thread] = tx
+            scenario._core.transaction_apis[thread] = tx.api
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.PAUSED
+            driver.success_signal = _ProbeSignal("nested-false", False)
+            driver.state = driver.driving
+            driver.signal_tx_drive({driver.thread_signal[Nested]})
+            self.assertIs(driver.state, driver.driving)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'until-terminated-watch'
+            driver.signal_until_terminated(set())
+            self.assertIs(driver.state, driver.persisted)
+
+            driver.drive_kind = 'until-terminated-watch'
+            scenario._core.transactions.pop(thread, None)
+            scenario._core.transaction_apis.pop(thread, None)
+            driver.base_thread_signal[Terminated] = _ProbeSignal("alive-watch", False)
+            driver.signal_until_terminated(set())
+            self.assertIs(driver.state, driver.driving)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+        fixture = self.make_driver_with_tx(tx_state=State.BLOCKED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.select_tx(tx)
+            driver.drive_kind = 'until-terminated-finish'
+            tx.state = State.RAISED
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.raised)
+
+            tx.state = State.RETURNED
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.WAITING
+            driver.success_signal = _ProbeSignal("success", True)
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.success)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.WAITING
+            driver.success_signal = _ProbeSignal("no-success", False)
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.overshot)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'reenter'
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.success)
+
+            tx.state = State.RAISED
+            driver.select_tx(tx)
+            driver.drive_kind = 'resume'
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.raised)
+
+            tx.state = State.RETURNED
+            driver.select_tx(tx)
+            driver.drive_kind = 'until'
+            driver.target = driver.terminated
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.success)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'other'
+            driver.signal_tx_drive({tx})
+            self.assertIs(driver.state, driver.success)
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+    def test_driver_park_and_impasse_signal_resolution_edges(self):
+        fixture = self.make_driver_with_tx(tx_state=State.STALLED)
+        scenario, lock, thread, base_tx, tx, driver = fixture
+        try:
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.PAUSED
+            driver.success_signal = _ProbeSignal("occupancy", False)
+            driver.signals = frozenset({driver.success_signal})
+            driver.state = driver.driving
+            driver.signal_tx_drive({driver.success_signal})
+            self.assertIs(driver.state, driver.driving)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.PAUSED
+            driver.success_signal = _ProbeSignal("occupancy-high", True)
+            driver.signal_tx_drive(set())
+            self.assertIs(driver.state, driver.success)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.STALLED
+            driver.success_signal = _ProbeSignal("state-signal", False)
+            driver.signal_tx_drive({driver.thread_signal[State.STALLED]})
+            self.assertIs(driver.state, driver.success)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.COMMIT
+            driver.success_signal = _ProbeSignal("resample", True)
+            driver.signal_tx_drive(set())
+            self.assertIs(driver.state, driver.success)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            driver.target = State.COMMIT
+            driver.success_signal = _ProbeSignal("still-waiting", False)
+            driver.signals = frozenset({driver.success_signal})
+            returned = driver.signal_tx_drive(set())
+            self.assertEqual(returned, driver.signals)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'park'
+            term = driver.base_thread_signal[Terminated]
+            driver.signal_tx_drive({term})
+            self.assertIs(driver.state, driver.terminated)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'until-impasse'
+            driver.base_thread_signal[Terminated] = _ProbeSignal("until-impasse-term", True)
+            driver.signal_until_impasse({driver.base_thread_signal[Terminated]})
+            self.assertIs(driver.state, driver.terminated)
+
+            driver.select_tx(tx)
+            driver.drive_kind = 'until-impasse'
+            driver.base_thread_signal[Terminated] = _ProbeSignal("until-impasse-live", False)
+            returned = driver.signal_until_impasse(set())
+            self.assertIs(returned, driver.signals)
+
+            driver.being_driven = True
+            with self.assertRaisesRegex(RuntimeError, "already being driven"):
+                driver()
+        finally:
+            self.cleanup_driver_fixture(scenario, thread)
+
+
+    def test_driver_deep_helpers_handle_children_and_scan_failures(self):
+        scenario = Scenario()
+        score = scenario._core
+        class Tx:
+            def __init__(self, state=State.BLOCKED, done=False):
+                self.state = state
+                self.done = done
+        class D:
+            success = score.Driver.success
+            terminated = score.Driver.terminated
+            raised = score.Driver.raised
+            impasse = score.Driver.impasse
+            overshot = score.Driver.overshot
+            mutated = score.Driver.mutated
+            def __init__(self, tx):
+                self.tx = tx
+                self.state = self.success
+                self.ops = []
+                self.child = Tx()
+                self.surfaced = False
+                self.scan_success = True
+            def scan(self):
+                self.ops.append('scan')
+            def finish(self):
+                self.ops.append(('finish', self.tx))
+            def pause(self):
+                self.ops.append(('pause', self.tx))
+            def __call__(self):
+                op = self.ops[-1]
+                if op == 'scan':
+                    if self.scan_success:
+                        self.tx = self.root
+                        self.state = self.success
+                    else:
+                        self.state = self.terminated
+                    return
+                name, tx = op
+                self.state = self.success
+                if name == 'finish':
+                    if tx is self.root:
+                        if not self.surfaced:
+                            self.surfaced = True
+                            self.tx = self.child
+                        else:
+                            tx.done = True
+                            tx.state = State.RETURNED
+                    else:
+                        tx.done = True
+                        tx.state = State.RETURNED
+                elif name == 'pause':
+                    if tx is self.root and not self.surfaced:
+                        self.surfaced = True
+                        self.tx = self.child
+                    else:
+                        tx.state = State.PAUSED
+
+        probe = D(Tx())
+        probe.root = probe.tx
+        probe.ops.append(('noop', probe.tx))
+        probe()
+        self.assertIs(probe.state, probe.success)
+
+        with self.assertRaisesRegex(RuntimeError, "finish_deep requires"):
+            score.driver_finish_deep(types.SimpleNamespace(tx=None))
+        with self.assertRaisesRegex(RuntimeError, "pause_deep requires"):
+            score.driver_pause_deep(types.SimpleNamespace(tx=None))
+
+        root = Tx()
+        d = D(root)
+        d.root = root
+        score.driver_finish_deep(d)
+        self.assertTrue(root.done)
+        self.assertTrue(d.child.done)
+        self.assertIn('scan', d.ops)
+
+        root = Tx()
+        d = D(root)
+        d.root = root
+        d.scan_success = False
+        score.driver_finish_deep(d)
+        self.assertIn('scan', d.ops)
+        self.assertFalse(root.done)
+
+        root = Tx()
+        d = D(root)
+        d.root = root
+        score.driver_pause_deep(d)
+        self.assertIs(root.state, State.PAUSED)
+        self.assertTrue(d.child.done)
+
+        root = Tx()
+        d = D(root)
+        d.root = root
+        d.scan_success = False
+        score.driver_pause_deep(d)
+        self.assertIn('scan', d.ops)
+        self.assertIs(root.state, State.BLOCKED)
+
+    def test_driver_deep_routes_handle_scan_and_child_branches(self):
+        scenario = Scenario()
+        score = scenario._core
+        class Tx:
+            def __init__(self, state=State.BLOCKED, done=False):
+                self.state = state
+                self.done = done
+        class D:
+            success = score.Driver.success
+            terminated = score.Driver.terminated
+            def __init__(self, tx):
+                self.tx = tx
+                self.state = self.success
+                self.ops = []
+            def scan(self):
+                self.ops.append('scan')
+            def finish(self):
+                self.ops.append('finish')
+            def pause(self):
+                self.ops.append('pause')
+
+        root = Tx()
+        child = Tx(done=True)
+        d = D(root)
+        gen = score.route_finish_deep(d)
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['finish'])
+        d.state = d.success
+        d.tx = child
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['finish', 'scan'])
+        d.state = d.terminated
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        root = Tx()
+        child = Tx()
+        d = D(root)
+        gen = score.route_pause_deep(d)
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['pause'])
+        d.state = d.success
+        d.tx = child
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['pause', 'finish'])
+        d.state = d.terminated
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        root = Tx(done=True)
+        d = D(root)
+        gen = score.route_pause_deep(d)
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['scan'])
+        d.state = d.success
+        d.tx = root
+        self.assertEqual(next(gen), None)
+        self.assertEqual(d.ops, ['scan', 'pause'])
+        d.state = d.terminated
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        root = Tx()
+        child = Tx(done=True)
+        d = D(root)
+        gen = score.route_finish_deep(d)
+        self.assertEqual(next(gen), None)
+        d.state = d.success
+        d.tx = child
+        self.assertEqual(next(gen), None)
+        d.state = d.success
+        d.tx = root
+        self.assertEqual(next(gen), None)
+
+        root = Tx(done=True)
+        d = D(root)
+        gen = score.route_pause_deep(d)
+        self.assertEqual(next(gen), None)
+        d.state = d.terminated
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        root = Tx()
+        child = Tx()
+        d = D(root)
+        gen = score.route_pause_deep(d)
+        self.assertEqual(next(gen), None)
+        d.state = d.success
+        d.tx = child
+        self.assertEqual(next(gen), None)
+        child.done = True
+        d.state = d.success
+        self.assertEqual(next(gen), None)
+
+        root = Tx()
+        d = D(root)
+        gen = score.route_pause_deep(d)
+        self.assertEqual(next(gen), None)
+        d.state = d.terminated
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        d = D(None)
+        gen = score.route_pause_deep(d)
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+    def test_public_reenter_resume_wrappers_guard_scenario_entry(self):
+        scenario = Scenario()
+        thread = threading.Thread(target=lambda: None, name="wrapper-guard")
+        driver = scenario.Driver(thread)
+        with self.assertRaisesRegex(RuntimeError, "scenario not entered"):
+            driver.reenter()
+        with self.assertRaisesRegex(RuntimeError, "scenario not entered"):
+            driver.resume()
 
 
 class TestLockAssignCoreErrorCoverage(unittest.TestCase):
@@ -1875,31 +2979,40 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
         def __init__(self, score, thread, state, method, tx_state, *, result=None):
             self.thread = thread
             self.state = state
+            self.mode = state
             self.impasse = score.Driver.impasse
             self.terminated = score.Driver.terminated
-            self.active = score.Driver.active
-            self.finished = score.Driver.finished
-            self.parked = score.Driver.parked
+            self.success = score.Driver.success
+            self.raised = score.Driver.raised
+            self.overshot = score.Driver.overshot
+            self.mutated = score.Driver.mutated
             self.tx = types.SimpleNamespace(
                 method=method,
                 state=tx_state,
                 result=result,
+                done=False,
             )
             self.finish_calls = 0
             self.pause_calls = 0
             self.drive_calls = 0
             self.on_call = None
-        def finish(self, autoskip=False):
+        def scan(self):
+            self.scan_calls = getattr(self, 'scan_calls', 0) + 1
+        def finish(self):
             self.finish_calls += 1
-            self.state = self.finished
-        def pause(self, autoskip=False):
+            self.tx.done = True
+            self.tx.state = State.RETURNED
+            self.state = self.success
+            self.mode = self.success
+        def pause(self):
             self.pause_calls += 1
-            self.state = self.parked
+            self.tx.state = State.PAUSED
+            self.state = self.success
+            self.mode = self.success
         def __call__(self):
             if self.on_call is not None:
                 return self.on_call(self)
             self.drive_calls += 1
-            self.state = self.finished
 
     def with_fake_driver(self, scenario, drivers, func):
         score = scenario._core
@@ -1929,12 +3042,12 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
         lock = scenario.Lock()
         driver = self.FakeAssignDriver(
             scenario._core, threading.Thread(target=lambda: None),
-            scenario._core.Driver.active, lock.acquire, State.BLOCKED)
+            scenario._core.Driver.success, lock.acquire, State.BLOCKED)
         driver.pause()
         self.assertEqual(driver.pause_calls, 1)
         driver()
         self.assertEqual(driver.drive_calls, 1)
-        self.assertIs(driver.state, driver.finished)
+        self.assertIs(driver.state, driver.success)
 
     def test_assign_reports_base_terminated_before_acquire(self):
         scenario = Scenario()
@@ -1954,7 +3067,7 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
         acquirer = threading.Thread(target=lambda: None, name="assign-wrong")
 
         wrong_method = self.FakeAssignDriver(
-            scenario._core, acquirer, scenario._core.Driver.active,
+            scenario._core, acquirer, scenario._core.Driver.success,
             lock.release, State.BLOCKED)
         with self.assertRaisesRegex(RuntimeError, "expected 'assign-wrong' to call"):
             self.with_fake_driver(
@@ -1962,7 +3075,7 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
                 lambda: lock._core.assign(acquirer, None, False))
 
         wrong_state = self.FakeAssignDriver(
-            scenario._core, acquirer, scenario._core.Driver.active,
+            scenario._core, acquirer, scenario._core.Driver.success,
             lock.acquire, State.COMMIT)
         with self.assertRaisesRegex(RuntimeError, "to be BLOCKED"):
             self.with_fake_driver(
@@ -1979,14 +3092,15 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
             lock._core.actual_held = lambda: True
             error = RuntimeError("release exploded")
             r = self.FakeAssignDriver(
-                scenario._core, releaser, scenario._core.Driver.active,
+                scenario._core, releaser, scenario._core.Driver.success,
                 lock.release, State.BLOCKED)
             a = self.FakeAssignDriver(
-                scenario._core, acquirer, scenario._core.Driver.active,
+                scenario._core, acquirer, scenario._core.Driver.success,
                 lock.acquire, State.BLOCKED)
             def releaser_call(driver):
                 driver.drive_calls += 1
-                driver.state = driver.finished
+                driver.state = driver.success
+                driver.tx.done = True
                 driver.tx.state = State.RAISED
                 driver.tx.result = error
             r.on_call = releaser_call
@@ -2000,11 +3114,12 @@ class TestLockAssignCoreErrorCoverage(unittest.TestCase):
         lock = scenario.Lock()
         acquirer = threading.Thread(target=lambda: None, name="assign-timeout")
         d = self.FakeAssignDriver(
-            scenario._core, acquirer, scenario._core.Driver.active,
+            scenario._core, acquirer, scenario._core.Driver.success,
             lock.acquire, State.BLOCKED)
         def acquirer_call(self):
             self.drive_calls += 1
-            self.state = self.finished
+            self.state = self.success
+            self.tx.done = True
             self.tx.state = State.RETURNED
             self.tx.result = False
         d.on_call = acquirer_call
@@ -2034,6 +3149,29 @@ class TestRelayAdditionalCoverage(unittest.TestCase):
         d.base_tx = None
         with self.assertRaisesRegex(RuntimeError, "terminated before"):
             lock._core._relay_check(d, "acquire")
+
+    def test_relay_cleanup_skips_done_driver(self):
+        scenario = Scenario()
+        lock = scenario.Lock()
+        thread = threading.Thread(target=lambda: None, name="relay-done")
+
+        class DoneDriver:
+            done = True
+            def __init__(self):
+                self.thread = thread
+                self.closed = 0
+            def scan(self):
+                raise RuntimeError("relay boom")
+            def close(self):
+                self.closed += 1
+
+        driver = DoneDriver()
+        relay = lock._core._relay_generator([driver], pause=False)
+        with self.assertRaisesRegex(RuntimeError, "relay boom"):
+            next(relay)
+        self.assertEqual(driver.closed, 0)
+        driver.close()
+        self.assertEqual(driver.closed, 1)
 
     def test_relay_pause_leaves_acquirer_paused_until_unpaused(self):
         scenario = Scenario()
@@ -2079,16 +3217,19 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
             super().__init__(score, name)
             self.thread = threading.Thread(target=lambda: None, name=name)
             self.state = state
+            self.mode = state
             self.impasse = score.Driver.impasse
             self.terminated = score.Driver.terminated
-            self.active = score.Driver.active
-            self.finished = score.Driver.finished
-            self.parked = score.Driver.parked
+            self.success = score.Driver.success
+            self.raised = score.Driver.raised
+            self.overshot = score.Driver.overshot
+            self.mutated = score.Driver.mutated
             self.base_tx = base_tx
             self.tx = types.SimpleNamespace(
                 method=method,
                 state=tx_state,
                 result=result,
+                done=False,
                 timed_out=False,
                 timeout=None,
                 kwargs={'blocking': True},
@@ -2097,14 +3238,21 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
             )
             self.finish_calls = 0
             self.pause_calls = 0
+        def scan(self):
+            self.calls.append(("scan",))
         def __call__(self):
             self.calls.append(("call",))
-        def finish(self, autoskip=False):
+        def finish(self):
             self.finish_calls += 1
-            self.state = self.finished
-        def pause(self, autoskip=False):
+            self.tx.done = True
+            self.tx.state = State.RETURNED
+            self.state = self.success
+            self.mode = self.success
+        def pause(self):
             self.pause_calls += 1
-            self.state = self.parked
+            self.tx.state = State.PAUSED
+            self.state = self.success
+            self.mode = self.success
 
     def with_fake_allocate_drivers(self, scenario, drivers, func):
         score = scenario._core
@@ -2125,7 +3273,7 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         scenario = Scenario()
         sem = scenario.Semaphore()
         driver = self.FakeAllocateDriver(
-            scenario._core, "alloc-default", scenario._core.Driver.active,
+            scenario._core, "alloc-default", scenario._core.Driver.success,
             sem.acquire, State.BLOCKED)
         driver()
         driver.finish()
@@ -2147,14 +3295,14 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
                 scenario, [d], lambda: list(core.allocate([(d.thread, object())])))
 
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-wrong-method", scenario._core.Driver.active,
+            scenario._core, "alloc-wrong-method", scenario._core.Driver.success,
             object(), State.BLOCKED)
         with self.assertRaisesRegex(ValueError, "calling acquire or release"):
             self.with_fake_allocate_drivers(
                 scenario, [d], lambda: list(core.allocate([(d.thread, None)])))
 
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-wrong-state", scenario._core.Driver.active,
+            scenario._core, "alloc-wrong-state", scenario._core.Driver.success,
             sem.acquire, State.COMMIT)
         with self.assertRaisesRegex(RuntimeError, "must be at BLOCKED"):
             self.with_fake_allocate_drivers(
@@ -2164,7 +3312,7 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         scenario = Scenario()
         sem = scenario.Semaphore(0)
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-timeout", scenario._core.Driver.active,
+            scenario._core, "alloc-timeout", scenario._core.Driver.success,
             sem.acquire, State.BLOCKED, result=False)
         d.tx.timed_out = True
         d.tx.kwargs = {'blocking': False}
@@ -2173,6 +3321,18 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
                 scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)])))
         self.assertEqual(d.finish_calls, 1)
 
+    def test_allocate_cleanup_skips_done_driver(self):
+        scenario = Scenario()
+        sem = scenario.Semaphore(1)
+        d = self.FakeAllocateDriver(
+            scenario._core, "alloc-done-wrong-method", scenario._core.Driver.success,
+            object(), State.BLOCKED)
+        d.done = True
+        with self.assertRaisesRegex(ValueError, "calling acquire or release"):
+            self.with_fake_allocate_drivers(
+                scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)])))
+        self.assertEqual(d.closed, 0)
+
     def test_allocate_reports_unexpected_start_state(self):
         scenario = Scenario()
         sem = scenario.Semaphore(1)
@@ -2180,7 +3340,7 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         d = self.FakeAllocateDriver(
             scenario._core, "alloc-strange-start", strange,
             sem.acquire, State.BLOCKED)
-        with self.assertRaisesRegex(RuntimeError, "unexpected Driver state"):
+        with self.assertRaisesRegex(RuntimeError, "unexpected Driver"):
             self.with_fake_allocate_drivers(
                 scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)])))
         self.assertEqual(d.closed, 1)
@@ -2192,7 +3352,7 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         self.assertEqual(sem._core.value, 0)
         sem._core.actual._initial_value = None
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-release-unknown-bound", scenario._core.Driver.active,
+            scenario._core, "alloc-release-unknown-bound", scenario._core.Driver.success,
             sem.release, State.BLOCKED)
         result = self.with_fake_allocate_drivers(
             scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)])))
@@ -2203,7 +3363,7 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         scenario = Scenario()
         sem = scenario.Semaphore(0)
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-zero-timeout", scenario._core.Driver.active,
+            scenario._core, "alloc-zero-timeout", scenario._core.Driver.success,
             sem.acquire, State.BLOCKED, result=True)
         d.tx.timeout = 0
         result = self.with_fake_allocate_drivers(
@@ -2215,13 +3375,14 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         scenario = Scenario()
         sem = scenario.Semaphore(1)
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-pause-strange", scenario._core.Driver.active,
+            scenario._core, "alloc-pause-strange", scenario._core.Driver.success,
             sem.acquire, State.BLOCKED, result=True)
-        def strange_pause(autoskip=False):
+        d.strange = types.SimpleNamespace(name='STRANGE')
+        def strange_pause():
             d.pause_calls += 1
-            d.state = d.finished
+            d.state = d.strange
         d.pause = strange_pause
-        with self.assertRaisesRegex(RuntimeError, "unexpected Driver state"):
+        with self.assertRaisesRegex(RuntimeError, "unexpected Driver"):
             self.with_fake_allocate_drivers(
                 scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)], pause=True)))
         self.assertEqual(d.pause_calls, 1)
@@ -2230,108 +3391,56 @@ class TestSemaphoreAllocateCoreErrorCoverage(unittest.TestCase):
         scenario = Scenario()
         sem = scenario.Semaphore(1)
         d = self.FakeAllocateDriver(
-            scenario._core, "alloc-finish-strange", scenario._core.Driver.active,
+            scenario._core, "alloc-finish-strange", scenario._core.Driver.success,
             sem.release, State.BLOCKED)
-        def strange_finish(autoskip=False):
+        d.strange = types.SimpleNamespace(name='STRANGE')
+        def strange_finish():
             d.finish_calls += 1
-            d.state = d.active
+            d.tx.done = True
+            d.state = d.strange
         d.finish = strange_finish
-        with self.assertRaisesRegex(RuntimeError, "unexpected Driver state"):
+        with self.assertRaisesRegex(RuntimeError, "unexpected Driver"):
             self.with_fake_allocate_drivers(
                 scenario, [d], lambda: list(sem._core.allocate([(d.thread, None)])))
         self.assertEqual(d.finish_calls, 1)
 
 class TestFinalPrimitiveCoverageEdges(unittest.TestCase):
-    def make_driver_fixture(self):
-        import time
-        scenario = Scenario()
-        lock = scenario.Lock()
-        score = scenario._core
-        core = lock._core
-        thread = threading.Thread(target=lambda: None, name="driver-final")
-        parent = core.methods[lock.acquire](lock.acquire, time.monotonic(), regulated=False)
-        child = core.methods[lock.locked](lock.locked, time.monotonic(), regulated=False)
-        parent.state = State.BLOCKED
-        child.state = State.BLOCKED
-        child.parent = parent
-        parent.child = child
-        score.transactions[thread] = parent
-        score.transaction_apis[thread] = parent.api
-        score.entered = True
-        driver = score.Driver(thread)
-        driver.initialize()
-        self.assertIs(driver.tx, parent)
-        return scenario, lock, thread, parent, child, driver
+    def test_dispatch_rejects_recursion_and_rewaits_routed_driver(self):
+        score = Scenario()._core
+        dispatch = score.Dispatch()
+        dispatch.driving = True
+        with self.assertRaisesRegex(RuntimeError, "recursively"):
+            next(dispatch)
+        dispatch.driving = False
 
-    def cleanup_driver_fixture(self, scenario, thread):
-        score = scenario._core
-        score.transactions.pop(thread, None)
-        score.transaction_apis.pop(thread, None)
-        score.drivers.pop(thread, None)
-        score.entered = False
+        first = object()
+        second = object()
 
-    def test_driver_delegate_parking_nested_signal_rotates_to_child(self):
-        scenario, lock, thread, parent, child, driver = self.make_driver_fixture()
+        class RoutedDriver(FakeDriver):
+            def __init__(self, score):
+                super().__init__(score, "routed-dispatch", signals={first})
+                self.route_iterator = object()
+            def slot_empty(self):
+                return True
+            def proceed(self):
+                self.calls.append(("proceed",))
+                self.route_iterator = None
+                self.signals = frozenset({second})
+                return self.signals
+
+        driver = RoutedDriver(score)
+        driver.register(dispatch)
+        dispatch.drivers[driver] = frozenset({first})
+        waits = [frozenset({first}), frozenset({second})]
+        original_wait = score.wait
         try:
-            parent.is_delegate = lambda candidate: candidate is child
-            driver.target = State.WAITING
-            driver.to(driver.parking)
-            scenario._core.transactions[thread] = child
-            scenario._core.transaction_apis[thread] = child.api
-            signals = {driver.thread_signal[Nested]}
-            driver.signal(signals)
-            self.assertIs(driver.state, driver.parking)
-            self.assertIs(driver.tx, child)
-            self.assertIs(driver.base, child)
+            score.wait = lambda signals: waits.pop(0)
+            yielded = next(dispatch)
         finally:
-            self.cleanup_driver_fixture(scenario, thread)
-
-    def test_driver_stacked_parking_parent_terminal_overshoots(self):
-        scenario, lock, thread, parent, child, driver = self.make_driver_fixture()
-        try:
-            driver.tx = child
-            driver.state = driver.parking
-            driver.target = State.WAITING
-            driver.stack.append((parent, driver.parking, State.WAITING, parent))
-            driver.cache_tx = lambda: setattr(driver, "tx", None)
-            parent.state = State.RETURNED
-            with self.assertRaisesRegex(RuntimeError, "overshot target WAITING"):
-                driver.signal({child})
-            self.assertIs(driver.state, driver.raised)
-        finally:
-            self.cleanup_driver_fixture(scenario, thread)
-
-    def test_driver_stacked_repop_parking_overshoots(self):
-        scenario, lock, thread, parent, child, driver = self.make_driver_fixture()
-        try:
-            grandparent = parent
-            parent2 = types.SimpleNamespace(state=State.RETURNED)
-            child.parent = parent
-            driver.tx = child
-            driver.state = driver.skipping
-            driver.target = State.WAITING
-            driver.stack.extend([
-                (grandparent, driver.parking, State.WAITING, grandparent),
-                (parent, driver.skipping, State.WAITING, parent),
-            ])
-            survivor = types.SimpleNamespace(api=object(), parent=parent2)
-            driver.cache_tx = lambda: setattr(driver, "tx", survivor)
-            with self.assertRaisesRegex(RuntimeError, "overshot target WAITING"):
-                driver.signal({child})
-            self.assertIs(driver.state, driver.raised)
-        finally:
-            self.cleanup_driver_fixture(scenario, thread)
-
-    def test_driver_parking_canary_overshoots(self):
-        scenario, lock, thread, parent, child, driver = self.make_driver_fixture()
-        try:
-            driver.target = State.WAITING
-            driver.to(driver.parking)
-            with self.assertRaisesRegex(RuntimeError, "reached COMMITTED"):
-                driver.signal({driver.thread_signal[State.COMMITTED]})
-            self.assertIs(driver.state, driver.raised)
-        finally:
-            self.cleanup_driver_fixture(scenario, thread)
+            score.wait = original_wait
+        self.assertIs(yielded, driver)
+        self.assertIn(("proceed",), driver.calls)
+        self.assertFalse(waits)
 
     def test_dispatch_ignores_driver_removed_while_waiting(self):
         score = Scenario()._core
@@ -2385,27 +3494,27 @@ class TestFinalPrimitiveCoverageEdges(unittest.TestCase):
         cycle.wait_for_methods = (core.primitive.wait_for, core.raw.wait_for)
         cycle.wait_for_drivers = set()
         cycle.ensure_ul_free = lambda: None
+        import time
         thread = threading.Thread(target=lambda: None, name="wf-no-outcome")
-        tx = types.SimpleNamespace(
-            method=core.primitive.wait_for,
-            state=State.COMMIT,
-            api=object(),
-            validate=lambda **kwargs: None,
-        )
+        tx = core.methods[cond.wait_for](
+            cond.wait_for, time.monotonic(), regulated=False,
+            predicate=lambda: False)
+        tx.thread = thread
+        tx.state = State.COMMIT
         class Driverish:
             pass
         d = Driverish()
         d.thread = thread
         d.tx = tx
-        d.state = scenario._core.Driver.active
+        d.state = scenario._core.Driver.success
         d.listen_predicate = False
-        d.reentered = scenario._core.Driver.reentered
+        d.callback_signal = None
+        d.signaled = frozenset()
         d.pausing = lambda: None
-        d.__call__ = lambda self=d: None
         d.__class__.__call__ = lambda self: None
         with self.assertRaisesRegex(RuntimeError, "predicate neither waited nor succeeded"):
             cycle.drive_waiter(d)
-        self.assertTrue(d.listen_predicate)
+        self.assertFalse(d.listen_predicate)
 
 
 class TestConditionCycleReenteredCoverage(unittest.TestCase):
@@ -2441,21 +3550,55 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
         d = Driverish()
         d.thread = thread
         d.tx = wait_tx
-        d.state = score.Driver.parked
-        d.reentered = score.Driver.reentered
+        d.state = score.Driver.success
+        d.success = score.Driver.success
+        d.terminated = score.Driver.terminated
+        d.raised = score.Driver.raised
+        d.impasse = score.Driver.impasse
+        d.overshot = score.Driver.overshot
+        d.mutated = score.Driver.mutated
+        d.signaled = frozenset()
         d.listen_predicate = False
         d.finish_calls = 0
         d.pause_calls = 0
+        d.waiting_calls = 0
+        d.scan_calls = 0
         d.call_count = 0
+        d._staged = None
+        d._wait_signals = None
         def finish():
             d.finish_calls += 1
+            d._staged = 'finish'
         def pause():
             d.pause_calls += 1
+            d._staged = 'pause'
+        def scan():
+            d.scan_calls += 1
+            d._staged = 'scan'
+        def waiting():
+            d.waiting_calls += 1
+            d._staged = 'waiting'
+        def wait(*signals):
+            d._staged = 'wait'
+            d._wait_signals = signals
         def call():
             d.call_count += 1
-            d.state = d.reentered
+            if d._staged == 'wait':
+                d.signaled = frozenset(score.wait(d._wait_signals))
+            elif d._staged == 'finish':
+                wait_tx.state = State.RETURNED
+            elif d._staged == 'pause':
+                wait_for_tx.state = State.PAUSED
+            elif d._staged == 'waiting':
+                wait_tx.state = State.WAITING
+            d.state = d.success
+            d._staged = None
+            d._wait_signals = None
         d.finish = finish
         d.pause = pause
+        d.scan = scan
+        d.waiting = waiting
+        d.wait = wait
         d.__class__.__call__ = lambda self: call()
         cycle.ready = [d]
         cycle.wait_for_drivers.add(d)
@@ -2482,6 +3625,18 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
                 score.lock.release()
         self.assertFalse(results)
         return wf, cycle, d, calls
+
+
+    def test_driverish_fake_directives_cover_all_staged_branches(self):
+        scenario, score, wf, wait_tx, cycle, d = self.make_cycle_and_driver()
+        d.pause(); d()
+        self.assertEqual(d.pause_calls, 1)
+        self.assertIs(wf._core.state, State.PAUSED)
+        d.scan(); d()
+        self.assertEqual(d.scan_calls, 1)
+        d.waiting(); d()
+        self.assertEqual(d.waiting_calls, 1)
+        self.assertIs(wait_tx.state, State.WAITING)
 
     def test_condition_cycle_wait_reruns_scheduler_then_thread_terminates(self):
         scenario, score, wf, wait_tx, cycle, d = self.make_cycle_and_driver()
@@ -2510,6 +3665,7 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
         wf, cycle, d, calls = self.run_act_one_with_waits(
             'wake',
             [
+                lambda wf, thread: {primitives_module.Predicate(wf)},
                 lambda wf, thread: {Not(primitives_module.Predicate(wf))},
                 lambda wf, thread: {wf},
             ])
@@ -2522,18 +3678,20 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
         wf, cycle, d, calls = self.run_act_one_with_waits(
             'pause',
             [
+                lambda wf, thread: {primitives_module.Predicate(wf)},
                 lambda wf, thread: {Not(primitives_module.Predicate(wf))},
                 lambda wf, thread: {primitives_module.Paused(wf)},
             ])
         self.assertEqual(cycle.scheduler_calls, [wf])
         self.assertIs(cycle.previous, d)
         self.assertFalse(d.listen_predicate)
-        self.assertEqual(d.pause_calls, 1)
+        self.assertEqual(d.pause_calls, 0)
 
     def test_condition_cycle_wake_reentered_returns_on_thread_termination(self):
         wf, cycle, d, calls = self.run_act_one_with_waits(
             'wake',
             [
+                lambda wf, thread: {primitives_module.Predicate(wf)},
                 lambda wf, thread: {Not(primitives_module.Predicate(wf))},
                 lambda wf, thread: {Terminated(thread)},
             ])
@@ -2545,7 +3703,6 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
         scenario, score, wf, wait_tx, cycle, d = self.make_cycle_and_driver()
         original_wait = score.wait
         results = [
-            lambda wf, thread: {Not(primitives_module.Predicate(wf))},
             lambda wf, thread: {Nested(wf)},
         ]
         def wait(signals):
@@ -2561,14 +3718,13 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
             if score.lock.locked():
                 score.lock.release()
         self.assertFalse(results)
-        self.assertTrue(d.listen_predicate)
+        self.assertFalse(d.listen_predicate)
         self.assertIsNone(cycle.previous)
 
     def test_condition_cycle_wake_reentered_complains_if_predicate_waited_again(self):
         scenario, score, wf, wait_tx, cycle, d = self.make_cycle_and_driver()
         original_wait = score.wait
         results = [
-            lambda wf, thread: {Not(primitives_module.Predicate(wf))},
             lambda wf, thread: {Nested(wf)},
         ]
         def wait(signals):
@@ -2584,7 +3740,7 @@ class TestConditionCycleReenteredCoverage(unittest.TestCase):
             if score.lock.locked():
                 score.lock.release()
         self.assertFalse(results)
-        self.assertTrue(d.listen_predicate)
+        self.assertFalse(d.listen_predicate)
         self.assertIsNone(cycle.previous)
 
 
@@ -2603,17 +3759,19 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
             self.method = method
             self.state = state
             self.result = None
+            self.done = False
         def validate(self, **kwargs):
             return None
 
     class CycleDriver:
         def __init__(self, score, thread, method, tx_state):
             self.thread = thread
-            self.state = score.Driver.active
+            self.state = score.Driver.success
+            self.mode = self.state
             self.impasse = score.Driver.impasse
             self.terminated = score.Driver.terminated
-            self.active = score.Driver.active
-            self.parked = score.Driver.parked
+            self.success = score.Driver.success
+            self.active = self.success
             self.done = False
             self.closed = 0
             self.tx = TestRemainingCycleErrorLineCoverage.Tx(method, tx_state)
@@ -2623,16 +3781,23 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
         def close(self):
             self.closed += 1
             self.done = True
+        def scan(self):
+            pass
         def wait(self):
             self.wait_calls += 1
-            self.state = self.parked
+            self.state = self.success
+            self.mode = self.success
             self.tx.state = State.WAITING
+        def waiting(self):
+            return self.wait()
         def stall(self):
-            self.state = self.parked
+            self.state = self.success
+            self.mode = self.success
             self.tx.state = State.STALLED
         def pausing(self):
             self.pausing_calls += 1
-            self.state = self.parked
+            self.state = self.success
+            self.mode = self.success
             self.tx.state = State.PAUSED
         def __call__(self):
             return None
@@ -2644,7 +3809,7 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
             scenario._core, threading.Thread(target=lambda: None),
             lock.acquire, State.BLOCKED)
         driver.stall()
-        self.assertIs(driver.state, driver.parked)
+        self.assertIs(driver.state, driver.success)
         self.assertIs(driver.tx.state, State.STALLED)
         driver.pausing()
         self.assertEqual(driver.pausing_calls, 1)
@@ -2669,6 +3834,21 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
             score.Driver = original_driver
             score.Dispatch = original_dispatch
 
+    def test_condition_cycle_cleanup_skips_done_driver(self):
+        scenario = Scenario()
+        cond = scenario.Condition()
+        waiter = threading.Thread(target=lambda: None, name="cond-not-waiting-done")
+        waker = threading.Thread(target=lambda: None, name="cond-notify-done")
+        waiter_driver = self.CycleDriver(scenario._core, waiter, cond.wait, State.BLOCKED)
+        waker_driver = self.CycleDriver(scenario._core, waker, cond.notify, State.BLOCKED)
+        waker_driver.done = True
+        with self.assertRaisesRegex(ValueError, "all waiters must already be in WAITING"):
+            self.with_fake_cycle_drivers(
+                scenario, [waiter_driver, waker_driver],
+                lambda: cond._core.Cycle([waiter, waker]))
+        self.assertEqual(waiter_driver.closed, 1)
+        self.assertEqual(waker_driver.closed, 0)
+
     def test_condition_cycle_rejects_notify_before_waiters_are_waiting(self):
         scenario = Scenario()
         cond = scenario.Condition()
@@ -2682,6 +3862,33 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
                 lambda: cond._core.Cycle([waiter, waker]))
         self.assertEqual(waiter_driver.closed, 1)
         self.assertEqual(waker_driver.closed, 1)
+
+    def test_event_cycle_cleanup_skips_done_driver(self):
+        scenario = Scenario()
+        event = scenario.Event()
+        waiter = threading.Thread(target=lambda: None, name="event-waiter-done")
+        setter = threading.Thread(target=lambda: None, name="event-setter-done")
+        waiter_driver = self.CycleDriver(scenario._core, waiter, event.wait, State.BLOCKED)
+        setter_driver = self.CycleDriver(scenario._core, setter, event.set, State.BLOCKED)
+        setter_driver.done = True
+        original_is_set = event._core.actual.is_set
+        original_waiter_count = event._core.actual_waiter_count
+        calls = []
+        def is_set():
+            calls.append("is_set")
+            return len(calls) > 1
+        try:
+            event._core.actual.is_set = is_set
+            event._core.actual_waiter_count = lambda: 1
+            with self.assertRaisesRegex(RuntimeError, "Event was set unexpectedly"):
+                self.with_fake_cycle_drivers(
+                    scenario, [waiter_driver, setter_driver],
+                    lambda: event._core.Cycle([waiter, setter]))
+        finally:
+            event._core.actual.is_set = original_is_set
+            event._core.actual_waiter_count = original_waiter_count
+        self.assertEqual(waiter_driver.closed, 1)
+        self.assertEqual(setter_driver.closed, 0)
 
     def test_event_cycle_reports_event_set_during_construction(self):
         scenario = Scenario()
@@ -2738,7 +3945,7 @@ class TestRemainingCycleErrorLineCoverage(unittest.TestCase):
         opener_driver = self.CycleDriver(scenario._core, opener, barrier.wait, State.BLOCKED)
         def failing_wait():
             raise RuntimeError("parking failed")
-        waiter_driver.wait = failing_wait
+        waiter_driver.waiting = failing_wait
         original_waiters = barrier._core.actual._cond._waiters
         barrier._core.actual._cond._waiters = []
         try:
@@ -2774,27 +3981,17 @@ class TestLastPrimitivesBranchCoverage(unittest.TestCase):
                 score.lock.release()
         self.assertEqual(score.waiters[signal], {sentinel})
 
-    def test_driver_stacked_repop_falls_off_stack_to_active_survivor(self):
-        fixture = TestFinalPrimitiveCoverageEdges().make_driver_fixture()
-        scenario, lock, thread, parent, child, driver = fixture
-        try:
-            other = types.SimpleNamespace(state=State.RETURNED)
-            survivor = types.SimpleNamespace(api=object(), parent=other)
-            driver.tx = child
-            driver.state = driver.skipping
-            driver.target = State.WAITING
-            hidden_parent = types.SimpleNamespace(state=State.RETURNED)
-            driver.stack.extend([
-                (hidden_parent, driver.skipping, State.WAITING, object()),
-                (parent, driver.skipping, State.WAITING, parent),
-            ])
-            driver.cache_tx = lambda: setattr(driver, "tx", survivor)
-            driver.signal({child})
-            self.assertIs(driver.state, driver.active)
-            self.assertIs(driver.tx, survivor)
-            self.assertIs(driver.base, survivor)
-        finally:
-            TestFinalPrimitiveCoverageEdges().cleanup_driver_fixture(scenario, thread)
+    def test_driver_release_pausing_is_idempotent(self):
+        score = Scenario()._core
+        driver = score.Driver(threading.Thread(target=lambda: None, name="release-pausing"))
+        driver.release_pausing()
+        tx = types.SimpleNamespace(pausing=1)
+        driver.held_pausing = True
+        driver.pausing_tx = tx
+        driver.release_pausing()
+        self.assertEqual(tx.pausing, 0)
+        self.assertFalse(driver.held_pausing)
+
 
     def test_transaction_call_with_post_commit_state_skips_commit_block(self):
         import time
@@ -2847,6 +4044,7 @@ class TestLastPrimitivesBranchCoverage(unittest.TestCase):
         cycle.scheduler = primitives_module._do_nothing
         original_wait = score.wait
         results = [
+            lambda wf, thread: {primitives_module.Predicate(wf)},
             lambda wf, thread: {Not(primitives_module.Predicate(wf))},
             lambda wf, thread: {wf},
         ]
@@ -3029,44 +4227,56 @@ class TestQueueDeliverInternalCoverage(unittest.TestCase):
             self.role = role
             self.state = state
             self.result = result
+            self.done = False
             self.method = types.SimpleNamespace(__name__='fake_queue_call')
             self.api = object()
 
     class FakeDriver:
-        idle = types.SimpleNamespace(name='IDLE')
+        undirected = types.SimpleNamespace(name='UNDIRECTED')
+        success = types.SimpleNamespace(name='SUCCESS')
         active = types.SimpleNamespace(name='ACTIVE')
-        finished = types.SimpleNamespace(name='FINISHED')
         terminated = types.SimpleNamespace(name='TERMINATED')
         impasse = types.SimpleNamespace(name='IMPASSE')
+        raised = types.SimpleNamespace(name='RAISED')
+        overshot = types.SimpleNamespace(name='OVERSHOT')
+        mutated = types.SimpleNamespace(name='MUTATED')
         strange = types.SimpleNamespace(name='STRANGE')
 
         def __init__(self, thread, base_tx, *, start_state=None, end_state=None, tx=None):
             self.thread = thread
             self.base_tx = base_tx
-            self.start_state = self.active if start_state is None else start_state
-            self.end_state = self.finished if end_state is None else end_state
+            self.start_state = self.success if start_state is None else start_state
+            self.end_state = self.success if end_state is None else end_state
             self.tx = (types.SimpleNamespace(
                 role='get',
                 state=State.BLOCKED,
                 result=None,
+                done=False,
                 method=types.SimpleNamespace(__name__='fake_queue_call'),
                 api=object()) if tx is None else tx)
-            self.state = self.idle
+            self.state = self.undirected
+            self.mode = self.undirected
             self.calls = 0
             self.finished_called = False
             self.closed = False
 
         @property
         def done(self):
-            return self.state in (self.finished, self.terminated, self.impasse)
+            return self.state in (self.terminated, self.impasse, self.raised)
+
+        def scan(self):
+            pass
 
         def __call__(self):
             self.calls += 1
             self.state = self.start_state if self.calls == 1 else self.end_state
+            self.mode = self.state
 
-        def finish(self, autoskip=False):
+        def finish(self):
             self.finished_called = True
-            self.autoskip = autoskip
+            self.tx.done = True
+            if self.tx.state is not State.RAISED:
+                self.tx.state = State.RETURNED
 
         def close(self):
             self.closed = True
@@ -3079,6 +4289,15 @@ class TestQueueDeliverInternalCoverage(unittest.TestCase):
         pairs = [(thread, None)] if pairs is None else pairs
         score.Driver = lambda thread, base_tx: driver
         return score.drive_queue_deliver(core, pairs)
+
+
+    def test_fake_driver_finish_preserves_raised_state(self):
+        tx = self.FakeTx(state=State.RAISED)
+        driver = self.FakeDriver(self.HashThread('worker'), None, tx=tx)
+        driver.finish()
+        self.assertTrue(driver.finished_called)
+        self.assertIs(tx.state, State.RAISED)
+        self.assertTrue(tx.done)
 
     def test_deliver_empty_participant_list_rejected(self):
         scenario = Scenario()

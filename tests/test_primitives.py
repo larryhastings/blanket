@@ -3024,6 +3024,90 @@ class TestBarrier(unittest.TestCase):
         self.assertIn(('w1_after', 0), results)
         self.assertIn(('w2_after', 1), results)
 
+    def test_barrier_cycle_without_action_context_manager(self):
+        """Barrier.cycle works when the Barrier has no action and no
+        scheduler is supplied."""
+        scenario = Scenario()
+        barrier = scenario.Barrier(3)
+        api = scenario.api(barrier)
+        results = []
+
+        def worker(name):
+            def fn():
+                results.append(f'{name}_before')
+                index = barrier.wait()
+                results.append((name, index))
+            return fn
+
+        with scenario:
+            a = scenario.thread(worker('A'))
+            b = scenario.thread(worker('B'))
+            c = scenario.thread(worker('C'))
+
+            with api.cycle(a, b, c) as cycle:
+                self.assertEqual(cycle.ready, (a, b, c))
+                self.assertEqual(cycle.extra_waiters, 0)
+                self.assertEqual(
+                    [scenario.transaction(t).state for t in (a, b, c)],
+                    [State.PAUSED, State.PAUSED, State.PAUSED])
+                self.assertEqual(results, [
+                    'A_before', 'B_before', 'C_before'])
+
+            self.assertTrue(cycle.closed)
+            self.assertEqual(cycle.ready, ())
+
+        self.assertEqual(results[:3], [
+            'A_before', 'B_before', 'C_before'])
+        self.assertEqual(set(results[3:]), {
+            ('A', 0), ('B', 1), ('C', 2)})
+
+    def test_barrier_cycle_without_action_accepts_waiting_waiters(self):
+        """Barrier.cycle also works when earlier parties have
+        already reached the underlying Barrier's WAITING state."""
+        scenario = Scenario()
+        barrier = scenario.Barrier(3)
+        api = scenario.api(barrier)
+        results = []
+
+        def worker(name):
+            def fn():
+                results.append(f'{name}_before')
+                index = barrier.wait()
+                results.append((name, index))
+            return fn
+
+        with scenario:
+            a = scenario.thread(worker('A'))
+            b = scenario.thread(worker('B'))
+            c = scenario.thread(worker('C'))
+
+            for thread in (a, b):
+                scenario.wait(thread)
+                tx = scenario.transaction(thread)
+                tx.unblock()
+                scenario.wait(Waiting(tx))
+
+            scenario.wait(c)
+            self.assertEqual(api.waiters, 2)
+            self.assertEqual(api.raw.n_waiting, 2)
+            self.assertEqual(results, [
+                'A_before', 'B_before', 'C_before'])
+
+            cycle = api.cycle(a, b, c)
+            self.assertEqual(cycle.ready, (a, b, c))
+            self.assertEqual(api.waiters, 0)
+            self.assertEqual(
+                [scenario.transaction(t).state for t in (a, b, c)],
+                [State.PAUSED, State.PAUSED, State.PAUSED])
+            self.assertEqual(results, [
+                'A_before', 'B_before', 'C_before'])
+            self.assertEqual(cycle.close(), (a, b, c))
+
+        self.assertEqual(results, [
+            'A_before', 'B_before', 'C_before',
+            ('A', 0), ('B', 1), ('C', 2),
+        ])
+
     def test_barrier_reset(self):
         """Barrier.reset() resets barrier and breaks waiting transactions."""
         scenario = Scenario()
@@ -3479,6 +3563,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)
             d = s.Driver(t)
+            d.scan(); d()
             self.assertIs(tx.state, State.BLOCKED)
             d.pause()
             self.assertIs(tx.state, State.BLOCKED)
@@ -3490,7 +3575,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             # Re-add and iterate: now the staged lazy fires.
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.parked)
+            self.assertIs(yielded.state, d.success)
             self.assertIs(tx.state, State.PAUSED)
 
         # --- Phase 2: Driver via Chain into Dispatch. ---
@@ -3500,6 +3585,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)
             d = s.Driver(t)
+            d.scan(); d()
             self.assertIs(tx.state, State.BLOCKED)
             d.pause()
             self.assertIs(tx.state, State.BLOCKED)
@@ -3518,7 +3604,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             disp.add(chain)
             yielded = next(iter(disp))
             self.assertIs(yielded, d)
-            self.assertIs(yielded.state, d.parked)
+            self.assertIs(yielded.state, d.success)
             self.assertIs(tx.state, State.PAUSED)
 
 
@@ -3543,6 +3629,8 @@ class TestChain(unittest.TestCase):
         t = s.thread(worker)
         s.wait(t)
         d = s.Driver(t)
+        d.scan()
+        d()
         return lock, t, d
 
     def _cleanup(self, s, *triples):
@@ -3698,10 +3786,10 @@ class TestChain(unittest.TestCase):
             it = iter(disp)
             first = next(it)
             self.assertIs(first, d1)
-            self.assertIs(first.state, d1.parked)
+            self.assertIs(first.state, d1.success)
             second = next(it)
             self.assertIs(second, d2)
-            self.assertIs(second.state, d2.parked)
+            self.assertIs(second.state, d2.success)
 
 
 class TestModuleHelpersAndImportBranches(unittest.TestCase):
@@ -5327,8 +5415,7 @@ class TestPark(unittest.TestCase):
             # Drive first acquire+release.  Worker is post-release,
             # heading toward the second acquire.
             s.skip(t, lock.acquire, lock.release)
-            # park's Driver auto-settles via IDLE while waiting for the
-            # next tx push.
+            # park() scans for and selects the next acquire transaction.
             r = s.park(t, lock.acquire)
             self.assertEqual(r[t].method, lock.acquire)
             r[t].unblock(); s.wait(r[t])
@@ -6628,8 +6715,8 @@ class TestConditionCycleScheduler(unittest.TestCase):
             condition.notify()
             lock.release()
 
-        def scheduler(wf):
-            pass
+        scheduler_calls = []
+        scheduler = scheduler_calls.append
 
         with s:
             w = s.thread(waiter)
@@ -9527,7 +9614,7 @@ class TestDriverConstructor(unittest.TestCase):
             d = s.Driver(t)
         # Out of scenario now.
         with self.assertRaisesRegex(RuntimeError, "scenario not entered"):
-            d.skip()
+            d.finish()
 
     def test_scenario_methods_outside_scenario_raise(self):
         """scenario.skip / park / pause raise if not entered."""
@@ -9554,12 +9641,14 @@ class TestDriverConstructor(unittest.TestCase):
             s.wait(t)             # t parked at lock.acquire
             d1 = s.Driver(t)
             d2 = s.Driver(t)      # no raise -- both inert
-            d1.skip()             # claims slot; skip acquire
-            d1()                  # ACTIVE at lock.release -- slot released
+            d1.scan(); d1()       # explicit scan discovers acquire
+            d1.finish()             # claims slot; skip acquire
+            d1()                  # SUCCESS at lock.release -- slot released
             # d1 has yielded, so d2 may now drive the same thread.
-            d2.skip()             # no CompetingDriversError
-            d2()                  # skip release -- t terminates
-            self.assertTrue(d2.done)
+            d2.scan(); d2()       # explicit scan discovers release
+            d2.finish()             # no CompetingDriversError
+            d2()                  # skip release; thread has no current tx
+            self.assertIs(d2.state, d2.success)
 
     def test_driver_init_clears_pause_chain(self):
         """Driver initialization clears tx.pause on first use of the Driver."""
@@ -9570,30 +9659,26 @@ class TestDriverConstructor(unittest.TestCase):
             tx = s.transaction(t)
             tx.pause = True
             d = s.Driver(t)
-            # An imperative is the public way to trigger first-use
-            # initialization; skip() stages a closure without
-            # observable tx effects until driven.
-            d.skip()
+            # scan() is the public way to trigger first-use
+            # initialization and select the current transaction.
+            d.scan()
+            d()
             self.assertFalse(tx.pause)
-            disp = s.Dispatch()
-            disp.add(d)
-            list(disp)
+            d.finish()
+            d()
 
 
 class TestDriverImperatives(unittest.TestCase):
 
-    def test_skip(self):
+    def test_driver_skip_is_removed(self):
         s, lock, worker = _make_scenario_with_lock_worker()
         with s:
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
-            d.skip()
-            disp = s.Dispatch()
-            disp.add(d)
-            yielded = next(iter(disp))
-            self.assertIn(yielded.state, (d.idle, d.terminated))
-            disp.close()
+            self.assertFalse(hasattr(d, 'skip'))
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
 
     def test_finish(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -9601,12 +9686,13 @@ class TestDriverImperatives(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.finish()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.finished)
-            self.assertTrue(yielded.done)
+            self.assertIs(yielded.state, d.success)
+            self.assertFalse(yielded.done)
 
     def test_block(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -9614,32 +9700,33 @@ class TestDriverImperatives(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.block()
-            d()  # fire the lazy: drives d to parked
-            self.assertIs(d.state, d.parked)
-            self.assertTrue(d.done)
+            d()  # drives d to a successful BLOCKED park
+            self.assertIs(d.state, d.success)
+            self.assertIs(d.tx.state, State.BLOCKED)
+            self.assertFalse(d.done)
             # Release worker so cleanup joins.
             s.api(lock).unblock(lock.acquire, t)
 
     def test_commit(self):
-        """Driver.commit() targets COMMIT and parks at parking.
+        """Driver.commit() succeeds when the tx reaches COMMIT.
 
-        COMMIT is a transient state that the tx normally races past,
-        so the canary overshoots in ordinary primitives -- the
-        cascade lands the driver at a terminal state.
+        COMMIT is externally controlled, so the tx may naturally race
+        onward after that without contradicting the directive.
         """
         s, lock, worker = _make_scenario_with_lock_worker()
         with s:
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.commit()
-            # Drive to terminal so the worker thread reaches
-            # termination cleanly.
-            disp = s.Dispatch()
-            disp.add(d)
-            list(disp)
-            self.assertTrue(d.done)
+            # Drive to the COMMIT parking point.
+            d.finish(); d()
+            self.assertIs(d.state, d.success)
+            self.assertIn(d.tx.state, (State.COMMIT, State.RETURNED))
+            d.close()
 
     def test_pause(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -9648,11 +9735,12 @@ class TestDriverImperatives(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.pause()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.parked)
+            self.assertIs(yielded.state, d.success)
             self.assertIs(tx.state, State.PAUSED)
             self.assertTrue(tx.pause)
             disp.close()
@@ -9668,25 +9756,32 @@ class TestDriverImperatives(unittest.TestCase):
             disp = s.Dispatch()
 
             w = s.thread(waiter)
+            s.wait(w)
             dw = s.Driver(w)
+            dw.scan()
             disp.add(dw)
 
             x = s.thread(setter)
+            s.wait(x)
             dx = s.Driver(x)
+            dx.scan()
             disp.add(dx)
 
             for d in disp:
                 pass
-            self.assertIs(dw.state, dw.active)
-            dw.wait()
+            self.assertIs(dw.state, dw.success)
+            tx = dw.tx
+            target = Waiting(tx)
+            dw.wait(target)
             dw()
-            self.assertIs(dw.state, dw.parked)
+            self.assertIs(dw.state, dw.success)
             self.assertIs(dw.tx.state, State.WAITING)
+            self.assertEqual(dw.signaled, frozenset((target,)))
 
             # Drive the setter through commit (fires actual.set, which
             # wakes the waiter's actual.wait; the waiter's tx then
             # advances naturally to terminal).
-            dx.skip()
+            dx.finish()
             disp.add(dx)
             for d in disp:
                 pass
@@ -9703,13 +9798,14 @@ class TestDriverImperatives(unittest.TestCase):
             s.skip(w, lock.acquire)
             s.wait(w)
             d = s.Driver(w)
+            d.scan(); d()
             d.stall()
             # Drive d to park at STALLED.  The test only needs the parked
             # state; scenario exit cleanup releases the worker afterwards.
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.parked)
+            self.assertIs(yielded.state, d.success)
             self.assertIs(d.tx.state, State.STALLED)
 
     def test_commit_validates_type(self):
@@ -9723,18 +9819,38 @@ class TestDriverImperatives(unittest.TestCase):
             s.skip(t, lock.acquire)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             with self.assertRaisesRegex(RuntimeError, "park in COMMIT"):
                 d.commit()
             d.close()
 
-    def test_wait_validates_type(self):
+    def test_wait_requires_signal(self):
         s, lock, worker = _make_scenario_with_lock_worker()
         with s:
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
-            with self.assertRaisesRegex(RuntimeError, "park in WAITING"):
+            with self.assertRaisesRegex(ValueError, "at least one signal"):
                 d.wait()
+            d.close()
+
+    def test_public_driver_publishes_most_recent_directive(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            self.assertIsNone(d.directive)
+            self.assertEqual(d.directive_args, ())
+            d.scan()
+            self.assertEqual(d.directive, d.scan)
+            self.assertEqual(d.directive_args, (None,))
+            d()
+            self.assertEqual(d.directive, d.scan)
+            self.assertEqual(d.directive_args, (None,))
+            d.finish()
+            self.assertEqual(d.directive, d.finish)
+            self.assertEqual(d.directive_args, ())
             d.close()
 
     def test_stall_validates_type(self):
@@ -9746,9 +9862,10 @@ class TestDriverImperatives(unittest.TestCase):
             w = s.thread(waiter)
             s.wait(w)
             d = s.Driver(w)
+            d.scan(); d()
             with self.assertRaisesRegex(RuntimeError, "park in STALLED"):
                 d.stall()
-            # stall() raised before transitioning; d is still ACTIVE
+            # stall() raised before staging; d is still at success
             # and owns w.  Set the underlying event so when the
             # commit's actual.wait runs it returns immediately, then
             # close d and finish w.
@@ -9761,14 +9878,481 @@ class TestDriverImperatives(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.finish()
             disp = s.Dispatch()
             disp.add(d)
-            list(disp)  # drive d to finished (terminal)
-            # d auto-reactivates from finished, but the worker has
-            # terminated -- so reactivate lands at idle (no tx).
-            with self.assertRaisesRegex(RuntimeError, "currently in"):
-                d.skip()
+            list(disp)  # drive d through the current tx
+            # A successful finish leaves no next tx selected; a new
+            # driving directive must be preceded by scan().
+            with self.assertRaisesRegex(RuntimeError, "scan first"):
+                d.finish()
+
+
+class TestDriverRoutes(unittest.TestCase):
+
+    def test_constructor_route_scans_then_drives_until_route_returns(self):
+        s = Scenario()
+        lock = s.Lock()
+        seen = []
+
+        def worker():
+            lock.acquire()
+            lock.release()
+
+        def route(d):
+            seen.append(("start", d.state, d.tx))
+            d.scan()
+            yield
+            seen.append(("scan", d.state, d.tx.method))
+            d.finish()
+            yield
+            seen.append(("skip", d.state, d.tx.method))
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, lock.acquire)
+            self.assertEqual(seen, [
+                ("start", d.undirected, None),
+                ("scan", d.success, lock.acquire),
+                ("skip", d.success, lock.acquire),
+            ])
+            d.scan(); d()
+            d.finish(); d()
+
+    def test_dispatch_route_drives_until_route_returns(self):
+        s = Scenario()
+        lock = s.Lock()
+
+        def worker():
+            lock.acquire()
+            lock.release()
+
+        def route(d):
+            d.scan()
+            yield
+            d.finish()
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            disp = s.Dispatch()
+            disp.add(d)
+            yielded = next(iter(disp))
+            self.assertIs(yielded, d)
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, lock.acquire)
+            d.scan(); d()
+            d.finish(); d()
+
+    def test_staged_route_install_can_be_overwritten(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        ran = []
+
+        def route(d):
+            ran.append(True)  # pragma: no cover - this route is intentionally overwritten
+            return            # pragma: no cover
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            d.route(route)
+            d.pause()
+            d()
+            self.assertEqual(ran, [])
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertIs(d.tx.state, State.PAUSED)
+            d.finish(); d()
+
+    def test_route_imperatives_must_come_from_route_thread(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        errors = []
+
+        def route(d):
+            def outsider():
+                try:
+                    d.scan()
+                except RuntimeError as e:
+                    errors.append(str(e))
+            thread = threading.Thread(target=outsider)
+            thread.start()
+            thread.join()
+            d.scan()
+            yield
+            d.finish()
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("being driven right now", errors[0])
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertTrue(d.tx.done)
+
+    def test_route_bare_yield_raises(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+
+        def route(d):
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            with self.assertRaisesRegex(RuntimeError, "without issuing"):
+                d()
+            self.assertIs(d.state, d.undirected)
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_route_close_blocks_finalizer_imperatives(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        errors = []
+
+        def route(d):
+            try:
+                yield
+            finally:
+                try:
+                    d.finish()
+                except RuntimeError as e:
+                    errors.append(str(e))
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            with self.assertRaisesRegex(RuntimeError, "without issuing"):
+                d()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("being driven right now", errors[0])
+            self.assertIs(d.state, d.undirected)
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_route_return_after_staging_directive_is_honored(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+
+        def route(d):
+            d.scan()
+            return
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, lock.acquire)
+            d.finish(); d()
+
+    def test_route_continues_after_successful_finish(self):
+        s = Scenario()
+        lock = s.Lock()
+        seen = []
+
+        def worker():
+            lock.acquire()
+
+        def route(d):
+            d.scan()
+            yield
+            d.finish()
+            yield
+            seen.append(d.state)
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertEqual(seen, [d.success])
+
+    def test_route_waits_for_named_signal(self):
+        s = Scenario()
+        ev = s.Event()
+        seen = []
+
+        def worker():
+            ev.wait()
+
+        def route(d):
+            d.scan()
+            yield
+            target = Waiting(d.tx)
+            d.wait(target)
+            yield
+            seen.append(d.signaled)
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertIs(d.tx.state, State.WAITING)
+            self.assertEqual(seen, [frozenset((Waiting(d.tx),))])
+            d.close()
+            s.raw(ev).set()
+
+    def test_routes_compose_with_yield_from(self):
+        s = Scenario()
+        lock = s.Lock()
+        seen = []
+
+        def worker():
+            lock.acquire()
+            lock.release()
+
+        def skip_one(d):
+            d.finish()
+            yield
+            d.scan()
+            yield
+            seen.append(d.tx.method)
+
+        def route(d):
+            d.scan()
+            yield
+            yield from skip_one(d)
+            self.assertEqual(d.tx.method, lock.release)
+            d.finish()
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertEqual(seen, [lock.release])
+
+    def test_route_rejects_bad_installations(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            with self.assertRaisesRegex(TypeError, "route must be callable"):
+                d.route(None)
+            with self.assertRaisesRegex(TypeError, "route must return an iterator"):
+                d.route(lambda driver: object())
+            with self.assertRaisesRegex(TypeError, "route must return an iterator"):
+                d.route(lambda driver: [])
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_route_bare_iterator_without_close_raises(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+
+        class BareIterator:
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return None
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=lambda driver: BareIterator())
+            with self.assertRaisesRegex(RuntimeError, "without issuing"):
+                d()
+            self.assertIs(d.state, d.undirected)
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_route_calling_route_tail_calls_successor(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        seen = []
+
+        def route2(d):
+            seen.append("route2")
+            d.scan()
+            yield
+            d.finish()
+            yield
+
+        def route1(d):
+            seen.append("route1")
+            d.route(route2)
+            return
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route1)
+            d()
+            self.assertEqual(seen, ["route1", "route2"])
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertTrue(d.tx.done)
+
+    def test_route_route_then_other_directive_clears_route(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        ran = []
+
+        def replacement(d):
+            ran.append("replacement")  # pragma: no cover - this route is intentionally overwritten
+            return                     # pragma: no cover
+            yield
+
+        def route(d):
+            d.scan()
+            yield
+            d.route(replacement)
+            d.pause()
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertEqual(ran, [])
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.success)
+            self.assertIs(d.tx.state, State.PAUSED)
+            d.finish(); d()
+
+    def test_route_exception_raises_and_closes_route(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        closed = []
+
+        def route(d):
+            try:
+                raise ValueError("route blew up")
+                yield
+            finally:
+                closed.append(True)
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            with self.assertRaisesRegex(ValueError, "route blew up"):
+                d()
+            self.assertIs(d.state, d.raised)
+            self.assertEqual(closed, [True])
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_route_may_return_at_first_ask(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        seen = []
+
+        def route(d):
+            seen.append(d.state)
+            return
+            yield
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t, route=route)
+            d()
+            self.assertEqual(seen, [d.undirected])
+            self.assertFalse(d.routed)
+            self.assertIs(d.state, d.undirected)
+            d.close()
+            s.api(lock).unblock(lock.acquire, t)
+
+    def test_wait_rejects_pending_or_invalid_states(self):
+        s, lock, worker = _make_scenario_with_lock_worker()
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            tx = d.tx
+            d.finish()
+            # Last-wins staging lets wait() overwrite the pending skip;
+            # listing the current tx makes tx-exit an explicit outcome.
+            d.wait(tx)
+            d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.signaled, frozenset((tx,)))
+            with self.assertRaisesRegex(RuntimeError, "scan first|currently in"):
+                d.finish()
+
+    def test_wait_from_idle_handles_thread_start_and_termination(self):
+        s = Scenario()
+
+        def worker():
+            return None
+
+        with s:
+            t = s.thread(worker)
+            d = s.Driver(t)
+            d.wait(Terminated(t))
+            d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.signaled, frozenset((Terminated(t),)))
+
+    def test_wait_auto_advances_stalled_and_paused_states(self):
+        s = Scenario()
+        lock = s.Lock()
+        cond = s.Condition(lock)
+
+        def stalled_worker():
+            with lock:
+                cond.wait(timeout=0)
+
+        with s:
+            t = s.thread(stalled_worker)
+            s.skip(t, lock.acquire)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            d.stall()
+            d()
+            self.assertIs(d.tx.state, State.STALLED)
+            tx = d.tx
+            d.wait(tx)
+            d()
+            self.assertEqual(d.signaled, frozenset((tx,)))
+
+        s = Scenario()
+        lock = s.Lock()
+
+        def paused_worker():
+            lock.acquire()
+
+        with s:
+            t = s.thread(paused_worker)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            d.pause()
+            d()
+            self.assertIs(d.tx.state, State.PAUSED)
+            tx = d.tx
+            d.wait(tx)
+            d()
+            self.assertEqual(d.signaled, frozenset((tx,)))
 
 
 class TestDriverCascade(unittest.TestCase):
@@ -9780,6 +10364,7 @@ class TestDriverCascade(unittest.TestCase):
             t.join()
             s.wait(Terminated(t))
             d = s.Driver(t)
+            d.scan()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
@@ -9798,14 +10383,15 @@ class TestDriverCascade(unittest.TestCase):
             t = s.thread(worker)
             started.wait()
             d = s.Driver(t)
+            d.scan()
             disp = s.Dispatch()
             disp.add(d)
             gate.set()
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.active)
+            self.assertIs(yielded.state, d.success)
             d.close()
 
-    def test_canary_overshoot(self):
+    def test_wait_raises_if_tx_exits_before_signal(self):
         s = Scenario()
         sem = s.Semaphore(value=1)
         def worker():
@@ -9813,87 +10399,30 @@ class TestDriverCascade(unittest.TestCase):
         with s:
             t = s.thread(worker)
             s.wait(t)
+            tx = s.transaction(t)
             d = s.Driver(t)
-            d.wait()
+            d.wait(Waiting(tx))
             disp = s.Dispatch()
             disp.add(d)
-            with self.assertRaisesRegex(RuntimeError, "overshot"):
+            with self.assertRaisesRegex(RuntimeError, "transaction exited during wait"):
                 next(iter(disp))
             self.assertIs(d.state, d.raised)
 
-    def test_cascade_pop_match_in_inner_loop(self):
-        """The Driver cascade-pop path restores the surviving ancestor frame.
-
-        This is a targeted state-machine test for the branch where a
-        driven child terminates, the immediate parent has already
-        disappeared, but an older saved ancestor is still the current
-        transaction.  Earlier versions of this test tried to create
-        the timing with bytecode injection; directly exercising the
-        Driver state machine is deterministic and tests the behavior
-        this branch actually owns.
-        """
-
-        class FakeTx:
-            def __init__(self, name, parent=None):
-                self.name = name
-                self.parent = parent
-                self.state = State.COMMITTED
-            def __repr__(self):
-                return f"<FakeTx {self.name}>"
-
+    def test_legacy_cascade_state_machine_is_removed(self):
+        """The tranche-2 Driver no longer exposes the old cascade/mode state machine."""
         s = Scenario()
         thread = threading.Thread(name="fake-driver-thread")
         with s:
             d = s.Driver(thread)
-            c = d._core
-
-            outer = FakeTx("outer")
-            self.assertEqual(repr(outer), "<FakeTx outer>")
-            middle = FakeTx("middle", outer)
-            child = FakeTx("child", middle)
-            outer_target = object()
-            outer_base = object()
-
-            c.state = c.skipping
-            c.tx = child
-            c.stack = [
-                (outer, c.active, outer_target, outer_base),
-                (middle, c.skipping, object(), object()),
-            ]
-            c.thread_signal = {Predicate: object(), Nested: object()}
-            old_cache_tx = c.cache_tx
-
-            def cache_tx_to_outer():
-                c.tx = outer
-
-            try:
-                c.cache_tx = cache_tx_to_outer
-                c.signal({child})
-
-                self.assertIs(c.state, c.active)
-                self.assertIs(c.tx, outer)
-                self.assertIs(c.target, outer_target)
-                self.assertIs(c.base, outer_base)
-            finally:
-                c.cache_tx = old_cache_tx
-                d.close()
+            self.assertFalse(hasattr(d._core, "mode"))
+            self.assertFalse(hasattr(d._core, "skipping"))
+            self.assertFalse(hasattr(d._core, "active"))
+            d.close()
 
 
-    def test_skipping_terminate_yields_to_active_when_worker_has_next_tx(self):
-        """When the Driver is skipping and the driven tx terminates,
-        the worker thread may have already moved on to a subsequent
-        regulated call -- so transactions[thread] points to a fresh
-        tx by the time signal handler processes the tx-end signal.
-        The handler must transition to ACTIVE (with the new tx as
-        base), not to IDLE: IDLE asserts self.tx is None, which
-        cache_tx falsifies when the worker has progressed.
-
-        Setup: worker does lock.acquire + cond.wait_for(True) +
-        lock.release.  d.skip(); d() drives wait_for to terminal.
-        At that moment the worker has already advanced to
-        lock.release; cache_tx surfaces it.  Driver should yield
-        ACTIVE on lock.release rather than crashing the next
-        score.wait cycle's IDLE handler."""
+    def test_finish_route_then_scan_finds_next_tx(self):
+        """After a deep finish route completes one tx, scan() is the
+        explicit way to select a subsequent regulated call."""
         s = Scenario()
         lock = s.Lock()
         condition = s.Condition(lock)
@@ -9908,30 +10437,18 @@ class TestDriverCascade(unittest.TestCase):
             s.skip(t, lock.acquire)
             s.wait(t)
             d = s.Driver(t)
-            d.skip(); d()
-            self.assertIs(d.state, d.active)
+            d.scan(); d()
+            d.route(lambda dd, core=s._core: core.route_finish_deep(dd)); d()
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
             self.assertIsNotNone(d.tx)
             self.assertEqual(d.tx.method.__name__, 'release')
             d.close()
 
-    def test_cascade_exhaust_yields_to_active_when_worker_has_next_tx(self):
-        """The cascade-pop while loop exhausts without finding a
-        match when the worker has advanced past every saved
-        ancestor.  Like the simple skipping-terminate case, this
-        must transition to ACTIVE (not IDLE) when cache_tx
-        surfaces a still-running tx.
-
-        Setup: nested wait_for chain (outer -> middle ->
-        innermost), all predicates True so each terminates after
-        one iteration with no sleeps.  d.skip(); d() drives.
-        Innermost terminates; middle and outer terminate too;
-        worker is in lock.release by the time the signal handler
-        processes innermost's tx-end signal.  Frames have
-        state=skipping (since d.skip() set Driver state to
-        skipping before each push), so the while loop walks
-        through both without match/finishing/parking and exits
-        the bottom.  cache_tx already surfaced lock.release;
-        Driver should yield ACTIVE on it."""
+    def test_deep_finish_route_then_scan_finds_next_tx(self):
+        """A deep finish route handles the nested wait_for chain as
+        one route, and an explicit scan() selects the worker's next
+        regulated call afterward."""
         s = Scenario()
         lock = s.Lock()
         condition = s.Condition(lock)
@@ -9949,20 +10466,18 @@ class TestDriverCascade(unittest.TestCase):
             s.skip(t, lock.acquire)
             s.wait(t)
             d = s.Driver(t)
-            d.skip(autoskip=True); d()
-            self.assertIs(d.state, d.active)
+            d.scan(); d()
+            d.route(lambda dd, core=s._core: core.route_finish_deep(dd)); d()
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
             self.assertIsNotNone(d.tx)
             self.assertEqual(d.tx.method.__name__, 'release')
             d.close()
 
     def test_cascade_exhaust_yields_to_idle_when_worker_has_no_next_tx(self):
-        """Same cascade-exhaust scenario as above but the worker
-        ends after the wait_for chain (no lock.release follows).
-        After wait_for terminates, transactions[thread] empties;
-        cache_tx returns None; the cascade-exhaust path takes the
-        IDLE branch rather than ACTIVE.  The drive loop's next
-        iteration sees the thread Terminated signal and
-        transitions IDLE -> TERMINATED."""
+        """Same nested wait_for scenario as above, but the worker
+        ends after the wait_for chain.  A following scan() therefore
+        lands in terminated instead of selecting a next transaction."""
         s = Scenario()
         lock = s.Lock()
         condition = s.Condition(lock)
@@ -9982,60 +10497,34 @@ class TestDriverCascade(unittest.TestCase):
             s.skip(t, lock.acquire)
             s.wait(t)
             d = s.Driver(t)
-            d.skip(autoskip=True); d()
-            # Driver passed through IDLE on the way to TERMINATED
-            # (thread exited; Terminated signal fired in the IDLE
-            # handler).
+            d.scan(); d()
+            d.route(lambda dd, core=s._core: core.route_finish_deep(dd)); d()
+            self.assertIs(d.state, d.success)
+            self.assertTrue(d.tx.done)
+            d.scan(); d()
             self.assertIs(d.state, d.terminated)
 
-    def test_simple_pop_restore_when_parent_still_alive(self):
-        """The Driver simple-pop path restores the immediate parent frame.
-
-        This covers the non-cascade branch where the driven child
-        terminates and cache_tx reports that the saved parent is still
-        the current transaction.
-        """
-
-        class FakeTx:
-            def __init__(self, name, parent=None):
-                self.name = name
-                self.parent = parent
-                self.state = State.COMMITTED
-            def __repr__(self):
-                return f"<FakeTx {self.name}>"
-
+    def test_scan_is_the_explicit_recovery_path_after_finish(self):
+        """finish() handles one tx; scan() is how the Driver reaches the next one."""
         s = Scenario()
-        thread = threading.Thread(name="fake-driver-thread")
+        lock = s.Lock()
+        def worker():
+            lock.acquire()
+            lock.release()
         with s:
-            d = s.Driver(thread)
-            c = d._core
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            first = d.tx
+            d.finish(); d()
+            self.assertIs(d.state, d.success)
+            self.assertTrue(first.done)
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, lock.release)
+            d.finish(); d()
 
-            parent = FakeTx("parent")
-            self.assertEqual(repr(parent), "<FakeTx parent>")
-            child = FakeTx("child", parent)
-            parent_target = object()
-            parent_base = object()
-
-            c.state = c.skipping
-            c.tx = child
-            c.stack = [(parent, c.active, parent_target, parent_base)]
-            c.thread_signal = {Predicate: object(), Nested: object()}
-            old_cache_tx = c.cache_tx
-
-            def cache_tx_to_parent():
-                c.tx = parent
-
-            try:
-                c.cache_tx = cache_tx_to_parent
-                c.signal({child})
-
-                self.assertIs(c.state, c.active)
-                self.assertIs(c.tx, parent)
-                self.assertIs(c.target, parent_target)
-                self.assertIs(c.base, parent_base)
-            finally:
-                c.cache_tx = old_cache_tx
-                d.close()
 
 
 class TestDispatch(unittest.TestCase):
@@ -10075,6 +10564,7 @@ class TestDispatch(unittest.TestCase):
             t.join()
             s.wait(Terminated(t))
             d = s.Driver(t)
+            d.scan()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
@@ -10086,6 +10576,7 @@ class TestDispatch(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.finish()
             disp = s.Dispatch()
             disp.add(d)
@@ -10113,13 +10604,12 @@ class TestDriverAPI(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
-            d.skip()  # trigger lazy init via a public imperative
+            d.scan()
+            d()  # trigger explicit scan / first-use initialization
             r = repr(d)
             self.assertIn("Scenario.Driver", r)
-            self.assertIn("ACTIVE", r)
-            disp = s.Dispatch()
-            disp.add(d)
-            list(disp)
+            self.assertIn("SUCCESS", r)
+            d.finish(); d()
 
     def test_thread_attribute(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -10154,21 +10644,21 @@ class TestDriverAPI(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
-            d.skip()  # trigger init; cache_tx populates txs
+            d.scan(); d()  # explicit scan populates txs
             self.assertEqual(len(d.txs), 1)
-            disp = s.Dispatch()
-            disp.add(d)
-            list(disp)
+            d.finish(); d()
 
     def test_state_constants_at_class_level(self):
-        self.assertEqual(Scenario.Driver.idle.name, 'IDLE')
-        self.assertEqual(Scenario.Driver.active.name, 'ACTIVE')
-        self.assertEqual(Scenario.Driver.reentered.name, 'REENTERED')
-        self.assertIn(Scenario.Driver.parked, Scenario.Driver.terminal_states)
-        self.assertIn(Scenario.Driver.skipping, Scenario.Driver.driving_states)
-        self.assertIn(Scenario.Driver.active, Scenario.Driver.active_states)
-        self.assertIn(Scenario.Driver.reentered, Scenario.Driver.active_states)
-        self.assertNotIn(Scenario.Driver.reentered, Scenario.Driver.terminal_states)
+        self.assertEqual(Scenario.Driver.undirected.name, 'UNDIRECTED')
+        self.assertEqual(Scenario.Driver.driving.name, 'DRIVING')
+        self.assertEqual(Scenario.Driver.success.name, 'SUCCESS')
+        self.assertEqual(Scenario.Driver.raised.name, 'RAISED')
+        self.assertEqual(Scenario.Driver.terminated.name, 'TERMINATED')
+        self.assertEqual(Scenario.Driver.impasse.name, 'IMPASSE')
+        self.assertIn(Scenario.Driver.driving, Scenario.Driver.driving_states)
+        self.assertIn(Scenario.Driver.raised, Scenario.Driver.terminal_states)
+        self.assertIn(Scenario.Driver.terminated, Scenario.Driver.terminal_states)
+        self.assertNotIn(Scenario.Driver.success, Scenario.Driver.terminal_states)
 
 
 
@@ -10199,6 +10689,8 @@ class TestChainIteration(unittest.TestCase):
             c = s.thread(worker('C'))
             s.wait(a); s.wait(b); s.wait(c)
             da = s.Driver(a); db = s.Driver(b); dc = s.Driver(c)
+            for d in (da, db, dc):
+                d.scan()
             chain = s.Chain(da, db, dc)
             self.assertEqual(len(chain), 3)
 
@@ -10255,6 +10747,8 @@ class TestChainIteration(unittest.TestCase):
             b = s.thread(worker('B'))
             s.wait(a); s.wait(b)
             da = s.Driver(a); db = s.Driver(b)
+            for d in (da, db):
+                d.scan()
             chain = s.Chain(da, db)
             yielded = []
             for d in chain:
@@ -10283,6 +10777,8 @@ class TestChainIteration(unittest.TestCase):
             b = s.thread(worker('B'))
             s.wait(a); s.wait(b)
             da = s.Driver(a); db = s.Driver(b)
+            for d in (da, db):
+                d.scan()
             chain = s.Chain(da, db)
             disp = s.Dispatch()
             disp.add(chain)
@@ -10316,8 +10812,10 @@ class TestChainIteration(unittest.TestCase):
             # Empty: returns None.
             self.assertIsNone(chain.promote())
 
-            # Cleanup: the promoted Drivers are unowned, finish them.
+            # Cleanup: the promoted Drivers are unowned; explicitly
+            # scan each one before finishing it.
             for d in (d1, d2):
+                d.scan(); d()
                 d.finish(); d()
 
     def test_promote_walrus_iteration_pattern(self):
@@ -10339,12 +10837,15 @@ class TestChainIteration(unittest.TestCase):
             b = s.thread(worker('B'))
             s.wait(a); s.wait(b)
             da = s.Driver(a); db = s.Driver(b)
+            for d in (da, db):
+                d.scan()
             chain = s.Chain(da, db)
 
             collected = []
             d = chain.promote()
             while d is not None:
                 collected.append(d)
+                d.scan(); d()
                 d.finish(); d()
                 d = chain.promote()
 
@@ -10375,6 +10876,8 @@ class TestChainIteration(unittest.TestCase):
             c = s.thread(worker('C'))
             s.wait(a); s.wait(b); s.wait(c)
             da = s.Driver(a); db = s.Driver(b); dc = s.Driver(c)
+            for d in (da, db, dc):
+                d.scan()
             chain = s.Chain(da, db, dc)
 
             popped_first = None
@@ -10434,6 +10937,8 @@ class TestDispatchAPI(unittest.TestCase):
             c = s.thread(worker('C'))
             s.wait(a); s.wait(b); s.wait(c)
             da = s.Driver(a); db = s.Driver(b); dc = s.Driver(c)
+            for d in (da, db, dc):
+                d.scan()
             disp = s.Dispatch()
             disp.add(da); disp.add(db); disp.add(dc)
 
@@ -10470,10 +10975,11 @@ class TestDispatchCoverage(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.active)
+            self.assertIs(yielded.state, d.success)
             d.close()
 
     def test_dispatch_iter_returns_self(self):
@@ -10521,11 +11027,13 @@ class TestCloseMethods(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.finish()
             disp = s.Dispatch()
             disp.add(d)
-            list(disp)  # drives d to FINISHED -- auto-close runs
-            self.assertTrue(d.done)
+            list(disp)  # drives d to a successful FINISHED internal mode
+            self.assertIs(d.state, d.success)
+            self.assertNotIn(t, s._core.drivers)
             d.close()  # explicit call after auto-close: no-op
 
     def test_chain_close_empties_pending(self):
@@ -10544,6 +11052,7 @@ class TestCloseMethods(unittest.TestCase):
             s.wait(t1, t2)
             d1 = s.Driver(t1)
             d2 = s.Driver(t2)
+            d1.scan(); d2.scan()
             chain = s.Chain(d1, d2)
             self.assertEqual(len(chain), 2)
             chain.close()
@@ -10573,6 +11082,7 @@ class TestCloseMethods(unittest.TestCase):
             s.wait(t1, t2)
             d1 = s.Driver(t1)
             d2 = s.Driver(t2)
+            d1.scan(); d2.scan()
             chain = s.Chain(d1, d2)
             disp = s.Dispatch()
             disp.add(chain)
@@ -10635,6 +11145,8 @@ class TestCloseMethods(unittest.TestCase):
             s.wait(t1, t2)
             d1 = s.Driver(t1)
             d2 = s.Driver(t2)
+            d1.scan()
+            d2.scan()
             chain = s.Chain(d1, d2)
             disp = s.Dispatch()
             disp.add(chain)
@@ -10830,26 +11342,19 @@ class TestCoverageMinor(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "calling thread"):
                 core.threads_to_txs((threading.current_thread(),), 'threads_to_txs_self_thread_raises')
 
-    def test_stacked_imperatives_raise(self):
-        """An imperative call raises if a previous imperative is
-        still pending (not yet driven).  One imperative at a time."""
+    def test_staged_directives_are_last_wins(self):
+        """A second directive before driving overwrites the first."""
         s, lock, worker = _make_scenario_with_lock_worker()
         with s:
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.pause()
-            with self.assertRaisesRegex(RuntimeError, "haven't run pause yet"):
-                d.finish()
-            # Driving clears the pending state; another imperative is
-            # then allowed.
-            disp = s.Dispatch()
-            disp.add(d)
-            next(iter(disp))
-            self.assertIs(d.state, d.parked)
-            d.finish()  # no raise now -- previous closure fired
-            disp.add(d)
-            list(disp)
+            d.finish()
+            d()
+            self.assertIs(d.state, d.success)
+            self.assertIs(d.tx.state, State.RETURNED)
 
     def test_scenario_exit_auto_unparks_blocked_worker(self):
         """A worker parked at BLOCKED is released on scenario __exit__
@@ -10884,6 +11389,7 @@ class TestCoverageMinor(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.pause()
             d()
             self.assertIs(d.tx.state, State.PAUSED)
@@ -10907,6 +11413,7 @@ class TestCoverageMinor(unittest.TestCase):
             s.skip(w, lock.acquire)
             s.wait(w)
             d = s.Driver(w)
+            d.scan(); d()
             d.stall()
             d()
             self.assertIs(d.tx.state, State.STALLED)
@@ -10933,10 +11440,13 @@ class TestCoverageMinor(unittest.TestCase):
             # gate so only worker pushes a regulated tx.  Wait for it.
             s.wait(w)
             # Drive w into WAITING (past BLOCKED).
+            tx = s.transaction(w)
             d = s.Driver(w)
-            d.wait()
+            target = Waiting(tx)
+            d.wait(target)
             d()
             self.assertIs(d.tx.state, State.WAITING)
+            self.assertEqual(d.signaled, frozenset((target,)))
             d.close()  # release the slot
             # Release the setter so it fires the event; scenario exit
             # then joins both managed threads.
@@ -10961,6 +11471,7 @@ class TestCoverageMinor(unittest.TestCase):
             s.wait(t)
             tx = s.transaction(t)
             d = s.Driver(t)
+            d.scan(); d()
             d.pause()
             d()
             # Tx is now at PAUSED; unblock should refuse.
@@ -11143,6 +11654,8 @@ class TestDispatchChainCoverage(unittest.TestCase):
             s.wait(t1, t2)
             d1 = s.Driver(t1)
             d2 = s.Driver(t2)
+            d1.scan()
+            d2.scan()
             chain = s.Chain(d1, d2)
             disp = s.Dispatch()
             disp.add(chain)
@@ -11211,9 +11724,11 @@ class TestDispatchChainCoverage(unittest.TestCase):
             t = s.thread(worker)
             s.wait(t)
             d = s.Driver(t)
-            d.skip()
+            d.scan(); d()
+            d.finish()
             d()  # advance synchronously
-            self.assertTrue(d.done)
+            self.assertIs(d.state, d.success)
+            self.assertTrue(d.tx.done)
             d.close()
 
 
@@ -11654,242 +12169,17 @@ class TestAction(unittest.TestCase):
 
 
 class TestDriverNested(unittest.TestCase):
-    """Driver handling for nested transactions and the NESTING state.
+    """Driver handling for nested transactions under the tranche-2 model."""
 
-    Driver imperatives now surface nested transactions by default; the
-    caller may drive the child explicitly, or request autoskip=True for
-    the old automatic child-draining behavior.
-    """
-
-    def test_driver_nesting_state_constant_exposed(self):
-        """The user-facing Driver class exposes the NESTING state
-        constant (s.Driver.nesting)."""
+    def test_driver_internal_old_nesting_modes_are_removed(self):
         s = Scenario()
-        self.assertEqual(s.Driver.nesting.name, 'NESTING')
-        self.assertIn(s.Driver.nesting, s.Driver.active_states)
-        self.assertNotIn(s.Driver.nesting, s.Driver.terminal_states)
+        self.assertFalse(hasattr(s.Driver, 'nesting'))
+        self.assertFalse(hasattr(s.Driver, 'reentered'))
+        self.assertFalse(hasattr(s._core.Driver, 'nesting'))
+        self.assertFalse(hasattr(s._core.Driver, 'reentered'))
+        self.assertFalse(hasattr(s._core.Driver, 'active'))
 
-    def test_driver_reentered_state_constant_exposed(self):
-        """The user-facing Driver class exposes the REENTERED state
-        constant (s.Driver.reentered)."""
-        s = Scenario()
-        self.assertEqual(s.Driver.reentered.name, 'REENTERED')
-        self.assertIn(s.Driver.reentered, s.Driver.active_states)
-        self.assertNotIn(s.Driver.reentered, s.Driver.terminal_states)
-
-    def test_driver_nested_yields_in_nesting_state_when_child_appears(self):
-        """When nested-armed and a child fires Nested, the Driver
-        yields in the NESTING state with self.tx rotated to the child
-        and the parent on the stack.  Uses finish() to keep the Driver
-        in a driving state long enough for the worker's wait_for body
-        to spawn the child cond.wait tx."""
-        s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        results = []
-
-        def waiter():
-            lock.acquire()
-            results.append(condition.wait_for(lambda: False, timeout=-1))
-            lock.release()
-
-        with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            wf_tx = s.transaction(t)
-
-            d = s.Driver(t)
-            # finish() drives toward terminal; when the worker's
-            # wait_for body spawns the cond.wait child, the Driver
-            # surfaces it in NESTING by default (autoskip=False).
-            d.finish()
-            d()  # drive
-
-            self.assertEqual(d.state, s.Driver.nesting)
-            child = d.tx
-            self.assertEqual(child.method, condition.wait)
-            self.assertIsNot(child, wf_tx)
-            # Parent context preserved on the stack.
-            self.assertEqual(len(d._core.stack), 1)
-
-            # Cleanup: release the driver slot so direct-API and
-            # subsequent s.skip can attach their own drivers.
-            d.close()
-
-            # Drive child to terminal via the API.
-            child.unblock()
-            s.wait(Call(t, condition.wait, State.STALLED))
-            child.unstall()
-            s.wait(child)
-            # wait_for's predicate sees False again, timeout has
-            # expired (-1), returns False.  wf_tx terminates.
-            s.wait(wf_tx)
-            s.skip(t, lock.release)
-
-        self.assertEqual(results, [False])
-
-    def test_driver_nested_grandchild_extends_stack(self):
-        """Re-arming after first NESTING yield catches the next
-        Nested fire, with the stack growing by one level.  Verifies
-        that the nesting mechanism composes recursively across
-        multiple parent levels: outer wait_for whose predicate calls
-        an inner wait_for produces parent -> inner -> grandchild
-        (cond.wait).  Each NESTING yield deepens the stack."""
-        s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-
-        def waiter():
-            lock.acquire()
-            # Outer wait_for's predicate is inner wait_for; inner's
-            # predicate is False -> spawns cond.wait grandchild.
-            condition.wait_for(
-                lambda: condition.wait_for(lambda: False, timeout=-1),
-                timeout=-1)
-            lock.release()
-
-        with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            d = s.Driver(t)
-
-            d.finish(); d()
-            self.assertEqual(d.state, s.Driver.nesting)
-            self.assertEqual(len(d._core.stack), 1)
-            inner = d.tx
-            self.assertEqual(inner.method, condition.wait_for)
-
-            # Drive inner forward; its body spawns a cond.wait
-            # grandchild, surfaced in NESTING by default with the stack
-            # now holding both outer and inner.
-            d.skip(); d()
-            self.assertEqual(d.state, s.Driver.nesting)
-            self.assertEqual(len(d._core.stack), 2)
-            grandchild = d.tx
-            self.assertEqual(grandchild.method, condition.wait)
-            self.assertIsNot(grandchild, inner)
-
-            # Drive everything to terminal, auto-skipping the rest:
-            # grandchild -> pop to inner -> inner ends -> pop to outer
-            # -> outer ends -> FINISHED.
-            d.finish(autoskip=True); d()
-            self.assertEqual(d.state, s.Driver.finished)
-
-            # The worker is parked mid-(infinite nested wait_for); the
-            # outer Driver finished its own stack but a re-spawned
-            # cond.wait is still live.  Drain the thread to terminal at
-            # the Driver tier so the scenario can exit.
-            dispatch = s.Dispatch()
-            cleanup = s.Driver(t)
-            dispatch.add(cleanup)
-            for dd in dispatch:
-                if dd.done:
-                    break
-                if dd.state is dd.active:  # coverage: cleanup branch
-                    dd.finish(autoskip=True)
-                dispatch.add(dd)
-
-    def test_driver_nested_drive_child_to_completion(self):
-        """finish() surfaces the spawned child in NESTING by default;
-        driving that child to terminal (skip) resumes the parent's
-        finish and lands FINISHED."""
-        s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        results = []
-
-        def waiter():
-            lock.acquire()
-            results.append(condition.wait_for(lambda: False, timeout=-1))
-            lock.release()
-
-        with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            wf_tx = s.transaction(t)
-            d = s.Driver(t)
-
-            d.finish()
-            d()
-
-            self.assertEqual(d.state, s.Driver.nesting)
-            child = d.tx
-            self.assertEqual(child.method, condition.wait)
-
-            # Drive child to terminal; parent's finish resumes, FINISHED.
-            d.skip(); d()
-            self.assertEqual(d.state, s.Driver.finished)
-            s.skip(t, lock.release)
-
-        self.assertEqual(results, [False])
-
-    def test_driver_nested_round_trip_resumes_parent_pursue(self):
-        """After yielding in NESTING, the user drives the child via
-        the same Driver; when the child terminates, the tx-end stack
-        pop restores the parent's pursue context (state, target,
-        base) and the Driver continues toward the original target.
-
-        Verifies that pursue from NESTING does NOT clear the stack
-        (which would lose the parent context), and that .base is
-        properly set to the child during NESTING (so subsequent
-        pursue acts on the child)."""
-        s = Scenario()
-        lock = s.Lock()
-        condition = s.Condition(lock)
-        results = []
-
-        def waiter():
-            lock.acquire()
-            results.append(condition.wait_for(lambda: False, timeout=-1))
-            lock.release()
-
-        with s:
-            t = s.thread(waiter)
-            s.skip(t, lock.acquire)
-            s.wait(t)
-            wf_tx = s.transaction(t)
-            d = s.Driver(t)
-
-            d.finish()
-            d()  # yield NESTING with child cond.wait in view
-
-            self.assertEqual(d.state, s.Driver.nesting)
-            child = d.tx
-            self.assertEqual(child.method, condition.wait)
-            self.assertEqual(len(d._core.stack), 1)
-            # base was set to child during the NESTING transition,
-            # so subsequent pursue here acts on child not parent.
-            self.assertIs(d._core.base, child._core)
-
-            # Drive child to terminal via the same Driver.  skip()
-            # auto-unstalls on STALLED-park, drives to terminal.
-            d.skip()
-            d()
-            # tx-end on child triggered stack pop; Driver resumed
-            # parent's finishing state and drove parent to terminal
-            # (since wait_for returned False right after the child's
-            # timeout).  Driver is now in FINISHED state.
-            self.assertEqual(d.state, s.Driver.finished)
-            self.assertEqual(len(d._core.stack), 0)
-
-            s.skip(t, lock.release)
-
-        self.assertEqual(results, [False])
-
-    def test_base_tx_driver_impasse_on_blanket_parked_base(self):
-        """A Driver given a base tx never latches onto base itself (the
-        parent callback's tx) -- a plain Driver does, which is exactly
-        the choke a nested cycle/Driver hits without a base tx.  When
-        base is parked in a blanket-controlled state (here BLOCKED), the
-        base_tx Driver can make no progress: it ignores base, and base
-        can't surface a child or end on its own, so it lands IMPASSE
-        (distinct from terminated -- the thread lives and base may move
-        later via someone else; it's just out of this Driver's purview).
-        Its idle observation set-up still watches base's subtree
-        (Nested(base) and base-terminal), never raw thread-presence."""
+    def test_finish_surfaces_nested_child(self):
         s = Scenario()
         lock = s.Lock()
         condition = s.Condition(lock)
@@ -11903,81 +12193,71 @@ class TestDriverNested(unittest.TestCase):
             t = s.thread(waiter)
             s.skip(t, lock.acquire)
             s.wait(t)
-            base = s.transaction(t)  # the wait_for tx, BLOCKED at entry
+            parent = s.transaction(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            d.finish(); d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, condition.wait)
+            self.assertIs(d.tx.parent, parent)
+            s._core.driver_finish_deep(d)
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
+            d.finish(); d()
 
-            # Blanket-parked base -> impasse, base refused.
-            d = s.Driver(t, base)
-            d._core.initialize()
-            self.assertEqual(d.state, d.impasse)
-            self.assertTrue(d.done)
-            self.assertIsNone(d.tx)
-            # The idle observation (pre-computed in __init__) watches
-            # base's subtree, not base: Nested(base) and base-terminal
-            # are listened for, the raw thread-presence signal is not.
-            idle_signals = d._core.state_signals[d._core.idle]
-            self.assertIn(Nested(base._core.api), idle_signals)
-            self.assertIn(base._core, idle_signals)
-            self.assertNotIn(t, idle_signals)
-            d.close()
-
-            # plain Driver: active, latched onto the parent.
-            d2 = s.Driver(t)
-            d2._core.initialize()
-            self.assertEqual(d2.state, d2.active)
-            self.assertIs(d2.tx, base)
-            d2.close()
-
-
-    def test_base_tx_driver_idle_on_method_controlled_base(self):
-        """Contrast to the blanket-parked case: when base is parked in a
-        METHOD-controlled state (here COMMIT -- a lock.acquire blocked
-        on a lock another thread holds), the real primitive can still
-        make base progress (the holder releasing), surface a child, or
-        end base.  So the base_tx Driver does NOT terminate -- it sits
-        idle, watching base's subtree, until something happens."""
+    def test_scan_watch_target_surfaces_child_under_parent(self):
         s = Scenario()
         lock = s.Lock()
+        condition = s.Condition(lock)
 
-        def holder():
+        def waiter():
             lock.acquire()
-            lock.release()
-
-        def contender():
-            lock.acquire()
+            condition.wait_for(lambda: False, timeout=-1)
             lock.release()
 
         with s:
-            h = s.thread(holder)
-            c = s.thread(contender)
-            # Holder takes the lock and parks before releasing -> holds it.
-            s.skip(h, lock.acquire)
-            hp = s.park(h, lock.release)
-            # Contender attempts the lock -> COMMIT (lock is held).
-            cp = s.park(c, lock.acquire)
-            cp[c].unblock()
-            s.wait(Call(c, lock.acquire, State.COMMIT))
-            base = s.transaction(c)
+            t = s.thread(waiter)
+            s.skip(t, lock.acquire)
+            base = s.transaction(t)
+            base.unblock()
+            s.wait(Call(t, condition.wait, State.BLOCKED))
+            d = s.Driver(t)
+            d.scan(base); d()
+            self.assertIs(d.state, d.success)
+            self.assertEqual(d.tx.method, condition.wait)
+            self.assertIs(d.tx.parent, base)
+            s._core.driver_finish_deep(d)
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
+            d.finish(); d()
 
-            # Method-controlled base -> idle, not terminated.
-            d = s.Driver(c, base)
-            d._core.initialize()
-            self.assertEqual(d.state, d.idle)
-            self.assertIsNone(d.tx)
+    def test_base_tx_driver_impasse_on_blanket_parked_base(self):
+        s = Scenario()
+        lock = s.Lock()
+        condition = s.Condition(lock)
+
+        def waiter():
+            lock.acquire()
+            condition.wait_for(lambda: False, timeout=-1)
+            lock.release()
+
+        with s:
+            t = s.thread(waiter)
+            s.skip(t, lock.acquire)
+            s.wait(t)
+            base = s.transaction(t)
+            d = s.Driver(t, base)
+            with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
+                d.scan()
             d.close()
 
-            # Cleanup: holder releases -> contender acquires -> both end.
-            hp[h].unblock()
+            d2 = s.Driver(t)
+            d2.scan(); d2()
+            self.assertIs(d2.state, d2.success)
+            self.assertIs(d2.tx, base)
+            d2.close()
 
     def test_base_tx_driver_surfaces_and_drives_child(self):
-        """The base_tx lifecycle: the Driver is idle while the thread
-        is only in base_tx, goes active when a child surfaces under
-        base_tx, and -- once that child is driven out -- continues
-        toward base_tx's own termination (done).  The worker's
-        wait_for spawns a cond.wait child; the base_tx Driver picks it
-        up active, skip() drives it to terminal, and base_tx then
-        terminates on its own, landing the Driver terminated -- driving
-        a nested op a plain Driver couldn't reach without choking on
-        the parent."""
         s = Scenario()
         lock = s.Lock()
         condition = s.Condition(lock)
@@ -11992,29 +12272,19 @@ class TestDriverNested(unittest.TestCase):
             t = s.thread(waiter)
             s.skip(t, lock.acquire)
             s.wait(t)
-            base = s.transaction(t)  # the wait_for tx
-
+            base = s.transaction(t)
             d = s.Driver(t, base)
-            # Outer context advances base_tx so the worker runs its
-            # body and spawns the cond.wait child under it.
             base.unblock()
             s.wait(Call(t, condition.wait, State.BLOCKED))
-
-            # Driver surfaces the child active (it refuses to latch
-            # onto base itself).
-            d()
-            self.assertIs(d.state, d.active)
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
             self.assertEqual(d.tx.method, condition.wait)
-
-            # Drive the child to terminal; base_tx then terminates on
-            # its own (predicate False, timeout expired) -> done.
-            d.skip(); d()
-            self.assertIs(d.state, d.terminated)
+            s._core.driver_finish_deep(d)
             self.assertTrue(base.done)
-
             s.skip(t, lock.release)
 
         self.assertEqual(seen, [False])
+
 
     def test_skip_with_base_tx_strict(self):
         """s.skip((t, base), m1, m2) is strict on base's children: base's
