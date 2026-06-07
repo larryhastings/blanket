@@ -726,8 +726,11 @@ representing a method that takes a `timeout` argument:
 
 #### scenario.wait
 
-`scenario.wait(*items, timeout=None)` is the universal blocker. It
-blocks the scheduler until any of the *items* you supply *signals*.
+`scenario.wait(*items, timeout=None, all=False)` is the universal blocker. It
+blocks the scheduler until any of the *items* you supply *signals*. With
+`all=True`, it accumulates signaled items until every item has signaled at
+least once, using one shared timeout; if that timeout expires it returns the
+partial `frozenset` accumulated so far.
 A wide range of objects can be items: bound methods on primitives
 (signals while any thread is inside that method), regulated primitives
 (signals while any thread is using that primitive), a thread (signals
@@ -818,7 +821,7 @@ Python execution.
 ```
 paused = scenario.pause(t, event.wait)
 tx = paused[t]
-tx.pause = False       # or tx.unpause()
+tx.unpause()           # release your pause request
 ```
 
 #### Driver
@@ -849,11 +852,13 @@ automatic child skipping where that is the right behavior, but code using
 A Driver gives you a set of imperatives--`scan()`, `finish()`,
 `until(state)`, `block()`, `commit()`, `wait(*signals)`, `reenter()`,
 `resume()`, `stall()`, `pause()`, and `route()`--each of which requests
-a scan, a state transition, a signal wait, a callback edge, or a route
-install.
+a scan, a state transition, a passive signal wait, a callback edge, or a
+route install.
 Again, this isn't done eagerly; the `Driver` remembers the request, then
 makes it happen the next time it's driven.  If you stage a second
 imperative before driving, the second one replaces the first one.
+`refresh()` is the exception: it acts immediately, re-baselining the
+Driver after deliberate out-of-band driving.
 
 A `Chain` is an ordered sequence of `Driver` objects. Adding a Chain to a
 Dispatch promotes the chain's first driver; when that driver reaches its
@@ -1250,9 +1255,9 @@ same underlying primitive can coexist in the same test.
 
 The `Driver` imperatives (`scan`, `finish`, `until`, `block`, `commit`,
 `wait`, `reenter`, `resume`, `stall`, `pause`, and `route`) are *lazy*.
-They request a scan, a state transition, a signal wait, a callback edge,
-or a route install, but they don't fire the underlying work until the
-driver is actually driven--by calling `driver()`, or by a `Dispatch`
+They request a scan, a state transition, a passive signal wait, a callback
+edge, or a route install, but they don't fire the underlying work until
+the driver is actually driven--by calling `driver()`, or by a `Dispatch`
 driving it. A driver carries at most one staged imperative at a time:
 calling a second imperative before the first one is driven replaces the
 first. The point of laziness isn't to let you stack imperatives; it's to
@@ -1263,7 +1268,8 @@ other drivers are also active.
 If you're working at the middle level, this rarely matters--`park`
 and `skip` handle the driving for you. But if you reach for explicit
 `Driver` / `Chain` / `Dispatch`, knowing the laziness rule will
-save you confusion.
+save you confusion.  `refresh()` is not lazy: it updates the Driver's
+model immediately and stages nothing.
 
 ## The Injector
 
@@ -1803,10 +1809,12 @@ Read-only mapping from thread to current transaction.
 Equivalent to `scenario.transactions.get(thread)`. Returns `None`
 if the thread has no active transaction.
 
-**`scenario.wait(*items, timeout=None)`**
+**`scenario.wait(*items, timeout=None, all=False)`**
 
 Block until any of `items` signals. See the *Signals And wait* section
 for the supported item types. If `timeout` expires, returns an empty set.
+With `all=True`, wait until every item has signaled at least once, using a
+single shared timeout; timeout returns the partial `frozenset`.
 
 **`scenario.park(*args)`**
 
@@ -1933,9 +1941,9 @@ Every API object has:
 - **`api.unblock(method, *thread_specs, pause=False)`** - unblock the
   named threads' transactions on `method`. `method` is the bound method
   on the primitive.
-- **`api.unpause(method, *thread_specs)`** - decrement the pause counter
-  on the named threads' transactions; transactions whose counter reaches
-  zero unpark from `PAUSED`.
+- **`api.unpause(method, *thread_specs)`** - clear the scheduler pause bit
+  on the named threads' transactions.  If **blanket** is not also holding
+  the transaction at `PAUSED`, it unparks.
 
 Every current primitive API object also has timeout helpers.  They only
 make sense for timeout-bearing methods, and the transaction itself raises
@@ -2047,10 +2055,11 @@ Properties:
   `False` if it raised or timed out, `None` while not yet terminal.
 - **`tx.failed`** - The opposite of `succeeded`. (and `None` if
   `succeeded` is `None`.)
-- **`tx.pause`** - read/write boolean. Setting `tx.pause = True`
-  tells the transaction that you want it to pause at `PAUSED` state.
-- **`tx.pausing`** - read-only; `True` if either you *or* **blanket**
-  *itself* have asked the transaction to pause.
+- **`tx.pause`** - read/write boolean.  This is the scheduler-owned pause
+  request.  Set it to `True` to ask **blanket** to hold the transaction
+  at `PAUSED`; set it to `False` to withdraw that request.
+- **`tx.paused`** - read-only boolean. `True` iff either you or
+  **blanket** is currently asking the transaction to stay at `PAUSED`.
 - **`tx.parent`** - the parent transaction, if any.  Only used
   for nested transactions, such as the `Condition.wait` inside
   a `Condition.wait_for`).  Usually `None` indicating no parent.
@@ -2066,22 +2075,19 @@ Properties:
 
 Methods:
 
+- **`tx.visited(*states)`** - return `True` if the transaction has
+  visited every state listed.  This is a convenience query over `tx.log`;
+  it does not impose an ordering requirement.  Calling it with no states
+  raises `ValueError`.
 - **`tx.wait(state=None)`** - block the scheduler until the transaction
   reaches `state`, or until it terminates if `state` is omitted. Returns
   the transaction's current state.
 - **`tx.unblock()`** - unblock the transaction from the scheduler
   block.
-- **`tx.unpause()`** - equivalent to `tx.pause = False`, but also,
-  unparks the transaction from the scheduler pause if you were the
-  only party requesting the `PAUSED` park.  (**blanket** can request
-  that park too, and a transaction parked at `PAUSED` won't unblock
-  until all parties give it permission to resume.)
+- **`tx.unpause()`** - equivalent to setting `tx.pause = False`, then
+  asserting that the transaction is no longer paused.  If **blanket** is
+  still holding the transaction at `PAUSED`, this raises.
 - **`tx.unstall()`** - unblock the transaction from a stall.
-- **`tx.unpark()`** - release the transaction from whatever
-  scheduler-controlled parking state it's currently in: `BLOCKED`,
-  `STALLED`, or `PAUSED`.  This is the blunt instrument; prefer the
-  specific operation when you already know where the transaction is
-  parked.
 - **`tx.expire()`** - force the transaction to time out, when it runs.
   Can only be called on transactions that can time out,
   while the transaction is in `BLOCKED` state.
@@ -2099,8 +2105,10 @@ Methods:
 
 Construct a Driver attached to `thread`.  If `base_tx` is provided, the
 Driver is scoped to descendant transactions under that base transaction.
-If `route` is provided, it must be a generator function accepting the
-Driver; the route steers the Driver until the route returns.
+If `route` is provided, it must be callable, accept the Driver, and
+return an iterator; the route steers the Driver until the route returns.
+Most routes are generator functions, but a stateful callable object that
+returns itself and implements `__next__` is also supported.
 A Driver "drives" a thread, which is to say, it causes method calls made
 on primitives by the thread to make progress. You can tell the Driver
 what you want the thread, or the tx running on the thread, to do, and the
@@ -2129,12 +2137,32 @@ Properties:
   `undirected`.
 - **`driver.tx`** - the current transaction (`None` if none).
 - **`driver.txs`** - tuple of all transactions seen so far.
-- **`driver.signaled`** - the explicit signals that fired during the
-  most recent `driver.wait(*signals)`.
-- **`driver.directive`** - the most recently staged Driver method, as a
-  bound method.
+- **`driver.status`** - a `DriverStatus` snapshot describing the most
+  recent completed Driver directive, or `None` if no directive has
+  completed yet or the Driver is currently driving.
+- **`driver.log`** - tuple of `DriverStatus` snapshots, one for each
+  completed Driver directive, including directives consumed internally
+  by a route.
+- **`driver.waited`** - a `frozenset` containing the final set of
+  signals the Driver waited on during the most recent completed drive.
+- **`driver.signaled`** - a `frozenset` containing the signals from
+  `driver.waited` that were high and woke the Driver.
+- **`driver.motivation`** - a `frozenset` containing the signals that
+  explain the Driver's new state.  These sets always satisfy
+  `driver.motivation <= driver.signaled <= driver.waited`.  For
+  `driver.wait(*signals)`, success means `driver.motivation` is the
+  subset of the asserted signals that actually signaled; intrinsic
+  thread termination means it is `{Terminated(driver.thread)}`.
+
+`DriverStatus` is an immutable tuple-style record with these fields:
+`directive`, `directive_args`, `state`, `tx`, `waited`, `signaled`, and
+`motivation`.  Its signal sets have the same frozenset invariant:
+`motivation <= signaled <= waited`.
+
+- **`driver.directive`** - the most recently completed Driver method, as a
+  bound method, or `None` if `driver.status` is `None`.
 - **`driver.directive_args`** - the positional arguments from the most
-  recently staged directive, as a tuple.
+  recently completed directive, as a tuple.
 - **`driver.routed`** - `True` while a route is installed and still
   active.
 - **`driver.done`** - `True` if in a terminal driver state.
@@ -2148,6 +2176,9 @@ Driver has these states:
   control while the Driver is driving.
 - `success`, the last committed directive reached its target.  This covers
   a successful scan, park, finish, `until`, callback edge, and signal wait.
+- `nested`, a child transaction surfaced while the Driver was carrying out
+  a non-scan directive.  The child is selected as `driver.tx`; tell the
+  Driver what to do with it, then scan back to the parent as needed.
 - `returned`, `until(raised)` expected the transaction to raise, but it
   returned cleanly instead.
 - `overshot`, the transaction self-progressed past an externally-controlled
@@ -2185,11 +2216,13 @@ and the last staged imperative wins:
   unblocking.
 - **`driver.commit()`** - drive the current transaction to `COMMIT`
   (timeout-bearing only).
-- **`driver.wait(*signals)`** - drive until one of the named signals
-  fires. The signal set is normalized the same way `scenario.wait`
-  normalizes signals, and the explicit signals that fired are stored in
-  `driver.signaled`. If you want the old "drive to WAITING" behavior,
-  say that explicitly after scanning: `driver.wait(Waiting(driver.tx))`.
+- **`driver.wait(*signals)`** - passively wait until one of the named
+  signals fires. The signal set is normalized the same way `scenario.wait`
+  normalizes signals. `wait` does not drive the worker and does not need a
+  current transaction; its value over `scenario.wait` is that a waiting
+  Driver can participate in a `Dispatch` while other Drivers keep moving.
+  After it returns, inspect `driver.waited`, `driver.signaled`, and
+  `driver.motivation`.
 - **`driver.reenter()`** - drive until the current transaction enters a
   user callback that can itself ask **blanket** for scheduler help.
 - **`driver.resume()`** - after `reenter()`, drive until that callback
@@ -2197,31 +2230,36 @@ and the last staged imperative wins:
 - **`driver.stall()`** - drive the current transaction to `STALLED`
   (stalling-supporting only).
 - **`driver.pause()`** - drive the current transaction to `PAUSED`.
-- **`driver.route(route)`** - install a route. A route is a generator
-  function with the shape `def route(driver):`. At each point where the
-  Driver would normally ask the caller for instructions, the Driver calls
-  the route instead. The route inspects the Driver, issues a Driver
-  imperative, and yields. When the route returns, the Driver goes back to
-  normal behavior and reports to its caller at the current ask point.
-  Routes compose naturally with `yield from`, and branch naturally with
-  ordinary `if` / `while` statements. `route(X)` inside a route is a hard
-  hand-off to a new route; `yield from subroute(driver)` is a subroutine
-  call that comes back.  A route may issue one directive and then yield;
-  yielding without a directive raises.
+- **`driver.route(route)`** - install a route. A route is callable with
+  the shape `route(driver)` and must return an iterator.  A generator
+  function is the usual spelling; a callable object may also return itself
+  and store its own state while implementing `__next__`. At each point
+  where the Driver would normally ask the caller for instructions, the
+  Driver calls the route instead. The route inspects the Driver, issues a
+  Driver imperative, and yields. When the route returns, the Driver goes
+  back to normal behavior and reports to its caller at the current ask
+  point. Routes compose naturally with `yield from`, and branch naturally
+  with ordinary `if` / `while` statements. `route(X)` inside a route is a
+  hard hand-off to a new route; `yield from subroute(driver)` is a
+  subroutine call that comes back.  A route may issue one directive and
+  then yield; yielding without a directive raises.
 
-`driver.wait(*signals)` also watches a couple of escape hatches so a bad
-signal list doesn't turn into a silent deadlock. If the thread terminates
-and you didn't list `Terminated(thread)`, the Driver enters `terminated`.
-If the current transaction exits before any of your named signals fire,
-the Driver raises; list the transaction itself if you mean to handle that
-case and branch on `driver.signaled`.
+`driver.wait(*signals)` always includes `Terminated(driver.thread)` as its
+intrinsic ender. If the thread terminates and you listed that signal, the
+wait succeeds like any other listed signal; if you didn't list it, the
+Driver enters `terminated`. Transaction exit is not intrinsic to
+`wait`--if you care about a transaction, list the transaction or a
+transaction-specific signal yourself.
 
 Other methods:
 
+- **`driver.refresh()`** - immediately re-sample the Driver's live thread
+  state after intentional out-of-band driving. It stages nothing and
+  drives nothing; it is the "I moved this myself, on purpose" operation.
 - Calling the driver itself (a la `driver()`) commits the staged directive
-  and drives until that directive reaches an ask point: success, raised,
-  termination, impasse, or a route ending.  Calling it with no staged
-  directive raises and leaves the Driver `undirected`.
+  and drives until that directive reaches an ask point: success, nested,
+  raised, termination, impasse, or a route ending.  Calling it with no
+  staged directive raises and leaves the Driver `undirected`.
 
 ### Scenario.Chain
 
@@ -2398,8 +2436,8 @@ states in between depend on which method was called.
 
 - **`PAUSED`** - the *scheduler pause*.  A parking state managed
   by *blanket*.  The scheduler can request that a transaction park
-  here by setting `tx.pause = True`; *blanket* high-level APIs also
-  often cause a transaction to park in **`PAUSED`** state.  The
+  here with `tx.pause = True`; *blanket* high-level APIs also often cause
+  a transaction to park in **`PAUSED`** state.  The
   transaction parked in **`PAUSED`** state will be held in that state
   as long as any functionality is requesting that state.
 
@@ -2585,8 +2623,9 @@ But the official test and coverage path is `tests/test_all.py`.
     - Reworked `Driver` around explicit staged directives.  A fresh Driver
       starts in `undirected` and does nothing until directed; use `scan()` to
       find the thread's current published transaction.  Driver's public states
-      are now `undirected`, `driving`, `success`, `returned`, `overshot`,
-      `persisted`, `mutated`, `raised`, `terminated`, and `impasse`.
+      are now `undirected`, `driving`, `success`, `nested`, `returned`,
+      `overshot`, `persisted`, `mutated`, `raised`, `terminated`, and
+      `impasse`.
 
     - Changed nested-transaction semantics: nested transactions are no longer
       automatically silently skipped by Driver.  When the driver detects a
@@ -2598,10 +2637,12 @@ But the official test and coverage path is `tests/test_all.py`.
       directive wins.
 
     - `Driver.wait` is now the Driver-level companion to `scenario.wait`:
-      `driver.wait(*signals)` drives the thread until one of the named signals
-      fires, then exposes the fired explicit signals via `driver.signaled`.
-      The old public "park at WAITING" shorthand was removed; use
-      `driver.wait(Waiting(driver.tx))` when that's what you mean.
+      `driver.wait(*signals)` passively waits until one of the named signals
+      fires. It doesn't release the worker through parking states and it
+      doesn't require a current transaction. Driver now publishes
+      `waited`, `signaled`, and `motivation` after a drive, and `refresh()`
+      lets you bless deliberate out-of-band driving before observing with
+      `wait`.
 
     - Added Driver routes.  Construct a Driver with `route=...`, or install one
       later with `driver.route(route)`, where `route` is a generator function
@@ -2612,6 +2653,26 @@ But the official test and coverage path is `tests/test_all.py`.
     - `Driver` is now more relaxed about multiple drivers operating on the
       same thread.  You can now have as many as you like, provided that only
       one is active at a time.
+
+    - Modernized Driver consumers to use routes for their deep-driving and
+      callback choreography.  `Condition.cycle()` no longer drops into raw
+      `score.wait` for `wait_for` predicate routing, and the old hidden
+      `listen_predicate` / `listen_action` Driver flags are gone.
+
+    - Added Driver observability: `DriverStatus`, `driver.status`, and
+      `driver.log`.  Added `tx.visited(*states)` as a convenience query over
+      a transaction's state-transition log.
+
+    - Reworked pause handling around two pause bits: a scheduler-owned
+      `tx.pause` bit and a blanket-owned `blanket_pause` bit.  `tx.pause` is
+      again a boolean property; `tx.paused` reports whether either bit is
+      holding the transaction at `PAUSED`; `tx.unpause()` clears the user
+      bit and raises if blanket is still holding the transaction.  The
+      old public `tx.pausing` and `tx.unpark()` APIs were removed.
+
+    - Added `scenario.wait(..., all=True)`, which waits for every supplied
+      item to signal at least once under one shared timeout and returns the
+      accumulated `frozenset`.
 
 - Changes to `cycle`:
 
