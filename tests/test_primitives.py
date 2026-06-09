@@ -3529,7 +3529,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
     """Regression tests for lazy semantics of Driver imperatives
     combined with Dispatch add/remove.
 
-    Driver.pause() (and the other parking imperatives) stage their
+    Driver.paused() (and the other parking imperatives) stage their
     tx.unblock on the driver's `lazy` slot rather than firing it
     eagerly.  That lazy must not fire as a side effect of
     Dispatch bookkeeping -- only the drain that __next__ runs at
@@ -3565,7 +3565,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             d = s.Driver(t)
             d.scan(); d()
             self.assertIs(tx.state, State.BLOCKED)
-            d.pause()
+            d.paused()
             self.assertIs(tx.state, State.BLOCKED)
             disp = s.Dispatch()
             disp.add(d)
@@ -3587,7 +3587,7 @@ class TestDriverDispatchLazy(unittest.TestCase):
             d = s.Driver(t)
             d.scan(); d()
             self.assertIs(tx.state, State.BLOCKED)
-            d.pause()
+            d.paused()
             self.assertIs(tx.state, State.BLOCKED)
             chain = s.Chain()
             chain.append(d)
@@ -3640,7 +3640,7 @@ class TestChain(unittest.TestCase):
         lock.acquire is unblocked so it can exit.
         """
         for lock, t, d in triples:
-            if not d.done:  # coverage: test-defensive branch
+            if Terminated(t) not in d.motivation:  # coverage: test-defensive branch
                 d.close()
             s.api(lock).unblock(lock.acquire, t)
 
@@ -3710,7 +3710,7 @@ class TestChain(unittest.TestCase):
             chain.append(d)
             self.assertTrue(chain)
             # Promote pending head to current via Dispatch iteration.
-            d.pause()
+            d.paused()
             disp = s.Dispatch()
             disp.add(chain)
             next(iter(disp))
@@ -3759,7 +3759,7 @@ class TestChain(unittest.TestCase):
         s = Scenario()
         with s:
             lock, t, d = self._make_thread(s)
-            d.pause()
+            d.paused()
             chain = s.Chain(d)
             disp = s.Dispatch()
             disp.add(chain)
@@ -3778,8 +3778,8 @@ class TestChain(unittest.TestCase):
         with s:
             lock1, t1, d1 = self._make_thread(s)
             lock2, t2, d2 = self._make_thread(s)
-            d1.pause()
-            d2.pause()
+            d1.paused()
+            d2.paused()
             chain = s.Chain(d1, d2)
             disp = s.Dispatch()
             disp.add(chain)
@@ -3845,7 +3845,7 @@ class TestModuleHelpersAndImportBranches(unittest.TestCase):
 
             d = s.Driver(t)
             d.scan(); d()
-            d.pause(); d()
+            d.paused(); d()
             self.assertTrue(tx.visited(State.BLOCKED, State.PAUSED))
             self.assertFalse(tx.visited(State.BLOCKED, State.RETURNED))
             d.finish(); d()
@@ -3968,48 +3968,6 @@ class TestScenarioCoreInternals(unittest.TestCase):
         with self.scenario:
             self.assertIn("entered", repr(self.scenario._context_manager))
 
-    def test_wait_interest_refcount_cleanup_keeps_positive_counts(self):
-        score = self.core
-        interest_key = object()
-        base_core = object()
-        not_call = object()
-        not_use = object()
-        not_nested = object()
-        not_state = object()
-
-        score.scoped_call_bases[interest_key][base_core] = 2
-        score.scoped_use_bases[interest_key][base_core] = 2
-        score.sleeping_not_calls[not_call] = 2
-        score.sleeping_not_uses[not_use] = 2
-        score.sleeping_not_nested[not_nested] = 2
-        score.sleeping_not_transaction_states[not_state] = 2
-
-        undo = [
-            ('scoped_call', interest_key, base_core),
-            ('scoped_use', interest_key, base_core),
-            ('not_call', not_call),
-            ('not_use', not_use),
-            ('not_nested', not_nested),
-            ('not_transaction_state', not_state),
-        ]
-        score.unregister_wait_interests(undo)
-
-        self.assertEqual(score.scoped_call_bases[interest_key][base_core], 1)
-        self.assertEqual(score.scoped_use_bases[interest_key][base_core], 1)
-        self.assertEqual(score.sleeping_not_calls[not_call], 1)
-        self.assertEqual(score.sleeping_not_uses[not_use], 1)
-        self.assertEqual(score.sleeping_not_nested[not_nested], 1)
-        self.assertEqual(score.sleeping_not_transaction_states[not_state], 1)
-
-        score.unregister_wait_interests(undo)
-
-        self.assertNotIn(interest_key, score.scoped_call_bases)
-        self.assertNotIn(interest_key, score.scoped_use_bases)
-        self.assertNotIn(not_call, score.sleeping_not_calls)
-        self.assertNotIn(not_use, score.sleeping_not_uses)
-        self.assertNotIn(not_nested, score.sleeping_not_nested)
-        self.assertNotIn(not_state, score.sleeping_not_transaction_states)
-
     def test_reset_clears_terminated_tx_debris_from_signaling(self):
         """reset() drops accumulated state.  Self-reporting tx and
         Signaling items report their own state directly; the per-score
@@ -4083,14 +4041,6 @@ class TestScenarioCoreInternals(unittest.TestCase):
         with self.scenario:
             pass
         self.assertTrue(ran)
-
-    def test_core_signal_requires_signaled(self):
-        # Every wait item is self-reporting now; score.signal on a bare
-        # object asserts out.  This is a contract assertion, not a
-        # user-facing error -- internal callers must wrap properly.
-        item = object()
-        with self.assertRaises(AssertionError):
-            self.core.signal(item)
 
     def test_wait_on_monitor_thread_raises(self):
         evt = threading.Event()
@@ -4192,10 +4142,10 @@ class TestCoreTransactionAndApiInternals(unittest.TestCase):
             self.scenario.wait(t)
             tx = self.scenario.transaction(t)
             _ = tx.thread; _ = tx.method; _ = tx.done; _ = tx.start_time; _ = tx.state
-            _ = tx.kwargs; _ = tx.pause; _ = tx.paused
+            _ = tx.kwargs; _ = tx.pause; _ = tx.pausing
             tx.pause = True
             self.assertTrue(tx.pause)
-            self.assertTrue(tx.paused)
+            self.assertTrue(tx.pausing)
             tx.pause = False
             self.assertFalse(tx.pause)
             self.assertFalse(hasattr(tx, 'pend'))
@@ -5132,14 +5082,6 @@ class TestSignalTokenCoverage(unittest.TestCase):
             self.assertEqual(use.thread_scope, (tx.thread, tx))
             self.assertIn(tx.thread.name, repr(use))
             self.assertIn("Use(", repr(use))
-
-            child = types.SimpleNamespace(use_primitives=set(), parent=tx._core)
-            old_tx = s._core.transactions[tx.thread]
-            s._core.transactions[tx.thread] = child
-            try:
-                self.assertIsNone(use.matching_tx(s))
-            finally:
-                s._core.transactions[tx.thread] = old_tx
         finally:
             self._finish_tx(s, tx)
 
@@ -7402,14 +7344,14 @@ class TestTransactionPauseFlag(unittest.TestCase):
             tx = s.transaction(t)
             tx.pause = True
             self.assertTrue(tx.pause)
-            self.assertTrue(tx.paused)
+            self.assertTrue(tx.pausing)
             tx.unblock()
             s.wait(Paused(tx))
             self.assertEqual(tx.state, State.PAUSED)
             tx.unpause()
             s.wait(tx)
             self.assertFalse(tx.pause)
-            self.assertFalse(tx.paused)
+            self.assertFalse(tx.pausing)
             self.assertEqual(order, ['ran'])
 
     def test_unpause_reports_blanket_pause(self):
@@ -7424,8 +7366,8 @@ class TestTransactionPauseFlag(unittest.TestCase):
             d = s.Driver(t)
             d.scan(); d()
             tx = d.tx
-            d._core.pause_internal(); d()
-            self.assertTrue(tx.paused)
+            d._core.blanket_paused(); d()
+            self.assertTrue(tx.pausing)
             self.assertFalse(tx.pause)
             with self.assertRaisesRegex(RuntimeError, 'still paused'):
                 tx.unpause()
@@ -7985,14 +7927,12 @@ class TestNestedTransactions(unittest.TestCase):
             s.skip(t, lock.acquire)
             s.wait(t)
             parent = s.transaction(t)
-            self.assertEqual(parent.depth, 0)
             parent.unblock()
 
             s.wait(Call(t, lock.locked, State.BLOCKED))
             child = s.transaction(t)
             self.assertEqual(child.method, lock.locked)
             self.assertIs(child.parent, parent)
-            self.assertEqual(child.depth, 0)
             child.unblock(); s.wait(child)
 
             s.wait(parent)
@@ -8001,9 +7941,9 @@ class TestNestedTransactions(unittest.TestCase):
 
 
     def test_wait_for_nested_same_primitive_different_method_restores_parent(self):
-        """A nested tx on the same primitive but a different method has
-        depth 0, uses the outer wait_for as parent, and does not corrupt
-        the active parent tx between nested calls."""
+        """A nested tx on the same primitive but a different method
+        uses the outer wait_for as parent, and does not corrupt the
+        active parent tx between nested calls."""
         s = Scenario()
         lock = s.RLock()
         condition = s.Condition(lock)
@@ -8028,7 +7968,6 @@ class TestNestedTransactions(unittest.TestCase):
             s.wait(t)
             parent = s.transaction(t)
             self.assertEqual(parent.method, condition.wait_for)
-            self.assertEqual(parent.depth, 0)
             use = Use(t, condition)
             signaled = s.wait(use)
             self.assertIn(use, signaled)
@@ -8039,7 +7978,6 @@ class TestNestedTransactions(unittest.TestCase):
             child1 = s.transaction(t)
             self.assertEqual(child1.method, condition.notify)
             self.assertIs(child1.parent, parent)
-            self.assertEqual(child1.depth, 0)
             signaled = s.wait(use)
             self.assertIn(use, signaled)
             child1.unblock()
@@ -8050,7 +7988,6 @@ class TestNestedTransactions(unittest.TestCase):
             self.assertEqual(child2.method, condition.notify)
             self.assertIs(child2.parent, parent)
             self.assertIsNot(child2.parent, child1)
-            self.assertEqual(child2.depth, 0)
             signaled = s.wait(use)
             self.assertIn(use, signaled)
             child2.unblock()
@@ -8110,11 +8047,8 @@ class TestNestedTransactions(unittest.TestCase):
                 child = s.transaction(x)
                 self.assertEqual(child.method, lock.locked)
                 # Under the new (no-implicit-stash) design, the child
-                # is a proper child of opener_tx via tx.parent.  depth
-                # is keyed by method, so child is depth 0 (lock.locked
-                # has no same-method ancestor).
+                # is a proper child of opener_tx via tx.parent.
                 self.assertIs(child.parent, opener_tx)
-                self.assertEqual(child.depth, 0)
                 self.assertTrue(tx.ran_action)
                 child.unblock()
                 s.wait(child)
@@ -8158,13 +8092,11 @@ class TestNestedTransactions(unittest.TestCase):
                 s.wait(Call(scope, condition.wait_for, State.BLOCKED))
                 tx = s.transaction(t)
                 self.assertEqual(tx.method, condition.wait_for)
-                self.assertEqual(tx.depth, depth)
 
                 if depth == 0:
                     self.assertIsNone(tx.parent)
                 else:
                     self.assertIs(tx.parent, txs[-1])
-                    self.assertEqual(tx.parent.depth, depth - 1)
                     scoped_call = Call((t, txs[-1]), condition.wait_for)
                     self.assertIn(scoped_call, s.wait(scoped_call, timeout=0))
 
@@ -8740,14 +8672,6 @@ class TestCoverageLowHangingFruit(unittest.TestCase):
         scenario = Scenario()
         proxy = scenario._core.ReadOnlyListProxy([1, 2, 3, 2])
         self.assertEqual(proxy.index(2, 2, 4), 3)
-
-    def test_core_thread_to_tx_type_validation(self):
-        scenario = Scenario()
-        lock = scenario.Lock()
-        core = lock._core
-        with core.lock:
-            with self.assertRaises(TypeError):
-                core.threads_to_txs([object()], 'test_core_thread_to_tx_type_validation')
 
     def test_park_raises_when_waited_thread_never_reaches_method(self):
         scenario = Scenario()
@@ -9733,7 +9657,7 @@ class TestDriverConstructor(unittest.TestCase):
             d = s.Driver(t)
             d.scan()
             d()
-            self.assertTrue(tx.paused)
+            self.assertTrue(tx.pausing)
             tx.pause = False
             d.finish()
             d()
@@ -9770,7 +9694,42 @@ class TestDriverImperatives(unittest.TestCase):
             disp.add(d)
             yielded = next(iter(disp))
             self.assertIs(yielded.state, d.success)
-            self.assertFalse(yielded.done)
+            self.assertNotIn(Terminated(yielded.thread), yielded.motivation)
+
+    def test_raised_is_recoverable(self):
+        """An unanticipated raise lands the Driver in `raised`, which is NOT
+        terminal.  The worker raised but caught it and kept running, so the
+        Driver can scan() and drive the thread's next transaction.  Only a
+        gone thread (`terminated`) is a true dead-end."""
+        s = Scenario()
+        sem = s.BoundedSemaphore(1)   # already at max: release() raises ValueError
+        lock = s.Lock()
+        log = []
+
+        def worker():
+            try:
+                sem.release()
+            except ValueError:
+                log.append("caught")
+            with lock:                # worker continues into a new transaction
+                log.append("locked")
+
+        with s:
+            t = s.thread(worker)
+            s.wait(t)
+            d = s.Driver(t)
+            d.scan(); d()
+            self.assertEqual(d.tx.method.__name__, "release")
+            d.finish(); d()
+            self.assertIs(d.state, d.unexpected)
+            self.assertNotIn(Terminated(d.thread), d.motivation)  # the whole point: still drivable
+            # Recover off the live published tx the caught-and-continued worker made.
+            d.scan(); d()
+            self.assertIsNotNone(d.tx)
+            self.assertEqual(d.tx.method.__name__, "acquire")
+            d.finish(); d()
+            self.assertIs(d.state, d.success)
+        self.assertEqual(log, ["caught", "locked"])
 
     def test_block(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -9779,11 +9738,11 @@ class TestDriverImperatives(unittest.TestCase):
             s.wait(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.block()
+            d.blocked()
             d()  # drives d to a successful BLOCKED park
             self.assertIs(d.state, d.success)
             self.assertIs(d.tx.state, State.BLOCKED)
-            self.assertFalse(d.done)
+            self.assertNotIn(Terminated(d.thread), d.motivation)
             # Release worker so cleanup joins.
             s.api(lock).unblock(lock.acquire, t)
 
@@ -9814,13 +9773,13 @@ class TestDriverImperatives(unittest.TestCase):
             tx = s.transaction(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.pause()
+            d.paused()
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
             self.assertIs(yielded.state, d.success)
             self.assertIs(tx.state, State.PAUSED)
-            self.assertTrue(tx.paused)
+            self.assertTrue(tx.pausing)
             disp.close()
 
     def test_wait(self):
@@ -9843,44 +9802,6 @@ class TestDriverImperatives(unittest.TestCase):
             self.assertIn(target, dw.motivation)
             self.assertDriverSignalSets(dw)
 
-    def test_refresh_rebaselines_and_public_signal_properties(self):
-        s, lock, worker = _make_scenario_with_lock_worker()
-        with s:
-            t = s.thread(worker)
-            s.wait(t)
-            d = s.Driver(t)
-            d.scan(); d()
-            tx = d.tx
-
-            # Public status and signal sets translate internal transaction
-            # handles back to the user-facing transaction handle.
-            with d._lock:
-                d._core.waited = frozenset({tx._core})
-                d._core.signaled = frozenset({tx._core})
-                d._core.motivation = frozenset({tx._core})
-                d._core.state = d._core.mutated
-                d._core.record_status()
-            self.assertIsInstance(d.status, DriverStatus)
-            self.assertEqual(d.status.tx, tx)
-            self.assertEqual(d.waited, frozenset({tx}))
-            self.assertEqual(d.signaled, frozenset({tx}))
-            self.assertEqual(d.motivation, frozenset({tx}))
-            self.assertDriverSignalSets(d)
-            self.assertIs(d.state, d.mutated)
-
-            d.refresh()
-            self.assertIsNone(d.status)
-            self.assertIs(d.state, d.success)
-            self.assertEqual(d.waited, frozenset())
-            self.assertEqual(d.signaled, frozenset())
-            self.assertEqual(d.motivation, frozenset())
-            self.assertDriverSignalSets(d)
-            d.refresh()
-            self.assertIs(d.state, d.success)
-
-            # Cleanup drives the worker out of its pending acquire.
-            d.finish(); d()
-
     def test_stall(self):
         s = Scenario()
         lock = s.Lock()
@@ -9894,7 +9815,7 @@ class TestDriverImperatives(unittest.TestCase):
             s.wait(w)
             d = s.Driver(w)
             d.scan(); d()
-            d.stall()
+            d.stalled()
             # Drive d to park at STALLED.  The test only needs the parked
             # state; scenario exit cleanup releases the worker afterwards.
             disp = s.Dispatch()
@@ -9938,13 +9859,13 @@ class TestDriverImperatives(unittest.TestCase):
             self.assertIsNone(d.status)
             self.assertEqual(d.log, ())
             self.assertIsNone(d.directive)
-            self.assertEqual(d.directive_args, ())
+            self.assertEqual(d.args, ())
 
             d.scan()
             # Staging alone is not a completed Driver outcome.
             self.assertIsNone(d.status)
             self.assertIsNone(d.directive)
-            self.assertEqual(d.directive_args, ())
+            self.assertEqual(d.args, ())
 
             d()
             self.assertIsInstance(d.status, DriverStatus)
@@ -9954,7 +9875,7 @@ class TestDriverImperatives(unittest.TestCase):
             raw = DriverStatus(None, (), d.success, None, (), (), ())
             self.assertIsNone(d._public_status(raw).directive)
             self.assertEqual(d.directive, d.scan)
-            self.assertEqual(d.directive_args, (None,))
+            self.assertEqual(d.args, (None,))
             self.assertEqual(len(d.log), 1)
             self.assertIs(d.log[-1].state, d.success)
             self.assertEqual(d.log[-1].directive, d.scan)
@@ -9965,7 +9886,7 @@ class TestDriverImperatives(unittest.TestCase):
             self.assertEqual(d.directive, d.scan)
             d()
             self.assertEqual(d.directive, d.finish)
-            self.assertEqual(d.directive_args, ())
+            self.assertEqual(d.args, ())
             self.assertEqual(len(d.log), 2)
             self.assertLessEqual(d.status.motivation, d.status.signaled)
             self.assertLessEqual(d.status.signaled, d.status.waited)
@@ -9982,7 +9903,7 @@ class TestDriverImperatives(unittest.TestCase):
             d = s.Driver(w)
             d.scan(); d()
             with self.assertRaisesRegex(RuntimeError, "park in STALLED"):
-                d.stall()
+                d.stalled()
             # stall() raised before staging; d is still at success
             # and owns w.  Set the underlying event so when the
             # commit's actual.wait runs it returns immediately, then
@@ -10086,7 +10007,7 @@ class TestDriverRoutes(unittest.TestCase):
             d = s.Driver(t)
             d.scan(); d()
             d.route(route)
-            d.pause()
+            d.paused()
             d()
             self.assertEqual(ran, [])
             self.assertFalse(d.routed)
@@ -10338,7 +10259,7 @@ class TestDriverRoutes(unittest.TestCase):
             d.scan()
             yield
             d.route(replacement)
-            d.pause()
+            d.paused()
             yield
 
         with s:
@@ -10369,7 +10290,7 @@ class TestDriverRoutes(unittest.TestCase):
             d = s.Driver(t, route=route)
             with self.assertRaisesRegex(ValueError, "route blew up"):
                 d()
-            self.assertIs(d.state, d.raised)
+            self.assertIs(d.state, d.unexpected)
             self.assertEqual(closed, [True])
             d.close()
             s.api(lock).unblock(lock.acquire, t)
@@ -10447,7 +10368,7 @@ class TestDriverRoutes(unittest.TestCase):
             s.wait(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.stall()
+            d.stalled()
             d()
             self.assertIs(d.tx.state, State.STALLED)
             tx = d.tx
@@ -10469,7 +10390,7 @@ class TestDriverRoutes(unittest.TestCase):
             s.wait(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.pause()
+            d.paused()
             d()
             self.assertIs(d.tx.state, State.PAUSED)
             tx = d.tx
@@ -10494,7 +10415,8 @@ class TestDriverCascade(unittest.TestCase):
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.terminated)
+            self.assertIs(yielded.state, d.unexpected)
+            self.assertIn(Terminated(yielded.thread), yielded.motivation)
 
     def test_idle_to_active_on_thread_signal(self):
         s = Scenario()
@@ -10630,7 +10552,8 @@ class TestDriverCascade(unittest.TestCase):
             self.assertIs(d.state, d.success)
             self.assertTrue(d.tx.done)
             d.scan(); d()
-            self.assertIs(d.state, d.terminated)
+            self.assertIs(d.state, d.unexpected)
+            self.assertIn(Terminated(d.thread), d.motivation)
 
     def test_scan_is_the_explicit_recovery_path_after_finish(self):
         """finish() handles one tx; scan() is how the Driver reaches the next one."""
@@ -10696,7 +10619,8 @@ class TestDispatch(unittest.TestCase):
             disp = s.Dispatch()
             disp.add(d)
             yielded = next(iter(disp))
-            self.assertIs(yielded.state, d.terminated)
+            self.assertIs(yielded.state, d.unexpected)
+            self.assertIn(Terminated(yielded.thread), yielded.motivation)
 
     def test_dispatch_yields_done_then_stops(self):
         s, lock, worker = _make_scenario_with_lock_worker()
@@ -10780,13 +10704,20 @@ class TestDriverAPI(unittest.TestCase):
         self.assertEqual(Scenario.Driver.undirected.name, 'UNDIRECTED')
         self.assertEqual(Scenario.Driver.driving.name, 'DRIVING')
         self.assertEqual(Scenario.Driver.success.name, 'SUCCESS')
-        self.assertEqual(Scenario.Driver.raised.name, 'RAISED')
-        self.assertEqual(Scenario.Driver.terminated.name, 'TERMINATED')
-        self.assertEqual(Scenario.Driver.impasse.name, 'IMPASSE')
-        self.assertIn(Scenario.Driver.driving, Scenario.Driver.driving_states)
-        self.assertIn(Scenario.Driver.raised, Scenario.Driver.terminal_states)
-        self.assertIn(Scenario.Driver.terminated, Scenario.Driver.terminal_states)
-        self.assertNotIn(Scenario.Driver.success, Scenario.Driver.terminal_states)
+        self.assertEqual(Scenario.Driver.unexpected.name, 'UNEXPECTED')
+        self.assertEqual(Scenario.Driver.mutated.name, 'MUTATED')
+        # terminated / raised / impasse are until() prediction targets now,
+        # not Driver rest states.
+        self.assertEqual(Scenario.Driver.terminated.name, 'terminated')
+        self.assertEqual(Scenario.Driver.raised.name, 'raised')
+        self.assertEqual(Scenario.Driver.impasse.name, 'impasse')
+        # The divergence states are gone -- folded into `unexpected`, with the
+        # signal(s) that fired carried in motivation.  `terminal_states` is
+        # gone too: termination is ground truth via the Driver's done property.
+        for gone in ('returned', 'overshot', 'persisted', 'nested',
+                     'terminal_states'):
+            self.assertFalse(hasattr(Scenario.Driver, gone),
+                             f"{gone} should be gone")
 
 
 
@@ -11442,25 +11373,6 @@ class TestCoverageMinor(unittest.TestCase):
             self.assertIn(chain, disp1)
             disp1.close()
 
-    def test_threads_to_txs_non_iterable(self):
-        """primitive core threads_to_txs raises TypeError for non-iterable."""
-        s = Scenario()
-        lock = s.Lock()
-        core = s.api(lock)._core
-        with s:
-            with self.assertRaisesRegex(TypeError, "iterable of threads"):
-                core.threads_to_txs(42, 'test_threads_to_txs_non_iterable')
-
-    def test_threads_to_txs_empty(self):
-        """primitive core threads_to_txs returns empty for empty iterable."""
-        s = Scenario()
-        lock = s.Lock()
-        core = s.api(lock)._core
-        with s:
-            threads, txs = core.threads_to_txs((), 'test_threads_to_txs_empty')
-            self.assertEqual(threads, ())
-            self.assertEqual(txs, [])
-
     def test_threads_to_txs_self_thread_raises(self):
         """primitive core threads_to_txs raises ValueError on caller."""
         s = Scenario()
@@ -11478,7 +11390,7 @@ class TestCoverageMinor(unittest.TestCase):
             s.wait(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.pause()
+            d.paused()
             d.finish()
             d()
             self.assertIs(d.state, d.success)
@@ -11518,7 +11430,7 @@ class TestCoverageMinor(unittest.TestCase):
             s.wait(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.pause()
+            d.paused()
             d()
             self.assertIs(d.tx.state, State.PAUSED)
             d.close()
@@ -11542,7 +11454,7 @@ class TestCoverageMinor(unittest.TestCase):
             s.wait(w)
             d = s.Driver(w)
             d.scan(); d()
-            d.stall()
+            d.stalled()
             d()
             self.assertIs(d.tx.state, State.STALLED)
             d.close()
@@ -11600,7 +11512,7 @@ class TestCoverageMinor(unittest.TestCase):
             tx = s.transaction(t)
             d = s.Driver(t)
             d.scan(); d()
-            d.pause()
+            d.paused()
             d()
             # Tx is now at PAUSED; unblock should refuse.
             with self.assertRaisesRegex(RuntimeError, "can't unblock"):
@@ -12324,14 +12236,24 @@ class TestDriverNested(unittest.TestCase):
             parent = s.transaction(t)
             d = s.Driver(t)
             d.scan(); d()
+            self.assertIs(d.tx, parent)
             d.finish(); d()
-            self.assertIs(d.state, d.nested)
+            # finish predicts the tx exits; it's instead blocked on a child,
+            # so it rests `unexpected` with the Nested edge in motivation and
+            # leaves the tx as the parent (it doesn't select the child).
+            self.assertIs(d.state, d.unexpected)
+            self.assertTrue(any(isinstance(m, Nested) for m in d.motivation))
+            self.assertIs(d.tx, parent)
+            # descend explicitly: push makes the parent the scope floor,
+            # scan finds the inner cond.wait child.
+            d.push()
+            d.scan(); d()
+            self.assertIs(d.state, d.success)
             self.assertEqual(d.tx.method, condition.wait)
             self.assertIs(d.tx.parent, parent)
             s._core.driver_finish_deep(d)
-            d.scan(); d()
-            self.assertIs(d.state, d.success)
-            d.finish(); d()
+            d.pop()
+            s.skip(t, lock.release)
 
     def test_scan_watch_target_surfaces_child_under_parent(self):
         s = Scenario()
@@ -12375,8 +12297,10 @@ class TestDriverNested(unittest.TestCase):
             s.wait(t)
             base = s.transaction(t)
             d = s.Driver(t, base)
-            with self.assertRaisesRegex(RuntimeError, "blanket-parked"):
-                d.scan()
+            # scan below a blanket-parked floor isn't an error -- it's a valid
+            # observation (the floor parked), reported as unexpected.
+            d.scan(); d()
+            self.assertIs(d.state, d.unexpected)
             d.close()
 
             d2 = s.Driver(t)

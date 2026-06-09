@@ -25,13 +25,13 @@ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 
-from collections import defaultdict, deque, Counter
+from collections import defaultdict, deque
 import inspect
 import math
 import queue
 import threading
 import time
-from types import MethodType, SimpleNamespace
+from types import MethodType
 import weakref
 
 from big.boundinnerclass import BoundInnerClass
@@ -163,23 +163,24 @@ class TimeoutState(ImmutableSequence):
 class DriverStatus(ImmutableSequence):
     """Tuple subclass describing one completed Driver directive outcome.
 
-    Fields are (directive, directive_args, state, tx, waited, signaled,
+    Fields are (directive, args, state, tx, waited, signaled,
     motivation).  The three signal collections are frozensets and should
     always satisfy motivation <= signaled <= waited.
     """
     __slots__ = ()
 
-    def __new__(cls, directive, directive_args, state, tx, waited, signaled, motivation):
+    def __new__(cls, directive, args, state, tx, waited, signaled, motivation):
+        args = tuple(args)
         waited = frozenset(waited)
         signaled = frozenset(signaled)
         motivation = frozenset(motivation)
         if not motivation <= signaled <= waited:
             raise ValueError("DriverStatus signal sets must satisfy motivation <= signaled <= waited")
-        return tuple.__new__(cls, (directive, tuple(directive_args), state, tx, waited, signaled, motivation))
+        return tuple.__new__(cls, (directive, args, state, tx, waited, signaled, motivation))
 
     def __repr__(self):
         return (f"DriverStatus(directive={self.directive!r}, "
-                f"directive_args={self.directive_args!r}, "
+                f"args={self.args!r}, "
                 f"state={self.state!r}, tx={self.tx!r}, "
                 f"waited={self.waited!r}, signaled={self.signaled!r}, "
                 f"motivation={self.motivation!r})")
@@ -189,7 +190,7 @@ class DriverStatus(ImmutableSequence):
         return self[0]
 
     @property
-    def directive_args(self):
+    def args(self):
         return self[1]
 
     @property
@@ -295,8 +296,48 @@ class Signaling:
         return self
 
 
+class ThreadScopedSignal(Signaling, ImmutableThreadSignalToken):
+    __slots__ = ()
+
+    @classmethod
+    def _parse_thread_scope(cls, scope):
+        """Parse a signal thread scope.
+
+        Public signal APIs accept either a bare thread, or a strict two-tuple
+        ``(thread, base_tx)``.  The tuple form scopes the signal to descendant
+        transactions underneath ``base_tx``.
+        """
+        caller = cls.__name__
+
+        if isinstance(scope, threading.Thread):
+            return (scope, None)
+
+        if type(scope) is not tuple:
+            raise TypeError(f"{caller} expected a thread or (thread, base_tx), got {scope!r}")
+        if len(scope) != 2:
+            raise TypeError(
+                f"{caller} thread/base spec must be a 2-tuple "
+                f"(thread, base_tx), got {scope!r}")
+
+        thread, base_tx = scope
+        if not isinstance(thread, threading.Thread):
+            raise TypeError(
+                f"{caller} first item in thread/base spec must be a thread, "
+                f"got {thread!r}")
+        if not isinstance(base_tx, Scenario._ScenarioCore.TransactionAPI):
+            raise TypeError(
+                f"{caller} second item in thread/base spec must be a transaction, "
+                f"got {base_tx!r}")
+        base_core = base_tx._core
+        if base_core.thread is not thread:
+            raise ValueError(
+                f"{caller} base tx belongs to thread "
+                f"{base_core.thread.name!r}, not {thread.name!r}")
+        return scope
+
+
 @export
-class Use(Signaling, ImmutableThreadSignalToken):
+class Use(ThreadScopedSignal):
     """A level signal that goes high whenever a thread uses a primitive.
 
     A Use signals while its thread has any transaction on ``primitive``
@@ -309,7 +350,7 @@ class Use(Signaling, ImmutableThreadSignalToken):
     __slots__ = ()
 
     def __new__(cls, thread_or_tuple, primitive):
-        thread, base_tx = _parse_thread_scope(thread_or_tuple, "Use")
+        thread, base_tx = cls._parse_thread_scope(thread_or_tuple)
         if not isinstance(primitive, Scenario.Primitive):
             raise TypeError(
                 f"Use expected a primitive, got {primitive!r}")
@@ -330,8 +371,8 @@ class Use(Signaling, ImmutableThreadSignalToken):
             return self.thread
         return (self.thread, base_tx)
 
-    def matching_tx(self, scenario):
-        """Return a transaction selected by this Use, or None.
+    def sample(self, scenario):
+        """Return True if this Use selects a transaction.
 
         For an unscoped Use, this is the innermost active transaction
         using the primitive.  For a scoped Use, only descendants of the
@@ -343,19 +384,16 @@ class Use(Signaling, ImmutableThreadSignalToken):
         if base_tx is None:
             while tx is not None:
                 if outer in tx.use_primitives:
-                    return tx
+                    return True
                 tx = tx.parent
-            return None
+            return False
 
         base_core = base_tx._core
         while tx is not None and tx is not base_core:
             if outer in tx.use_primitives:
                 return tx
             tx = tx.parent
-        return None
-
-    def sample(self, scenario):
-        return self.matching_tx(scenario) is not None
+        return False
 
     def __repr__(self):
         base_tx = self.base_tx
@@ -373,42 +411,8 @@ class Use(Signaling, ImmutableThreadSignalToken):
         return Use(self.thread_scope, cooked)
 
 
-def _parse_thread_scope(scope, caller):
-    """Parse a signal thread scope.
-
-    Public signal APIs accept either a bare thread, or a strict two-tuple
-    ``(thread, base_tx)``.  The tuple form scopes the signal to descendant
-    transactions underneath ``base_tx``.
-    """
-    if isinstance(scope, threading.Thread):
-        return (scope, None)
-
-    if type(scope) is not tuple:
-        raise TypeError(f"{caller} expected a thread or (thread, base_tx), got {scope!r}")
-    if len(scope) != 2:
-        raise TypeError(
-            f"{caller} thread/base spec must be a 2-tuple "
-            f"(thread, base_tx), got {scope!r}")
-
-    thread, base_tx = scope
-    if not isinstance(thread, threading.Thread):
-        raise TypeError(
-            f"{caller} first item in thread/base spec must be a thread, "
-            f"got {thread!r}")
-    if not isinstance(base_tx, Scenario._ScenarioCore.TransactionAPI):
-        raise TypeError(
-            f"{caller} second item in thread/base spec must be a transaction, "
-            f"got {base_tx!r}")
-    base_core = base_tx._core
-    if base_core.thread is not thread:
-        raise ValueError(
-            f"{caller} base tx belongs to thread "
-            f"{base_core.thread.name!r}, not {thread.name!r}")
-    return scope
-
-
 @export
-class Call(Signaling, ImmutableThreadSignalToken):
+class Call(ThreadScopedSignal):
     """A level signal that goes high whenever a thread is calling a method.
 
     A Call signals while its thread is calling ``method``, optionally only
@@ -419,7 +423,7 @@ class Call(Signaling, ImmutableThreadSignalToken):
     __slots__ = ()
 
     def __new__(cls, thread_or_tuple, method, state=None):
-        thread, base_tx = _parse_thread_scope(thread_or_tuple, "Call")
+        thread, base_tx = cls._parse_thread_scope(thread_or_tuple)
         if not callable(method):
             raise TypeError(f"Call expected a callable method, got {method!r}")
         primitive = getattr(method, '__self__', None)
@@ -465,8 +469,8 @@ class Call(Signaling, ImmutableThreadSignalToken):
             cur = cur.parent
         return False
 
-    def matching_tx(self, scenario):
-        """Return the transaction this Call currently selects, or None.
+    def sample(self, scenario):
+        """Return True if this Call currently selects a transaction.
 
         For an unscoped Call, this is the innermost active matching
         transaction.  For a scoped Call, same-method descendants shadow
@@ -479,14 +483,11 @@ class Call(Signaling, ImmutableThreadSignalToken):
             if method in tx.call_methods():
                 if base_core is None or self._scoped_tx_selected(tx, base_core, method):
                     if state is None or tx.state == state:
-                        return tx
+                        return True
                     if base_core is not None:
-                        return None
+                        return False
             tx = tx.parent
-        return None
-
-    def sample(self, scenario):
-        return self.matching_tx(scenario) is not None
+        return False
 
     def __repr__(self):
         method_name = getattr(self.method, '__name__', repr(self.method))
@@ -887,7 +888,8 @@ class Scenario:
     def __init__(self):
         self._core = self._ScenarioCore()
         self._context_manager = None
-        self._impersonators = {}
+        self._threading = self.ModuleImpersonator(threading)
+        self._queue = self.ModuleImpersonator(queue)
 
     def __repr__(self):
         return repr(self._core).replace("_ScenarioCore", "Scenario")
@@ -901,32 +903,14 @@ class Scenario:
         self._core.name = value
 
     @property
-    def threading(self):
-        """A drop-in for the threading module, bound to this scenario:
-        its Lock / RLock / Condition / Semaphore / BoundedSemaphore /
-        Event / Barrier are this scenario's primitives, and
-        every other attribute falls through to the real threading
-        module.  This is the handle inject installs for `import
-        threading` references."""
-        return self._impersonator(threading)
+    def queue(self):
+        "A mock threading module providing classes bound to this scenario."
+        return self._queue
 
     @property
-    def queue(self):
-        """A drop-in for the queue module, bound to this scenario:
-        queue classes available in this Python version are replaced
-        with this scenario's primitives, and every other
-        attribute falls through to the real queue module.  This is the
-        handle inject installs for `import queue` references."""
-        return self._impersonator(queue)
-
-    def _impersonator(self, module):
-        """Return this scenario's cached ModuleImpersonator for module,
-        creating it on first use."""
-        imp = self._impersonators.get(module)
-        if imp is None:
-            imp = self.ModuleImpersonator(module)
-            self._impersonators[module] = imp
-        return imp
+    def threading(self):
+        "A mock threading module providing synchronization primitives bound to this scenario."
+        return self._threading
 
     def reset(self):
         """Clear the completed-transaction log.
@@ -1206,28 +1190,10 @@ class Scenario:
             self.transaction_apis = transaction_apis = {}
             self.transaction_apis_proxy = self.LockedDictProxy(transaction_apis)
             self.raws_proxy = self.CoreAttrMapProxy('raw')
+            # The entire wait system's state: a normalized signal -> the set
+            # of WaitTransactions parked on it.  No secondary indexes, no
+            # caches; wake() re-samples these signals live to find wakeups.
             self.waiters = defaultdict(set)
-            # Scoped Call wakeups only pay for base transactions someone
-            # is actually sleeping on: (thread, cooked_method) ->
-            # Counter({base_tx_core: parked-waiter-count}).
-            self.scoped_call_bases = defaultdict(Counter)
-            # Scoped Use wakeups mirror scoped Call wakeups: only base
-            # transactions someone is actually sleeping on are tested.
-            # (thread, cooked_primitive) -> Counter({base_tx_core: count}).
-            self.scoped_use_bases = defaultdict(Counter)
-            # Parked Not(Call(...)) and Not(Use(...)) keys need low-edge
-            # wakeups when the selected item goes away or changes state.
-            # Refcounted for multiple simultaneous waiters on the same
-            # normalized key.
-            self.sleeping_not_calls = Counter()
-            self.sleeping_not_uses = Counter()
-            self.sleeping_not_nested = Counter()
-            self.sleeping_not_transaction_states = Counter()
-            # Aggregate usage refcount: cooked primitive / cooked bound
-            # method -> number of threads currently using it.  Drives
-            # _Primitive(p) / BoundMethod(m) (and their Nots) wakeups
-            # without an O(threads) poll at tx close.  See incref_usage.
-            self.usage_counter = Counter()
 
         @property
         def name(self):
@@ -1258,10 +1224,10 @@ class Scenario:
             during this wait, and a one-shot blocker callable.
 
             The blocker is the wait()-side blocker.release method,
-            captured at install time.  The first signaler to find this
-            wtx in score.waiters[item] calls the blocker (waking the
-            waiter) and clears it; subsequent signalers see None and
-            only append to wtx.signaled.
+            captured at install time.  wake() samples each parked signal
+            at the instant of a change and, for the high ones, appends
+            the signal to wtx.signaled and calls the blocker (waking the
+            waiter), clearing it so later signalers only append.
 
             Hash and equality are by object identity (default).  Each
             wait() call constructs a fresh wtx; no two wtxs ever need
@@ -1331,10 +1297,8 @@ class Scenario:
                 self.blocker = blocker.release
 
                 waiters = score.waiters
-                undo = []
                 for key in keys:
                     waiters[key].add(self)
-                    score.register_wait_interest(key, undo)
 
                 try:
                     with unlock(score.lock):
@@ -1347,7 +1311,6 @@ class Scenario:
                             bucket.discard(self)
                             if not bucket:
                                 waiters.pop(key, None)
-                    score.unregister_wait_interests(undo)
 
             def wait(self, timeout=None, *, all=False):
                 assert not self.signaled
@@ -1444,7 +1407,7 @@ class Scenario:
                 # Thread cleanup.
                 del self.monitors[thread]
                 self.managed.pop(thread, None)
-                self.signal(Terminated(thread))
+                self.wake()
                 # Not(Terminated(t)) goes low automatically because
                 # Terminated(t).sample(...) is now true; no wakeup is
                 # needed for a high->low transition.
@@ -1471,38 +1434,57 @@ class Scenario:
             undirected = State(11, 'UNDIRECTED')
             driving    = State(12, 'DRIVING')
             success    = State(13, 'SUCCESS')
-            returned   = State(14, 'RETURNED')
-            overshot   = State(15, 'OVERSHOT')
-            persisted  = State(16, 'PERSISTED')
-            mutated    = State(17, 'MUTATED')
-            raised     = State(18, 'RAISED')
-            terminated = State(19, 'TERMINATED')
-            nested     = State(20, 'NESTED')
-            impasse    = State(21, 'IMPASSE')
+            unexpected = State(14, 'UNEXPECTED')
+            mutated    = State(15, 'MUTATED')
+            detained   = State(16, 'DETAINED')
 
-            terminal_states = frozenset((raised, terminated))
-            dead_states = frozenset((raised, terminated))
-            driving_states = frozenset((driving,))
+            # `detained`: a driving directive reached PAUSED but can't move the
+            # tx past it -- the tx is held by a pause this Driver doesn't own
+            # (the user's sticky `pause` bit, or a pause blanket itself set).
+            # The model is intact (the tx is exactly where the Driver thinks);
+            # it just can't proceed until whoever set the hold clears it.  Unlike
+            # `unexpected`, there's no signal that means "stuck", so it's its own
+            # rest state rather than a motivation entry; unlike `mutated`, the
+            # Driver's model is not a lie.
+
+            # Every directive is a prediction about what the worker does next:
+            # finish() predicts the tx exits, a park predicts it reaches the
+            # target state, scan() predicts a fresh child tx appears, reenter()
+            # predicts the tx enters a callback.  When the prediction holds the
+            # Driver rests at `success`.  When the worker does something else --
+            # a surfaced child, an early exit, an overshoot, a raise, the thread
+            # dying, the scope floor blocking -- it rests at `unexpected`, with
+            # the signal(s) that actually fired carried in `motivation` for the
+            # route to read and decide what to do.
+            #
+            # blanket makes a test deterministic, so a misprediction is not an
+            # outcome to taxonomize -- it means the scheduler told the worker it
+            # would zig and it zagged.  An `unexpected` the scheduler doesn't
+            # handle is a bug in the scheduler (or the program isn't blanketed
+            # hard enough), not a state blanket needs its own vocabulary for.
+            #
+            # `mutated` is the one outcome that is not a misprediction: the tx
+            # moved out of a state blanket controls without this Driver letting
+            # it, so the Driver's model is a lie and must be rebuilt (scan()).
+
+            # until() prediction targets: how the caller predicts the worker
+            # ends.  These are arguments to until(), not Driver rest states --
+            # a prediction that holds rests at `success`, one that doesn't at
+            # `unexpected`.
+            class Ending:
+                def __init__(self, name):
+                    self.name = name
+                def __repr__(self):
+                    return f"<until {self.name}>"
+            terminated = Ending('terminated')
+            raised     = Ending('raised')
+            impasse    = Ending('impasse')
 
             blanket_controlled_states = frozenset(
                 (State.BLOCKED, State.STALLED, State.PAUSED))
             externally_controlled_states = frozenset(
                 (State.COMMIT, State.WAITING))
-            parkable_states = frozenset(
-                (State.BLOCKED, State.COMMIT, State.WAITING,
-                 State.STALLED, State.PAUSED))
-            driver_release_states = frozenset(
-                (State.BLOCKED, State.STALLED, State.PAUSED))
-            base_impasse_states = blanket_controlled_states
-            processor_rows = (
-                'callback',
-                'primary',
-                'tx-exit',
-                'persisted',
-                'terminated',
-                'impasse',
-                'park-release',
-            )
+            parkable_states = blanket_controlled_states | externally_controlled_states
             _continue_until_terminated_watch = object()
 
             def __init__(self, score, thread, tx=None):
@@ -1530,7 +1512,6 @@ class Scenario:
 
                 self.state = self.undirected
                 self.tx = None
-                self.base = None
                 self.target = None
                 self.signals = frozenset()
                 self.waited = frozenset()
@@ -1541,45 +1522,50 @@ class Scenario:
 
                 # Published description of the most recent directive.
                 self.directive = None
-                self.directive_args = ()
+                self.args = ()
                 # Staged deferred work.  A directive call installs a
                 # closure; driving consumes it.
                 self.closure = None
                 self.closure_is_route = False
 
                 self.current_directive = None
-                self.current_directive_args = ()
+                self.current_args = ()
                 self.current_verb = None
                 self.drive_kind = None
-                self.drive_tx = None
                 self.scan_target = None
                 self.callback_signal = None
+                self.exit_signal = None
 
                 self.wait_keys = frozenset()
                 self.wait_unbox = {}
                 self.wait_description = None
 
-                self.snapshot_terminated = False
-                self.snapshot_tx = None
-                self.snapshot_state = None
+                # Nested-transaction frame stack.  Driving a nested call
+                # (a wait_for predicate's inner cond.wait, a Barrier action)
+                # pushes the current frame and makes the child self.tx; when
+                # the child finishes we pop back to the parent.  tx_state_cache
+                # is the current frame's last-known state -- the drift baseline
+                # the next directive checks for an unexpected move out of a
+                # blanket-controlled state.  scheduler_pause_held / blanket_pause_held
+                # record the pause bits this frame has set on its self.tx (the
+                # scheduler/user bit and blanket's own bit); they ride the stack
+                # so a wait_for's pause, armed before descending into the inner
+                # cond.wait, is restored on the parent when we pop.  tx.scheduler_pause
+                # / tx.blanket_pause are the projection of these; a divergence means
+                # someone drove the tx behind this Driver's back -> mutated.
+                self.stack = []
+                self.tx_state_cache = None
+                self.scheduler_pause_held = False
+                self.blanket_pause_held = False
 
                 self.route_iterator = None
-                self.route_subject = None
-                self.being_driven = False
-                self.iterating_thread = None
-
-                # The one transaction whose blanket_pause bit this Driver owns.
-                self.owned_pause_tx = None
-
-            def owns_pause(self, tx=None):
-                tx = self.tx if tx is None else tx
-                return tx is not None and tx is self.owned_pause_tx
-
-            def set_owns_pause(self, tx, value):
-                if value:
-                    self.owned_pause_tx = tx
-                elif self.owned_pause_tx is tx:
-                    self.owned_pause_tx = None
+                # driving_thread: the thread currently driving this Driver
+                # (None when idle).  iterating: True only while we're literally
+                # inside next(iterator).  check_busy lets the driving thread
+                # re-enter mid-step, but blocks everyone else -- and blocks even
+                # the driving thread outside a step (e.g. a route finalizer).
+                self.driving_thread = None
+                self.iterating = False
 
             def __eq__(self, other):
                 if type(self) is not type(other):
@@ -1602,12 +1588,50 @@ class Scenario:
                 return f"<Driver {self.thread.name!r} {state}{tx}{target} owner={self.owner!r}>"
 
             @property
-            def done(self):
-                return self.state in self.terminal_states
-
-            @property
             def routed(self):
                 return self.route_iterator is not None or self.closure_is_route
+
+            @property
+            def scheduler_pause(self):
+                """The scheduler/user-owned pause bit this Driver holds on its
+                current tx (projected onto tx.scheduler_pause).  Sticky: driving
+                other directives does not release it -- the user clears it."""
+                return self.scheduler_pause_held
+
+            @scheduler_pause.setter
+            def scheduler_pause(self, value):
+                value = bool(value)
+                if value == self.scheduler_pause_held:
+                    return
+                tx = self.tx
+                if tx is None:
+                    raise RuntimeError("can't set pause, no current transaction")
+                tx.set_scheduler_pause(value)
+                self.scheduler_pause_held = value
+
+            @property
+            def blanket_pause(self):
+                """Blanket's own pause bit this Driver holds on its current tx
+                (projected onto tx.blanket_pause).  Transient: a driving
+                directive drops it as it drives the tx forward."""
+                return self.blanket_pause_held
+
+            @blanket_pause.setter
+            def blanket_pause(self, value):
+                value = bool(value)
+                if value == self.blanket_pause_held:
+                    return
+                tx = self.tx
+                if tx is None:
+                    raise RuntimeError("can't set blanket pause, no current transaction")
+                tx.set_blanket_pause(value)
+                self.blanket_pause_held = value
+
+            @property
+            def pausing(self):
+                """True iff this Driver is holding its current tx at PAUSED by
+                either bit."""
+                return self.scheduler_pause_held or self.blanket_pause_held
 
             def register(self, owner):
                 if self.owner is not None:
@@ -1645,36 +1669,78 @@ class Scenario:
                 self.motivation = frozenset()
                 self.release_slot()
 
-            def is_descendant(self, tx, ancestor):
-                cur = tx
-                while cur is not None:
-                    if cur is ancestor:
-                        return True
-                    cur = cur.parent
-                return False
-
             def is_proper_descendant(self, tx, ancestor):
-                return tx is not ancestor and self.is_descendant(tx, ancestor)
-
-            def live_top_tx(self):
-                return self.score.transaction(self.thread)
-
-            def live_scoped_tx(self):
-                tx = self.live_top_tx()
-                base_tx = self.base_tx
-                if tx is None or base_tx is None:
-                    return tx
-                return tx if self.is_proper_descendant(tx, base_tx) else None
+                if tx is ancestor:
+                    return False
+                while True:
+                    if tx is None:
+                        return False
+                    if tx is ancestor:
+                        return True
+                    tx = tx.parent
 
             def live_child_of(self, parent):
-                tx = self.live_top_tx()
+                if parent is None:
+                    return self.scan_for_tx()
+
+                tx = self.score.transaction(self.thread)
                 if tx is None:
                     return None
                 return tx if self.is_proper_descendant(tx, parent) else None
 
-            def select_tx(self, tx):
-                self.tx = tx
-                self.base = tx
+            def scan_for_tx(self):
+                """The live transaction this Driver may select: the thread's
+                current tx, gated to strictly inside Driver scope."""
+                tx = self.score.transaction(self.thread)
+                if tx is None or self.base_tx is None:
+                    return tx
+                return tx if self.is_proper_descendant(tx, self.base_tx) else None
+
+            @property
+            def base_signals(self):
+                """The wait-set that detects activity at the Driver's scope
+                floor: the thread terminating, plus the boundary below which a
+                fresh scoped tx would appear."""
+                return {self.base_thread_signal[Terminated],
+                        self.thread if self.base_tx is None
+                        else Nested(self.base_tx.api)}
+
+            def push(self):
+                """Descend a frame: the current tx becomes the base_tx (the
+                scope floor), so scan() now finds that tx's own children.  A
+                fresh frame starts with nothing selected (self.tx = None).
+                Reuses the base_tx machinery -- all the scoping code already
+                reads the current base_tx, so nothing else has to change."""
+                if self._tx is None:
+                    raise RuntimeError("can't push, no current transaction")
+                self.stack.append(
+                    (self.base_tx, self._tx, self.tx_state_cache,
+                     self.scheduler_pause_held, self.blanket_pause_held))
+                self.base_tx = self._tx
+                self.tx = None      # property setter resets thread_signal
+                self.tx_state_cache = None
+                self.scheduler_pause_held = False
+                self.blanket_pause_held = False
+                # callback_signal is driver-scoped, not frame-scoped: reenter()
+                # sets it, exit() clears it.  It deliberately rides through
+                # push/pop so a pushed scan() can watch the floor's callback for
+                # its exit (Not(Predicate)/Not(Action)).
+
+            def pop(self):
+                """Restore the frame saved by the matching push()."""
+                (self.base_tx, tx, self.tx_state_cache,
+                 self.scheduler_pause_held, self.blanket_pause_held) = self.stack.pop()
+                self._tx = tx
+                self.thread_signal = (self.base_thread_signal if tx is None
+                                      else self.txs_seen[tx])
+
+            @property
+            def tx(self):
+                return self._tx
+
+            @tx.setter
+            def tx(self, tx):
+                self._tx = tx
                 if tx is None:
                     self.thread_signal = self.base_thread_signal
                     return
@@ -1697,17 +1763,46 @@ class Scenario:
                 ts[Action]          = Action(api)
                 self.txs_seen[tx] = ts
 
-            def update_snapshot(self):
-                self.snapshot_terminated = self.base_thread_signal[Terminated].sample(self.score.api)
-                live = self.live_scoped_tx()
-                self.snapshot_tx = live
-                self.snapshot_state = None if live is None else live.state
+            def cache_tx_state(self):
+                """Refresh the drift baseline for the current frame: the
+                last-known state of self.tx, against which the next directive
+                detects an unexpected move out of a blanket-controlled state."""
+                self.tx_state_cache = None if self.tx is None else self.tx.state
 
             def live_base_blocks(self):
                 base_tx = self.base_tx
                 if base_tx is None:
                     return False
                 return base_tx.done or base_tx.state in self.blanket_controlled_states
+
+            def base_block_signal(self):
+                """The signal explaining why the scope floor blocks: its current
+                blanket-controlled state (PAUSED/BLOCKED/STALLED) signal, or the
+                floor tx itself if it has exited.  Routes read it from motivation
+                to tell a parked floor from an exited one."""
+                base_tx = self.base_tx
+                if base_tx is None:
+                    return None
+                state = base_tx.state
+                if state is State.PAUSED:
+                    return Paused(base_tx.api)
+                if state is State.BLOCKED:
+                    return Blocked(base_tx.api)
+                if state is State.STALLED:
+                    return Stalled(base_tx.api)
+                return base_tx.api
+
+            def base_callback_exit_signal(self):
+                """If the scope floor is the tx whose callback this Driver
+                entered (reenter set callback_signal on it), the Not() of that
+                callback -- high once the callback returns.  None otherwise, so
+                an ordinary scan never watches it (Not(Predicate) is trivially
+                high for any tx that was never in a predicate)."""
+                cb = self.callback_signal
+                base_tx = self.base_tx
+                if cb is None or base_tx is None or cb.tx is not base_tx.api:
+                    return None
+                return Not(cb)
 
             def check_base_or_raise(self, verb, *, aiming_at_impasse=False):
                 if self.base_tx is None or aiming_at_impasse:
@@ -1743,15 +1838,18 @@ class Scenario:
                 if not self.score.entered:
                     raise self.error("can't use driver, scenario not entered")
                 current = threading.current_thread()
-                if self.being_driven and current is not self.iterating_thread:
+                if self.driving_thread is not None and not (
+                        self.iterating and current is self.driving_thread):
                     raise self.error(
                         f"can't {verb}, Driver is being driven right now")
 
             def check_directive(self, verb, *, needs_tx=False, target=None,
                                 allow_mutated_scan=False, aiming_at_impasse=False):
                 self.check_busy(verb)
-                if self.state in self.dead_states:
-                    raise self.error(f"can't {verb}, currently in {self.state}")
+                # No terminal-state guard: termination is no longer a rest
+                # state.  A directive on a dead thread drives and resolves
+                # `unexpected` (scan) with Terminated in motivation, which the
+                # route reads -- there's no hang, so nothing to fast-fail here.
                 if self.state is self.mutated and not allow_mutated_scan:
                     raise self.error("can't drive, Driver state is mutated; scan first")
                 self.check_base_or_raise(verb, aiming_at_impasse=aiming_at_impasse)
@@ -1762,12 +1860,11 @@ class Scenario:
                         raise self.error(f"can't {verb}, scan first")
                     # Early mutation detection: a tx left one of the states
                     # blanket controls without this Driver releasing it.
-                    if (self.snapshot_tx is tx
-                            and self.snapshot_state in self.blanket_controlled_states
-                            and tx.state is not self.snapshot_state):
+                    if (self.tx_state_cache in self.blanket_controlled_states
+                            and tx.state is not self.tx_state_cache):
                         raise self.error(
                             f"can't {verb}, Driver model is mutated: tx moved "
-                            f"from {self.snapshot_state.name} to {tx.state.name}")
+                            f"from {self.tx_state_cache.name} to {tx.state.name}")
                     if target is not None and tx.state.index > target.index:
                         raise self.error(
                             f"can't {verb}, tx currently in {tx.state.name}; "
@@ -1777,16 +1874,12 @@ class Scenario:
                 self.closure = closure
                 self.closure_is_route = route
                 self.directive = method
-                self.directive_args = tuple(args)
+                self.args = tuple(args)
                 self.signaled = frozenset()
                 self.motivation = frozenset()
 
             def slot_empty(self):
                 return self.closure is None
-
-            def clear_slot(self):
-                self.closure = None
-                self.closure_is_route = False
 
             def clear_route(self, close=False):
                 iterator = self.route_iterator
@@ -1798,26 +1891,8 @@ class Scenario:
                                 close_method()
                         finally:
                             self.route_iterator = None
-                            self.route_subject = None
                         return
                 self.route_iterator = None
-                self.route_subject = None
-
-            def make_status(self):
-                return DriverStatus(
-                    self.directive,
-                    self.directive_args,
-                    self.state,
-                    self.tx,
-                    self.waited,
-                    self.signaled,
-                    self.motivation)
-
-            def record_status(self):
-                status = self.make_status()
-                self.status = status
-                self.log.append(status)
-                return status
 
             def error(self, message):
                 status = self.status
@@ -1833,13 +1908,23 @@ class Scenario:
                 self.drive_kind = None
                 self.current_verb = None
                 self.current_directive = None
-                self.current_directive_args = ()
-                self.target = None if state is not self.overshot else self.target
+                self.current_args = ()
+                self.target = None
                 self.release_slot()
-                if state not in (self.success, self.mutated):
-                    self.release_blanket_pause()
-                self.update_snapshot()
-                self.record_status()
+                if state not in (self.success, self.mutated, self.detained):
+                    self.blanket_pause = False
+                self.cache_tx_state()
+
+                self.status = status = DriverStatus(
+                    self.directive,
+                    self.args,
+                    self.state,
+                    self.tx,
+                    self.waited,
+                    self.signaled,
+                    self.motivation)
+                self.log.append(status)
+
                 return self.signals
 
             def wait_on(self, signals):
@@ -1858,147 +1943,116 @@ class Scenario:
                 # Some internal paths resolve from a freshly sampled signal
                 # rather than one returned directly from score.wait(); if that
                 # signal explains the transition, treat it as signaled here.
-                motivation = frozenset(motivation)
-                self.motivation = motivation
+                motivation = self.motivation = frozenset(motivation)
                 self.signaled = frozenset(self.signaled) | motivation
                 self.waited = frozenset(self.waited) | self.signaled
                 return self.rest(state)
 
             def prepare_drive_start(self):
                 """Detect post-stage mutation/overshoot/nesting before release."""
-                tx = self.drive_tx
-                target = self.target
+                tx = self.tx
                 if tx is None or tx.done:
                     return True
-                live = self.live_top_tx()
-                if live is not tx and live is not None and self.is_proper_descendant(live, tx):
-                    # A child appeared in the post-stage window.  For scan(tx)
-                    # this is success; for every other tx-driving directive,
-                    # the requested parent boundary is blocked on the child.
-                    self.select_tx(live)
-                    self.resolve(self.nested)
+                target = self.target
+                if self.thread_signal[Nested].sample(self.score.api):
+                    # A child surfaced in the post-stage window: the requested
+                    # boundary is blocked on it.  Report it as unexpected with
+                    # the Nested edge in motivation; the route answers by
+                    # push()ing and scan()ning for the child.
+                    self.resolve(self.unexpected, (self.thread_signal[Nested],))
                     return False
-                if self.snapshot_tx is tx:
-                    old = self.snapshot_state
-                    new = tx.state
-                    if old is not None and new is not old:
-                        if old in self.blanket_controlled_states:
+                old = self.tx_state_cache
+                new = tx.state
+                if old is not None and new is not old:
+                    if old in self.blanket_controlled_states:
+                        self.resolve(self.mutated)
+                        return False
+                    if (target is not None
+                            and old.index <= target.index < new.index):
+                        if target in self.externally_controlled_states:
+                            # Overshot the requested boundary: unexpected, with
+                            # the state it actually reached in motivation.
+                            reached = self.thread_signal.get(new)
+                            self.resolve(self.unexpected,
+                                         (reached,) if reached is not None else ())
+                        else:
                             self.resolve(self.mutated)
-                            return False
-                        if (target is not None
-                                and old.index <= target.index < new.index):
-                            if target in self.externally_controlled_states:
-                                self.resolve(self.overshot)
-                            else:
-                                self.resolve(self.mutated)
-                            return False
-                        self.update_snapshot()
+                        return False
+                    self.cache_tx_state()
                 return True
 
             def maybe_impasse_at_commit(self, *, success_if_impasse=False):
-                if self.base_tx is None:
+                if (self.base_tx is None) or (not self.live_base_blocks()):
                     return False
-                if self.live_base_blocks():
-                    self.rest(self.success if success_if_impasse else self.impasse)
-                    return True
-                return False
-
-            def arm_blanket_pause(self, tx=None):
-                tx = self.tx if tx is None else tx
-                if tx is None or tx.done:
-                    raise RuntimeError("can't set blanket pause, no active transaction")
-                if tx.state > State.PAUSED:
-                    raise RuntimeError("can't set blanket pause, tx already passed PAUSED")
-                if self.owns_pause(tx):
-                    raise RuntimeError("blanket pause already set by this Driver")
-                if tx.blanket_pause:
-                    self.resolve(self.mutated)
-                    return False
-                tx.blanket_pause = True
-                self.set_owns_pause(tx, True)
-                return True
-
-            def handoff_blanket_pause_to_scheduler_pause(self, tx=None):
-                tx = self.tx if tx is None else tx
-                if tx is None:
-                    raise RuntimeError("can't hand off blanket pause, no active transaction")
-                if not self.owns_pause(tx):
-                    if tx.blanket_pause:
-                        self.resolve(self.mutated)
-                        return False
-                    raise RuntimeError("Driver does not own blanket pause for this transaction")
-                if tx.state > State.PAUSED:
-                    raise RuntimeError(
-                        "transaction has already advanced past PAUSED state")
-                if not tx.blanket_pause:
-                    raise RuntimeError("no blanket pause to hand off")
-                tx.scheduler_pause = True
-                tx.blanket_pause = False
-                self.set_owns_pause(tx, False)
-                return True
-
-            def release_blanket_pause(self, tx=None):
-                tx = self.tx if tx is None else tx
-                if tx is None:
-                    return True
-                if self.owns_pause(tx):
-                    tx.release_blanket_pause()
-                    self.set_owns_pause(tx, False)
-                    return True
-                if tx.blanket_pause:
-                    self.resolve(self.mutated)
-                    return False
-                return True
-
-            def auto_release_current_state(self):
-                tx = self.tx
-                state = tx.state
-                if state is State.BLOCKED:
-                    tx.unblock()
-                elif state is State.STALLED:
-                    tx.unstall()
-                elif state is State.PAUSED:
-                    if not self.release_blanket_pause(tx):
-                        return
-                    if tx.scheduler_pause:
-                        self.resolve(self.mutated)
-                        return
-                    if tx.state is State.PAUSED:
-                        tx.unpark(State.EXITING)
+                if success_if_impasse:
+                    self.rest(self.success)
                 else:
-                    raise RuntimeError(f"can't release tx in {state.name}")
+                    # The scope floor is blocked, so there's nothing to drive
+                    # below it: unexpected, with the floor tx and its blocking
+                    # state signal in motivation so the route can tell this from
+                    # a terminated worker and read how the floor blocked.
+                    self.resolve(self.unexpected,
+                                 (self.base_tx, self.base_tx.api,
+                                  self.base_block_signal()))
+                return True
 
-            def make_tx_signals(self, tx):
-                if tx is not self.tx:
-                    self.select_tx(tx)
-                ts = self.thread_signal
-                return ts
+            def release_blanket_pause(self):
+                """Before driving self.tx, drop the blanket pause I hold on it.
+
+                Returns True if there was nothing in the way (I released my own
+                hold, or there was none), or False after resolving `detained`
+                when self.tx carries a blanket pause this frame does not own --
+                blanket is holding it for reasons this Driver can't unstick.
+                Operates on self.tx; the caller must only invoke it while
+                driving a tx.
+                """
+                tx = self.tx
+                if tx is None:
+                    raise RuntimeError(
+                        "can't release blanket pause: the Driver has no current transaction")
+                if self.blanket_pause_held:
+                    self.blanket_pause = False
+                    return True
+                if tx.blanket_pause:
+                    self.resolve(self.detained)
+                    return False
+                return True
 
             def drive_scan(self):
-                self.release_blanket_pause()
+                self.blanket_pause = False
                 self.drive_kind = 'scan'
-                self.drive_tx = None
                 watch = self.scan_target
                 self.target = None
 
                 if self.maybe_impasse_at_commit():
                     return
 
-                if watch is None:
-                    tx = self.live_scoped_tx()
-                else:
-                    tx = self.live_child_of(watch)
+                tx = self.live_child_of(watch)
                 if tx is not None:
-                    if tx.paused and tx.state > State.PAUSED:
-                        self.select_tx(tx)
+                    self.tx = tx
+                    if tx.blanket_pause and not self.blanket_pause_held:
+                        # A blanket pause this Driver didn't set: another driver
+                        # is driving this tx, and stomping its bit would corrupt
+                        # its model.  We can't incorporate the foreign hold.
                         self.resolve(self.mutated)
                         return
-                    self.select_tx(tx)
+                    if tx.pausing and tx.state > State.PAUSED:
+                        self.resolve(self.mutated)
+                        return
                     self.rest(self.success)
                     return
 
                 if self.base_thread_signal[Terminated].sample(self.score.api):
-                    self.rest(self.terminated)
+                    self.resolve(self.unexpected,
+                                 (self.base_thread_signal[Terminated],))
+                    return
+
+                # The scope floor's callback returned without surfacing a child
+                # (Phase A: the predicate ran pure and exited).  Report the exit.
+                cb_exit = self.base_callback_exit_signal()
+                if cb_exit is not None and cb_exit.sample(self.score.api):
+                    self.callback_signal = None
+                    self.resolve(self.unexpected, (cb_exit,))
                     return
 
                 signals = {self.base_thread_signal[Terminated]}
@@ -2011,10 +2065,25 @@ class Scenario:
                 else:
                     signals.add(Nested(watch.api))
                     signals.add(watch.api)
+                # The floor may block (park) instead of surfacing a child, or its
+                # callback may return -- wake on either so scan reports it rather
+                # than hanging.
+                if self.base_tx is not None:
+                    api = self.base_tx.api
+                    signals.add(Paused(api))
+                    signals.add(Blocked(api))
+                    signals.add(Stalled(api))
+                if cb_exit is not None:
+                    signals.add(cb_exit)
                 self.wait_on(signals)
 
             def scan(self, base_tx=None):
-                self.check_directive('scan', allow_mutated_scan=True)
+                # scan observes; a blanket-parked floor isn't a precondition
+                # violation, it's a valid observation (the floor parked instead
+                # of surfacing a child), which drive_scan reports as unexpected.
+                # So skip the base-block guard and let drive_scan resolve it.
+                self.check_directive('scan', allow_mutated_scan=True,
+                                     aiming_at_impasse=True)
                 watch = self.validate_scan_target(base_tx)
 
                 def closure():
@@ -2025,30 +2094,34 @@ class Scenario:
 
             def refresh(self):
                 self.check_busy('refresh')
-                live = self.live_scoped_tx()
-                self.select_tx(live)
-                self.update_snapshot()
+                live = self.scan_for_tx()
+                self.tx = live
+                self.cache_tx_state()
                 self.waited = frozenset()
                 self.signaled = frozenset()
                 self.motivation = frozenset()
                 self.status = None
                 if self.state is self.mutated:
                     self.state = self.success
+                if live is not None and live.blanket_pause and not self.blanket_pause_held:
+                    # A foreign blanket pause: another driver owns this tx.
+                    # refresh re-syncs our model, but it can't absorb a hold it
+                    # doesn't own -- stay mutated.
+                    self.state = self.mutated
 
-            def park(self, verb, target, *, tx_cls=None, setup=None, unblock=True):
+            def park(self, verb, target, *, cls=None, setup=None, unblock=True):
                 self.check_directive(verb, needs_tx=True, target=target)
                 tx = self.tx
-                if tx_cls and not isinstance(tx, tx_cls):
+                if cls and not isinstance(tx, cls):
                     raise RuntimeError(
                         f"can't {verb}, tx doesn't park in {target.name} state, tx={tx!r}")
                 if tx.state not in self.parkable_states:
                     raise RuntimeError(f"can't {verb}, tx currently in {tx.state.name}")
 
                 def closure():
-                    if not self.release_blanket_pause(tx):
+                    if not self.release_blanket_pause():
                         return
                     self.drive_kind = 'park'
-                    self.drive_tx = tx
                     self.target = target
                     if self.maybe_impasse_at_commit():
                         return
@@ -2061,61 +2134,63 @@ class Scenario:
                         return
                     if unblock and tx.state is State.BLOCKED:
                         tx.unblock()
-                    self.configure_park_wait(tx, target)
+                    self.tx = tx
+                    success = (Reached(tx.api, target)
+                               if target in self.externally_controlled_states
+                               else TransactionState(tx.api, target))
+                    signals = {success, self.base_thread_signal[Terminated], tx, tx.api,
+                               Nested(tx.api)}
+                    # State signals needed for transit release and for quick
+                    # detection of raised/terminal before target.
+                    ts = self.thread_signal
+                    signals.update(ts[state] for state in (
+                        State.BLOCKED, State.STALLED, State.PAUSED,
+                        State.COMMITTED, State.EXITING))
+                    self.success_signal = success
+                    self.wait_on(signals)
 
                 self.stage(getattr(self, verb), (), closure)
 
-            def configure_park_wait(self, tx, target):
-                self.select_tx(tx)
-                success = (Reached(tx.api, target)
-                           if target in self.externally_controlled_states
-                           else TransactionState(tx.api, target))
-                signals = {success, self.base_thread_signal[Terminated], tx, tx.api,
-                           Nested(tx.api)}
-                # State signals needed for transit release and for quick
-                # detection of raised/terminal before target.
-                ts = self.thread_signal
-                signals.update(ts[state] for state in (
-                    State.BLOCKED, State.STALLED, State.PAUSED,
-                    State.COMMITTED, State.EXITING))
-                self.success_signal = success
-                self.wait_on(signals)
 
-            def block(self):
-                return self.park('block', State.BLOCKED, unblock=False)
+            def blocked(self):
+                return self.park('blocked', State.BLOCKED, unblock=False)
 
             def commit(self):
                 return self.park('commit', State.COMMIT,
-                                 tx_cls=self.score.Core.TimeoutTransaction)
+                                 cls=self.score.Core.TimeoutTransaction)
 
             def waiting(self):
                 return self.park('waiting', State.WAITING,
-                                 tx_cls=self.score.WaitingTransaction)
+                                 cls=self.score.WaitingTransaction)
 
-            def stall(self):
-                return self.park('stall', State.STALLED,
-                                 tx_cls=self.score.Core.StallingTransaction)
+            def stalled(self):
+                return self.park('stalled', State.STALLED,
+                                 cls=self.score.Core.StallingTransaction)
 
-            def pause(self):
+            def paused(self):
                 def setup():
-                    tx = self.drive_tx
-                    tx.set_scheduler_pause(True)
-                return self.park('pause', State.PAUSED, setup=setup)
+                    # paused() asserts it is the one establishing the hold; a
+                    # scheduler pause already set behind this Driver's back means
+                    # the model diverged -> mutated.
+                    if self.tx.scheduler_pause and not self.scheduler_pause_held:
+                        self.resolve(self.mutated)
+                        return False
+                    self.scheduler_pause = True
+                return self.park('paused', State.PAUSED, setup=setup)
 
-            def pause_internal(self):
+            def blanket_paused(self):
                 def setup():
-                    return self.arm_blanket_pause(self.drive_tx)
-                return self.park('pause_internal', State.PAUSED, setup=setup)
+                    self.blanket_pause = True
+                return self.park('blanket_paused', State.PAUSED, setup=setup)
 
             def finish(self):
                 self.check_directive('finish', needs_tx=True)
                 tx = self.tx
 
                 def closure():
-                    if not self.release_blanket_pause(tx):
+                    if not self.release_blanket_pause():
                         return
                     self.drive_kind = 'finish'
-                    self.drive_tx = tx
                     self.target = None
                     if self.maybe_impasse_at_commit():
                         return
@@ -2126,14 +2201,13 @@ class Scenario:
                 self.stage(self.finish, (), closure)
 
             def configure_finish_wait(self, tx):
-                self.select_tx(tx)
+                self.tx = tx
                 if tx.done:
                     self.finish_tx_done(tx, normal_success=True)
                     return
                 signals = {tx, tx.api, self.base_thread_signal[Terminated], Nested(tx.api)}
                 ts = self.thread_signal
-                signals.update(ts[state] for state in (
-                    State.BLOCKED, State.STALLED, State.PAUSED))
+                signals.update((ts[State.BLOCKED], ts[State.STALLED], ts[State.PAUSED]))
                 self.wait_on(signals)
 
             def until(self, state):
@@ -2151,64 +2225,63 @@ class Scenario:
                 tx = self.tx
 
                 def closure():
-                    if not self.release_blanket_pause(tx):
+                    nonlocal tx
+                    # until(terminated) and until(impasse) drive the thread, not
+                    # a transaction (tx is None); only drop a pause when there's
+                    # a tx to drive (until(raised)).
+                    if tx is not None and not self.release_blanket_pause():
                         return
                     self.drive_kind = 'until'
-                    self.drive_tx = tx
                     self.target = target
                     if target is self.impasse:
                         if self.maybe_impasse_at_commit(success_if_impasse=True):
                             return
-                        self.configure_until_impasse_wait()
+
+                        tx = self.scan_for_tx()
+                        if tx is not None:
+                            self.tx = tx
+                            self.drive_kind = 'until-impasse'
+                            signals = {self.base_tx.api, self.base_thread_signal[Terminated], Nested(tx.api), tx, tx.api}
+                            ts = self.thread_signal
+                            signals.update(ts[state] for state in (State.BLOCKED, State.STALLED, State.PAUSED))
+                            self.wait_on(signals)
+                            return
+                        signals = {self.base_thread_signal[Terminated], self.base_tx.api, Nested(self.base_tx.api)}
+                        self.wait_on(signals)
                         return
                     if self.maybe_impasse_at_commit():
                         return
                     if target is self.terminated:
                         self.configure_until_terminated_wait(tx)
-                    else:
-                        self.configure_until_raised_wait(tx)
+                        return
+
+                    self.tx = tx
+                    if tx.done:
+                        self.finish_tx_done(tx, normal_success=False, raised_success=True)
+                        return
+                    signals = {tx, tx.api, self.base_thread_signal[Terminated], Nested(tx.api)}
+                    ts = self.thread_signal
+                    signals.update(ts[state] for state in (
+                        State.BLOCKED, State.STALLED, State.PAUSED))
+                    self.wait_on(signals)
 
                 self.stage(self.until, (state,), closure)
 
             def configure_until_terminated_wait(self, tx):
                 if tx is not None and not tx.done:
-                    self.select_tx(tx)
+                    self.tx = tx
                     self.drive_kind = 'until-terminated-finish'
                     self.configure_finish_wait(tx)
                     return
                 if self.base_thread_signal[Terminated].sample(self.score.api):
-                    self.rest(self.success)
+                    self.resolve(self.success, (self.base_thread_signal[Terminated],))
                     return
-                if self.live_scoped_tx() is not None:
-                    self.rest(self.persisted)
+                if self.scan_for_tx() is not None:
+                    # until(terminated) predicted the worker would stop
+                    # transacting, but a fresh scoped tx appeared.
+                    self.resolve(self.unexpected, ())
                     return
-                signals = {self.base_thread_signal[Terminated]}
-                signals.add(self.thread if self.base_tx is None else Nested(self.base_tx.api))
-                self.wait_on(signals)
-
-            def configure_until_raised_wait(self, tx):
-                self.select_tx(tx)
-                if tx.done:
-                    self.finish_tx_done(tx, normal_success=False, raised_success=True)
-                    return
-                signals = {tx, tx.api, self.base_thread_signal[Terminated], Nested(tx.api)}
-                ts = self.thread_signal
-                signals.update(ts[state] for state in (
-                    State.BLOCKED, State.STALLED, State.PAUSED))
-                self.wait_on(signals)
-
-            def configure_until_impasse_wait(self):
-                tx = self.live_scoped_tx()
-                if tx is not None:
-                    self.select_tx(tx)
-                    self.drive_kind = 'until-impasse'
-                    signals = {self.base_tx.api, self.base_thread_signal[Terminated], Nested(tx.api), tx, tx.api}
-                    ts = self.thread_signal
-                    signals.update(ts[state] for state in (State.BLOCKED, State.STALLED, State.PAUSED))
-                    self.wait_on(signals)
-                    return
-                signals = {self.base_thread_signal[Terminated], self.base_tx.api, Nested(self.base_tx.api)}
-                self.wait_on(signals)
+                self.wait_on(self.base_signals)
 
             def wait(self, *items):
                 self.check_directive('wait')
@@ -2226,9 +2299,6 @@ class Scenario:
                     self.wait_unbox = wait_unbox
                     self.wait_description = wait_description
                     signals = set(wait_keys)
-                    # Passive wait is bound to this Driver's thread, not
-                    # to the selected transaction.  Terminated(thread) is
-                    # the only intrinsic ender.
                     terminated = self.base_thread_signal[Terminated]
                     signals.add(terminated)
                     self.wait_on(signals)
@@ -2242,13 +2312,12 @@ class Scenario:
 
                 def closure():
                     self.drive_kind = 'reenter'
-                    self.drive_tx = tx
                     self.target = None
                     if self.maybe_impasse_at_commit():
                         return
                     if not self.prepare_drive_start():
                         return
-                    self.select_tx(tx)
+                    self.tx = tx
                     ts = self.thread_signal
                     signals = {self.base_thread_signal[Terminated], tx, tx.api,
                                Nested(tx.api), ts[Predicate], ts[Action]}
@@ -2258,29 +2327,41 @@ class Scenario:
 
                 self.stage(self.reenter, (), closure)
 
-            def resume(self):
-                self.check_directive('resume')
-                signal = self.callback_signal
-                if signal is None:
-                    raise RuntimeError("can't resume, Driver is not in a callback")
-                wtx = self.score.WaitTransaction({Not(signal)})
-                wait_keys = wtx.keys
-                wait_unbox = wtx.unbox
-                wait_description = repr((Not(signal),))
+            def exit(self):
+                """Drive until the callback the scope floor entered returns
+                (Not(Predicate)/Not(Action)).  The mirror of reenter()+push():
+                once those descended into a callback's scope, exit() waits for
+                that callback to return, and the route pop()s back out.
+
+                A floor that already parked (the callback returned and a blanket
+                pause halted the tx at PAUSED) is tolerated: the closure sees the
+                callback has returned and rests success without driving."""
+                self.check_directive('exit', aiming_at_impasse=True)
 
                 def closure():
-                    self.drive_kind = 'resume'
-                    self.wait_keys = wait_keys
-                    self.wait_unbox = wait_unbox
-                    self.wait_description = wait_description
-                    signals = set(wait_keys)
-                    terminated = self.base_thread_signal[Terminated]
-                    signals.add(terminated)
+                    self.drive_kind = 'exit'
+                    self.target = None
+                    base = self.base_tx
+                    if base is None:
+                        raise self.error("can't exit, the scope floor is not in a callback")
+                    # We're leaving the callback either way; a pushed scan() in
+                    # the next phase must not re-watch this exit.
+                    self.callback_signal = None
+                    if base.in_predicate:
+                        callback = Predicate(base.api)
+                    elif base.in_action:
+                        callback = Action(base.api)
+                    else:
+                        # The callback has already returned: exit is satisfied.
+                        self.exit_signal = None
+                        self.rest(self.success)
+                        return
+                    self.exit_signal = Not(callback)
+                    signals = {self.exit_signal, self.base_thread_signal[Terminated],
+                               base.api, Nested(base.api)}
                     self.wait_on(signals)
-                    self.waited = frozenset((Not(signal), terminated))
 
-                self.stage(self.resume, (), closure)
-
+                self.stage(self.exit, (), closure)
 
             def clear_wait(self):
                 self.wait_keys = frozenset()
@@ -2302,7 +2383,6 @@ class Scenario:
 
                 def closure():
                     self.route_iterator = iterator
-                    self.route_subject = subject
                     # Installing a route is not itself a Driver outcome.
                     self.state = previous_state
 
@@ -2314,9 +2394,10 @@ class Scenario:
                     self.state = self.undirected
                     raise self.error(f"{self}: no Driver directive staged")
                 is_route = self.closure_is_route
-                self.clear_slot()
+                self.closure = None
+                self.closure_is_route = False
                 self.current_directive = self.directive
-                self.current_directive_args = self.directive_args
+                self.current_args = self.args
                 self.waited = frozenset()
                 self.signaled = frozenset()
                 self.motivation = frozenset()
@@ -2334,7 +2415,7 @@ class Scenario:
                         raise self.error(f"{self}: no Driver directive staged")
 
                     stopped = False
-                    self.iterating_thread = threading.current_thread()
+                    self.iterating = True
                     try:
                         try:
                             with unlock(self.score.lock):
@@ -2343,10 +2424,10 @@ class Scenario:
                             stopped = True
                         except BaseException:
                             self.clear_route(close=True)
-                            self.rest(self.raised)
+                            self.rest(self.unexpected)
                             raise
                     finally:
-                        self.iterating_thread = None
+                        self.iterating = False
 
                     if self.closure is not None:
                         if stopped:
@@ -2381,72 +2462,44 @@ class Scenario:
                         continue
                     return self.signals
 
-            def processor_mapping(self):
-                """Return the small per-directive map used by signal_processor."""
-                mapping = {
-                    'callback': (),
-                    'primary': (),
-                    'primary_requires_fired': frozenset(),
-                    'tx_exit_default': self.success,
-                    'terminated': self.terminated,
-                    'impasse': False,
-                    'persisted': False,
-                }
-
-                if self.drive_kind == 'park':
-                    mapping['primary'] = (self.success_signal,)
-                    mapping['tx_exit_default'] = self.overshot
-                    return mapping
-
-                if self.drive_kind == 'finish':
-                    mapping['tx_exit_default'] = self.success
-                    return mapping
-
-                if self.drive_kind == 'until-terminated-finish':
-                    mapping['tx_exit_default'] = self._continue_until_terminated_watch
-                    return mapping
-
-                if self.drive_kind == 'until-terminated-watch':
-                    mapping['terminated'] = self.success
-                    mapping['persisted'] = True
-                    return mapping
-
-                if self.drive_kind == 'until':
-                    if self.target is self.raised:
-                        mapping['tx_exit_default'] = self.returned
-                    return mapping
-
-                if self.drive_kind == 'until-impasse':
-                    mapping['impasse'] = True
-                    return mapping
-
-                if self.drive_kind == 'reenter':
-                    ts = self.thread_signal
-                    mapping['callback'] = (ts[Predicate], ts[Action])
-                    mapping['tx_exit_default'] = self.success
-                    if (self.tx is not None
-                            and self.owns_pause(self.tx)):
-                        paused = ts[State.PAUSED]
-                        mapping['primary'] = (paused,)
-                        mapping['primary_requires_fired'] = frozenset((paused,))
-                    return mapping
-
-                if self.drive_kind == 'resume':
-                    mapping['tx_exit_default'] = self.success
-                    return mapping
-
-                return mapping
-
-            def signal_is_high(self, signal, fired, *, requires_fired=False):
-                if requires_fired and signal not in fired:
-                    return False
-                sample = getattr(signal, 'sample', None)
-                if sample is not None:
-                    return sample(self.score.api)
-                return signal in fired
 
             def signal_processor(self, fired):
-                mapping = self.processor_mapping()
+                callback = ()
+                primary = ()
+                primary_requires_fired = frozenset()
+                tx_exit_default = self.success
+                terminated_state = self.unexpected
+                impasse = False
+                persisted = False
+
+                if self.drive_kind == 'park':
+                    primary = (self.success_signal,)
+                    tx_exit_default = self.unexpected
+                elif self.drive_kind == 'finish':
+                    tx_exit_default = self.success
+                elif self.drive_kind == 'until-terminated-finish':
+                    tx_exit_default = self._continue_until_terminated_watch
+                elif self.drive_kind == 'until-terminated-watch':
+                    terminated_state = self.success
+                    persisted = True
+                elif self.drive_kind == 'until':
+                    if self.target is self.raised:
+                        tx_exit_default = self.unexpected
+                elif self.drive_kind == 'until-impasse':
+                    impasse = True
+                elif self.drive_kind == 'reenter':
+                    ts = self.thread_signal
+                    callback = (ts[Predicate], ts[Action])
+                    tx_exit_default = self.success
+                    if self.tx is not None and self.blanket_pause_held:
+                        paused = ts[State.PAUSED]
+                        primary = (paused,)
+                        primary_requires_fired = frozenset((paused,))
+                elif self.drive_kind == 'exit':
+                    # Success when the scope floor's callback has returned
+                    # (Not(Predicate)/Not(Action), sampled).
+                    primary = (self.exit_signal,)
+
                 tx = self.tx
                 ts = self.thread_signal
 
@@ -2455,112 +2508,106 @@ class Scenario:
                 # both enter the predicate and publish the inner wait when
                 # the predicate is false; reenter's target is the callback
                 # edge, not the child.
-                for signal in mapping['callback']:
+                for signal in callback:
                     if signal in fired:
                         self.callback_signal = signal
                         return self.resolve(self.success, (signal,))
 
-                # Wrapper structural check: a surfaced child is not a
-                # rest-state row; selecting it is part of nested handling.
+                # A surfaced child blocks the current tx: report the NESTED
+                # edge and leave self.tx where it is.  The route answers by
+                # push()ing (the current tx becomes the scope floor) and
+                # scan()ning for the child -- the dispatch never selects it.
                 if tx is not None and ts[Nested] in fired:
-                    if self.surface_nested_child():
-                        return self.signals
+                    self.resolve(self.unexpected, (Nested(tx.api),))
+                    return self.signals
 
-                # Row 2: primary success.  For level/latched signals,
-                # trust the signal's live sample() semantics.
-                requires_fired = mapping['primary_requires_fired']
-                for signal in mapping['primary']:
-                    if self.signal_is_high(signal, fired,
-                                           requires_fired=signal in requires_fired):
+                # Row 2: primary success.  Trust the signal's live sample()
+                # semantics (level/latched), but a signal in requires_fired only
+                # counts when its edge actually fired this round.
+                requires_fired = primary_requires_fired
+                for signal in primary:
+                    if signal in requires_fired and signal not in fired:
+                        continue
+                    if signal.sample(self.score.api):
                         return self.resolve(self.success, (signal,))
 
                 # Row 3: tx-exit.  The RAISED override lives here; the
                 # until(terminated) finish phase uses the one continuation.
                 if tx is not None and (tx in fired or tx.api in fired or tx.done):
                     motivation = tuple(fired & {tx, tx.api}) or ((tx.api,) if tx.done else ())
-                    if mapping['tx_exit_default'] is self._continue_until_terminated_watch:
+                    if tx_exit_default is self._continue_until_terminated_watch:
                         if tx.state is State.RAISED:
-                            return self.resolve(self.raised, motivation)
+                            return self.resolve(self.unexpected, motivation)
                         self.drive_kind = 'until-terminated-watch'
                         return self.configure_until_terminated_wait(None)
                     if self.drive_kind == 'finish':
                         return self.finish_tx_done(tx, normal_success=True, motivation=motivation)
                     if self.drive_kind == 'until' and self.target is self.raised:
                         return self.finish_tx_done(tx, normal_success=False, raised_success=True, motivation=motivation)
-                    if tx.state is State.RAISED and mapping['tx_exit_default'] is not self.raised:
-                        return self.resolve(self.raised, motivation)
-                    return self.resolve(mapping['tx_exit_default'], motivation)
+                    if tx.state is State.RAISED:
+                        return self.resolve(self.unexpected, motivation)
+                    return self.resolve(tx_exit_default, motivation)
 
                 # Row 4: a new scoped tx appeared while until(terminated)
-                # predicted the thread would stop transacting.
-                if mapping['persisted']:
-                    live = self.live_scoped_tx()
+                # predicted the thread would stop transacting -- unexpected.
+                if persisted:
+                    live = self.scan_for_tx()
                     if live is not None:
-                        self.select_tx(live)
+                        self.tx = live
                         motivation = tuple(fired & {self.thread})
-                        return self.resolve(self.persisted, motivation)
+                        return self.resolve(self.unexpected, motivation)
 
-                # Row 5: thread termination.
-                terminated = self.base_thread_signal[Terminated]
-                if terminated in fired:
-                    return self.resolve(mapping['terminated'], (terminated,))
+                # Row 5: thread termination -- success only when until(terminated)
+                # predicted it, otherwise unexpected.
+                terminated_signal = self.base_thread_signal[Terminated]
+                if terminated_signal in fired:
+                    return self.resolve(terminated_state, (terminated_signal,))
 
                 # Row 6: scoped impasse.
-                if mapping['impasse'] and self.live_base_blocks():
+                if impasse and self.live_base_blocks():
                     motivation = tuple(fired & {self.base_tx, self.base_tx.api})
                     return self.resolve(self.success, motivation)
 
                 # Wrapper continuation: release an intermediate blanket
                 # park state and keep driving.
+                tx = self.tx
                 for state in (State.PAUSED, State.STALLED, State.BLOCKED):
                     signal = ts[state]
                     if signal in fired:
                         if self.drive_kind == 'park' and self.target is state:
                             return self.resolve(self.success, (signal,))
-                        self.auto_release_current_state()
+
+                        current_state = tx.state
+                        if current_state is State.BLOCKED:
+                            tx.unblock()
+                        elif current_state is State.STALLED:
+                            tx.unstall()
+                        elif current_state is State.PAUSED:
+                            if not self.release_blanket_pause():
+                                return
+                            if tx.scheduler_pause:
+                                # Held by the user's sticky pause bit; we can't
+                                # move past PAUSED until they clear it.
+                                self.resolve(self.detained)
+                                return
+                            if tx.state is State.PAUSED:
+                                tx.unpark(State.EXITING)
                         return self.signals
 
-                if mapping['persisted']:
+                if persisted:
                     return self.configure_until_terminated_wait(None)
 
                 return self.signals
 
             def finish_tx_done(self, tx, *, normal_success, raised_success=False, motivation=()):
                 if tx.state is State.RAISED:
-                    return self.resolve(self.success if raised_success else self.raised, motivation)
+                    return self.resolve(self.success if raised_success else self.unexpected, motivation)
                 if raised_success:
-                    return self.resolve(self.returned, motivation)
-                return self.resolve(self.success if normal_success else self.returned, motivation)
-
-            def surface_nested_child(self):
-                parent = self.tx
-                self.select_tx(self.live_top_tx())
-                if self.tx is parent or self.tx is None:
-                    return False
-                self.resolve(self.nested, (Nested(parent.api),))
-                return True
-
-            def signal_scan(self, fired):
-                watch = self.scan_target
-                if watch is None:
-                    tx = self.live_scoped_tx()
-                else:
-                    tx = self.live_child_of(watch)
-                if tx is not None:
-                    self.select_tx(tx)
-                    motivation = tuple(fired & set(self.waited))
-                    return self.resolve(self.success, motivation)
-                terminated = self.base_thread_signal[Terminated]
-                if terminated in fired:
-                    return self.resolve(self.terminated, (terminated,))
-                if watch is not None and watch.done:
-                    return self.resolve(self.impasse, tuple(fired & {watch, watch.api}))
-                if self.base_tx is not None and self.live_base_blocks():
-                    return self.resolve(self.impasse, tuple(fired & {self.base_tx, self.base_tx.api}))
-                return self.drive_scan()
+                    return self.resolve(self.unexpected, motivation)
+                return self.resolve(self.success if normal_success else self.unexpected, motivation)
 
             def signal_wait(self, fired):
-                # wait()/resume() succeed by value intersection with the
+                # wait() succeeds by value intersection with the
                 # asserted wait keys.  Present wait diagnostics in the
                 # caller's spelling where possible, not the normalized key.
                 unbox = self.wait_unbox
@@ -2573,62 +2620,59 @@ class Scenario:
                                 for key in explicit_keys
                                 for orig in unbox.get(key, {key})}
                     self.motivation = frozenset(explicit)
-                    if self.current_directive != self.resume:
-                        for key in explicit_keys:
-                            if isinstance(key, (Predicate, Action)):
-                                canonical = None
-                                if self.tx is not None:
-                                    canonical = self.thread_signal.get(type(key))
-                                self.callback_signal = canonical if key == canonical else key
-                                break
+                    for key in explicit_keys:
+                        if isinstance(key, (Predicate, Action)):
+                            canonical = None
+                            if self.tx is not None:
+                                canonical = self.thread_signal.get(type(key))
+                            self.callback_signal = canonical if key == canonical else key
+                            break
                     self.clear_wait()
-                    self.callback_signal = None if self.current_directive == self.resume else self.callback_signal
-                    self.update_snapshot()
+                    self.cache_tx_state()
                     return self.rest(self.success)
 
                 terminated = self.base_thread_signal[Terminated]
                 if terminated in fired:
                     self.clear_wait()
-                    return self.resolve(self.terminated, (terminated,))
+                    return self.resolve(self.unexpected, (terminated,))
 
                 raise self.error(f"{self}: unexpected signal while waiting: {fired!r}")
 
-            def signal_reenter(self, fired):
-                return self.signal_processor(fired)
-
-            def signal_until_terminated(self, fired):
-                return self.signal_processor(fired)
-
-            def signal_tx_drive(self, fired):
-                return self.signal_processor(fired)
-
-            def signal_until_impasse(self, fired):
-                return self.signal_processor(fired)
-
             def signal(self, signals):
-                fired = set(signals)
-                self.signaled = frozenset(fired)
+                self.signaled = fired = frozenset(signals)
                 self.motivation = frozenset()
+
                 if self.drive_kind == 'scan':
-                    return self.signal_scan(fired)
-                if self.drive_kind == 'wait' or self.drive_kind == 'resume':
-                    was_resume = self.drive_kind == 'resume'
-                    result = self.signal_wait(fired)
-                    if was_resume and self.state is self.success:
+                    watch = self.scan_target
+                    tx = self.live_child_of(watch)
+                    if tx is not None:
+                        self.tx = tx
+                        motivation = tuple(fired & set(self.waited))
+                        return self.resolve(self.success, motivation)
+                    terminated = self.base_thread_signal[Terminated]
+                    if terminated in fired:
+                        return self.resolve(self.unexpected, (terminated,))
+                    if watch is not None and watch.done:
+                        return self.resolve(self.unexpected, (watch, watch.api))
+                    if self.base_tx is not None and self.live_base_blocks():
+                        return self.resolve(self.unexpected,
+                                            (self.base_tx, self.base_tx.api,
+                                             self.base_block_signal()))
+                    cb_exit = self.base_callback_exit_signal()
+                    if cb_exit is not None and cb_exit.sample(self.score.api):
                         self.callback_signal = None
-                    return result
-                if self.drive_kind == 'reenter':
-                    return self.signal_reenter(fired)
-                if self.drive_kind == 'until-terminated-watch':
-                    return self.signal_until_terminated(fired)
-                if self.drive_kind == 'until-impasse':
-                    return self.signal_until_impasse(fired)
-                return self.signal_tx_drive(fired)
+                        return self.resolve(self.unexpected, (cb_exit,))
+                    return self.drive_scan()
+
+                if self.drive_kind == 'wait':
+                    return self.signal_wait(fired)
+
+                return self.signal_processor(fired)
 
             def __call__(self):
-                if self.being_driven:
+                if self.driving_thread is not None:
                     raise self.error(f"{self}: Driver is already being driven")
-                self.being_driven = True
+                self.driving_thread = threading.current_thread()
                 try:
                     while True:
                         signals = self.proceed()
@@ -2639,8 +2683,8 @@ class Scenario:
                         if not self.signals and self.route_iterator is None:
                             return
                 finally:
-                    self.being_driven = False
-                    self.iterating_thread = None
+                    self.driving_thread = None
+                    self.iterating = False
 
 
 
@@ -2847,7 +2891,7 @@ class Scenario:
                 # promotion -- happen when __next__ drains recent
                 # at the top of each iteration.  This keeps
                 # add+remove observationally side-effect-free on
-                # the items themselves: a driver.pause() followed
+                # the items themselves: a driver.paused() followed
                 # by dispatch.add(driver); dispatch.remove(driver)
                 # never fires the staged tx.unblock.
                 self.recent = deque()
@@ -2856,13 +2900,13 @@ class Scenario:
 
             def mark_busy(self, driver):
                 if self.driving:
-                    driver.being_driven = True
+                    driver.driving_thread = threading.current_thread()
                     self.busy_drivers.add(driver)
 
             def clear_busy(self):
                 for driver in self.busy_drivers:
-                    driver.being_driven = False
-                    driver.iterating_thread = None
+                    driver.driving_thread = None
+                    driver.iterating = False
                 self.busy_drivers.clear()
                 self.driving = False
 
@@ -3218,135 +3262,6 @@ class Scenario:
                 pairs.append(list(spec))
             return [tuple(pair) for pair in pairs]
 
-        def drive_queue_deliver(self, core, pairs):
-            """Drive queue get/put traffic for QueueAPI.deliver.
-
-            All participants are strict thread specs.  Each active
-            participant's next transaction must be one of the queue's
-            get / put / get_nowait / put_nowait calls, and it must still
-            be at BLOCKED when deliver first sees it.
-
-            deliver may surface many participants, but it runs only one
-            queue transaction on this queue at a time.  The rest remain
-            parked at BLOCKED.  Whenever possible it chooses a pending
-            transaction that can complete with the queue's current size.
-            If none can be proven runnable, it drives the oldest pending
-            transaction; if that call blocks forever, deliver blocks
-            forever too.
-            """
-            if not pairs:
-                raise ValueError("deliver requires at least one thread")
-
-            class Entry:
-                def __init__(self, index, thread, base_tx):
-                    self.index = index
-                    self.thread = thread
-                    self.base_tx = base_tx
-                    self.driver = None
-                    self.tx = None
-                    self.role = None
-
-            entries = [Entry(i, thread, base_tx)
-                       for i, (thread, base_tx) in enumerate(pairs)]
-            by_thread = defaultdict(deque)
-            thread_order = []
-            for entry in entries:
-                if entry.thread not in by_thread:
-                    thread_order.append(entry.thread)
-                by_thread[entry.thread].append(entry)
-
-            active = {}
-            pending = []
-            drivers = []
-            results = [None] * len(entries)
-
-            def start(entry):
-                d = self.Driver(entry.thread, entry.base_tx)
-                entry.driver = d
-                drivers.append(d)
-                d.scan(); d()
-                if d.state is d.impasse:
-                    raise RuntimeError(
-                        f"deliver: thread {entry.thread.name!r} base tx is "
-                        f"blanket-parked, can't reach its queue call")
-                if d.state is d.terminated:
-                    if entry.base_tx is not None:
-                        raise RuntimeError(
-                            f"deliver: thread {entry.thread.name!r} base tx ended "
-                            f"before pushing a queue call")
-                    raise RuntimeError(
-                        f"deliver: thread {entry.thread.name!r} terminated "
-                        f"before pushing a queue call")
-                if d.state is not d.success or d.tx is None or d.tx.done:
-                    raise RuntimeError(
-                        f"deliver: thread {entry.thread.name!r} stopped in "
-                        f"unexpected Driver state {d.state.name}")
-
-                tx = d.tx
-                role = core.deliver_role(tx)
-                if role is None:
-                    raise ValueError(
-                        f"deliver: thread {entry.thread.name!r} should be "
-                        f"calling get, put, get_nowait, or put_nowait on "
-                        f"this queue, but is calling {tx.method}")
-                if tx.state is not State.BLOCKED:
-                    raise RuntimeError(
-                        f"deliver: thread {entry.thread.name!r} {role} tx "
-                        f"must be at BLOCKED, got {tx.state.name}")
-                entry.tx = tx
-                entry.role = role
-                active[entry.thread] = entry
-                pending.append(entry)
-
-            try:
-                for thread in thread_order:
-                    start(by_thread[thread][0])
-
-                size = core.deliver_size()
-                remaining = len(entries)
-                while remaining:
-                    for i, entry in enumerate(pending):
-                        if core.deliver_can_run(entry.role, size):
-                            pending.pop(i)
-                            break
-                    else:
-                        # No pending queue operation can be proven to
-                        # complete immediately.  Drive the oldest one
-                        # anyway; for a blocking get/put this may block
-                        # forever, which mirrors the user's deadlocked
-                        # traffic script.  For a nowait call it will
-                        # usually raise the stdlib queue exception.
-                        entry = pending.pop(0)
-
-                    d = entry.driver
-                    self.driver_finish_deep(d)
-                    tx = entry.tx
-                    if tx.state is State.RAISED:
-                        raise tx.result
-                    if not tx.done or d.state is not d.success:
-                        raise RuntimeError(
-                            f"deliver: thread {entry.thread.name!r} stopped "
-                            f"in unexpected Driver state {d.state.name}")
-                    results[entry.index] = tx
-                    size = core.deliver_adjust_size(entry.role, size)
-                    remaining -= 1
-
-                    active.pop(entry.thread)
-                    thread_entries = by_thread[entry.thread]
-                    assert thread_entries[0] is entry
-                    thread_entries.popleft()
-                    if thread_entries:
-                        start(thread_entries[0])
-
-                return tuple(tx.api for tx in results)
-            finally:
-                for d in drivers:
-                    if not d.done:
-                        d.close()
-
-
-
-
         def run_driver_route(self, d, route):
             """Run a Driver route to completion."""
             d.route(route)
@@ -3376,39 +3291,49 @@ class Scenario:
 
 
         def route_finish_deep(self, d):
-            root = d.tx
-            while root is not None and not root.done:
-                if d.tx is None or d.tx.done:
+            # Drive d.tx to terminal.  finish() predicts the tx exits; when it
+            # instead blocks on a surfaced child it rests `unexpected` with the
+            # Nested edge in motivation.  We answer by push()ing (the tx becomes
+            # the scope floor), scan()ning for the child, driving that subtree,
+            # then pop()ing back to finish the parent.
+            while not d.tx.done:
+                d.finish()
+                yield
+                if d.state is d.unexpected and any(
+                        isinstance(m, Nested) for m in d.motivation):
+                    d.push()
                     d.scan()
                     yield
                     if d.state is not d.success:
                         return
-                d.finish()
-                yield
-                if d.state is getattr(d, "nested", None):
+                    yield from self.route_finish_deep(d)
+                    done = d.tx.done
+                    d.pop()
+                    if not done:
+                        return
                     continue
                 if d.state is not d.success:
                     return
-                # If a child just finished, the next scan reselects the
-                # parent.  If finish surfaced a child, tranche 3 reports
-                # NESTED and the loop drives that child explicitly.
 
         def route_pause_deep(self, d):
             root = d.tx
-            while root is not None:
-                if d.tx is None or d.tx.done:
+            while True:
+                d.paused()
+                yield
+                if d.state is d.unexpected and any(
+                        isinstance(m, Nested) for m in d.motivation):
+                    # A child surfaced under the tx we're pausing; descend
+                    # (push + scan), drive it to terminal, pop back, re-pause.
+                    d.push()
                     d.scan()
                     yield
                     if d.state is not d.success:
                         return
-                if d.tx is not root:
                     yield from self.route_finish_deep(d)
-                    if d.state is not d.success:
+                    done = d.tx.done
+                    d.pop()
+                    if not done:
                         return
-                    continue
-                d.pause()
-                yield
-                if d.state is getattr(d, "nested", None):
                     continue
                 if d.state is not d.success:
                     return
@@ -3422,13 +3347,12 @@ class Scenario:
             cooked = core.normalize(method)
             return tx.normalized_method == cooked
 
-        def named_error_base(self, caller, thread, base_tx, method, state):
-            if state is self.Driver.impasse:  # pragma: no cover - defensive route validation
-                raise RuntimeError(
-                    f"{caller}: thread {thread.name!r} base tx is "
-                    f"blanket-parked, can't reach nested "
-                    f"{method.__name__!r}")
-            if state is self.Driver.terminated:
+        def named_error_base(self, caller, thread, base_tx, method, d):
+            # scan() predicted a fresh tx; an `unexpected` rest means either the
+            # worker terminated (Terminated in motivation) or the scope floor is
+            # blocked (the base tx is in motivation).  Raise the specific
+            # message for each; leave anything else to the caller.
+            if Terminated(d.thread) in d.motivation:
                 if base_tx is not None:  # pragma: no cover - defensive route validation
                     raise RuntimeError(
                         f"{caller}: thread {thread.name!r} base tx ended "
@@ -3436,109 +3360,181 @@ class Scenario:
                 raise RuntimeError(
                     f"{caller}: thread {thread.name!r} terminated before "
                     f"reaching {method.__name__!r}")
-
-        def route_drive_named(self, task, d):
-            thread = task.thread
-            base_tx = task.base_tx
-            methods = task.methods
-            caller = task.caller
-            while task.index < len(methods):
-                method = methods[task.index]
-                try:
-                    d.scan()
-                except RuntimeError:  # pragma: no cover - defensive route validation
-                    if base_tx is not None:
-                        if base_tx.done:
-                            raise RuntimeError(
-                                f"{caller}: thread {thread.name!r} base tx ended "
-                                f"before reaching nested {method.__name__!r}") from None
-                        if base_tx.state in self.Driver.blanket_controlled_states:
-                            raise RuntimeError(
-                                f"{caller}: thread {thread.name!r} base tx is "
-                                f"blanket-parked, can't reach nested "
-                                f"{method.__name__!r}") from None
-                    raise
-                yield
-
-                state = d.state
-                self.named_error_base(caller, thread, base_tx, method, state)
-                if state in (d.raised, d.overshot, d.mutated, d.returned):  # pragma: no cover - defensive route validation
+            if base_tx is not None and (
+                    base_tx in d.motivation or base_tx.api in d.motivation):
+                if base_tx.done:
                     raise RuntimeError(
-                        f"{caller}: thread {thread.name!r} stopped in "
-                        f"unexpected Driver state {state.name}")
-                if state is not d.success:  # pragma: no cover - defensive route validation
-                    raise RuntimeError(
-                        f"{caller}: thread {thread.name!r} stopped in "
-                        f"unexpected Driver state {state.name}")
-
-                tx = d.tx
-                if tx is None:  # pragma: no cover - defensive route validation
-                    continue
-
-                if tx.done:  # pragma: no cover - defensive route validation
-                    if base_tx is not None and base_tx.done:
-                        raise RuntimeError(
-                            f"{caller}: thread {thread.name!r} base tx ended "
-                            f"before reaching nested {method.__name__!r}")
-                    continue
-
-                if self.named_method_matches(tx, method):
-                    task.result = tx
-                    if caller == 'skip':
-                        yield from self.route_finish_deep(d)
-                        if d.state is d.raised and tx.done:
-                            # A named transaction may itself raise; skip's
-                            # job is still complete for that named boundary.
-                            task.index += 1
-                            continue
-                        if d.state is not d.success:  # pragma: no cover - defensive route validation
-                            raise RuntimeError(
-                                f"{caller}: thread {thread.name!r} stopped in "
-                                f"unexpected Driver state {d.state.name}")
-                        if not tx.done:  # pragma: no cover - defensive route validation
-                            raise RuntimeError(
-                                f"{caller}: thread {thread.name!r} stopped before "
-                                f"finishing {method.__name__!r}")
-                        task.index += 1
-                        continue
-
-                    if caller in ('park', 'block'):
-                        if tx.state != State.BLOCKED:
-                            raise RuntimeError(
-                                f"{caller}: thread {thread.name!r} reached "
-                                f"{method.__name__!r} but it is in "
-                                f"{tx.state.name} state, not BLOCKED state")
-                        return
-
-                    # pause
-                    yield from self.route_pause_deep(d)
-                    if d.state is not d.success:  # pragma: no cover - defensive route validation
-                        raise RuntimeError(
-                            f"{caller}: thread {thread.name!r} stopped in "
-                            f"unexpected Driver state {d.state.name}")
-                    if tx.state is not State.PAUSED:  # pragma: no cover - defensive route validation
-                        raise RuntimeError(
-                            f"{caller}: thread {thread.name!r} stopped "
-                            f"at {tx.state.name}, expected PAUSED")
-                    return
-
-                if caller == 'park':
-                    yield from self.route_finish_deep(d)
-                    if d.state is not d.success:  # pragma: no cover - defensive route validation
-                        raise RuntimeError(
-                            f"{caller}: thread {thread.name!r} stopped in "
-                            f"unexpected Driver state {d.state.name}")
-                    continue
-
-                where = ("base tx's next child" if base_tx is not None
-                         else "next tx")
+                        f"{caller}: thread {thread.name!r} base tx ended "
+                        f"before reaching nested {method.__name__!r}")
                 raise RuntimeError(
-                    f"{caller}: thread {thread.name!r} {where} was "
-                    f"{tx.method.__name__!r}, expected "
+                    f"{caller}: thread {thread.name!r} base tx is "
+                    f"blanket-parked, can't reach nested "
                     f"{method.__name__!r}")
 
-        def _drive_named(self, plan, caller):
-            """Shared engine for skip / park / pause / block."""
+        class BaseRoute:
+            """Route driving a thread to the method calls a middle-level
+            directive named for it (skip / park / block / pause).
+
+            __call__(d) is the generator: it walks the thread's transactions,
+            matching each against the next named call.  Subclasses override
+            match_subroute / after_match / unmatched_subroute to say what to do
+            at a match and how to treat a non-match -- instead of branching on
+            the directive's name.  The matched transactions are carried back on
+            self.result, and how far the route got on self.index.
+            """
+            name = None  # 'skip' / 'park' / 'block' / 'pause', for messages
+
+            def __init__(self, owner, thread, base_tx, methods):
+                self.owner = owner
+                self.thread = thread
+                self.base_tx = base_tx
+                self.methods = methods
+                self.index = 0
+                self.result = None
+
+            def __call__(self, d):
+                owner = self.owner
+                thread = self.thread
+                base_tx = self.base_tx
+                methods = self.methods
+                name = self.name
+                while self.index < len(methods):
+                    method = methods[self.index]
+                    try:
+                        d.scan()
+                    except RuntimeError:  # pragma: no cover - defensive route validation
+                        if base_tx is not None:
+                            if base_tx.done:
+                                raise RuntimeError(
+                                    f"{name}: thread {thread.name!r} base tx ended "
+                                    f"before reaching nested {method.__name__!r}") from None
+                            if base_tx.state in owner.Driver.blanket_controlled_states:
+                                raise RuntimeError(
+                                    f"{name}: thread {thread.name!r} base tx is "
+                                    f"blanket-parked, can't reach nested "
+                                    f"{method.__name__!r}") from None
+                        raise
+                    yield
+
+                    owner.named_error_base(name, thread, base_tx, method, d)
+                    if d.state is not d.success:  # pragma: no cover - defensive route validation
+                        raise RuntimeError(
+                            f"{name}: thread {thread.name!r} stopped in "
+                            f"unexpected Driver state {d.state.name}")
+
+                    tx = d.tx
+                    if tx is None:  # pragma: no cover - defensive route validation
+                        continue
+
+                    if tx.done:  # pragma: no cover - defensive route validation
+                        if base_tx is not None and base_tx.done:
+                            raise RuntimeError(
+                                f"{name}: thread {thread.name!r} base tx ended "
+                                f"before reaching nested {method.__name__!r}")
+                        continue
+
+                    if owner.named_method_matches(tx, method):
+                        self.result = tx
+                        sub = self.match_subroute(d)
+                        if sub is not None:
+                            yield from sub
+                        if self.after_match(d, tx, method):
+                            self.index += 1
+                            continue
+                        return
+
+                    sub = self.unmatched_subroute(d)
+                    if sub is None:
+                        where = ("base tx's next child" if base_tx is not None
+                                 else "next tx")
+                        raise RuntimeError(
+                            f"{name}: thread {thread.name!r} {where} was "
+                            f"{tx.method.__name__!r}, expected "
+                            f"{method.__name__!r}")
+                    yield from sub
+                    if d.state is not d.success:  # pragma: no cover - defensive route validation
+                        raise RuntimeError(
+                            f"{name}: thread {thread.name!r} stopped in "
+                            f"unexpected Driver state {d.state.name}")
+
+            # Hooks.  Defaults: strict (the named call must be the next tx),
+            # no sub-route to drive on a match.  after_match has no default --
+            # each directive defines what reaching its call means.
+            def match_subroute(self, d):
+                return None
+
+            def unmatched_subroute(self, d):
+                return None
+
+            def after_match(self, d, tx, method):
+                raise NotImplementedError
+
+        class SkipRoute(BaseRoute):
+            """Strict; drive the matched call through to terminal, then
+            advance to the next named call."""
+            name = 'skip'
+
+            def match_subroute(self, d):
+                return self.owner.route_finish_deep(d)
+
+            def after_match(self, d, tx, method):
+                if d.state is d.unexpected and tx.done:
+                    # A named transaction may itself raise (finish predicts a
+                    # clean exit, a raise rests unexpected with the done tx in
+                    # motivation); skip's job is still complete for that boundary.
+                    return True
+                if d.state is not d.success:  # pragma: no cover - defensive route validation
+                    raise RuntimeError(
+                        f"{self.name}: thread {self.thread.name!r} stopped in "
+                        f"unexpected Driver state {d.state.name}")
+                if not tx.done:  # pragma: no cover - defensive route validation
+                    raise RuntimeError(
+                        f"{self.name}: thread {self.thread.name!r} stopped before "
+                        f"finishing {method.__name__!r}")
+                return True
+
+        class BlockRoute(BaseRoute):
+            """Strict; the matched call must already be at BLOCKED.  Leave it
+            parked there and stop."""
+            name = 'block'
+
+            def after_match(self, d, tx, method):
+                if tx.state != State.BLOCKED:
+                    raise RuntimeError(
+                        f"{self.name}: thread {self.thread.name!r} reached "
+                        f"{method.__name__!r} but it is in "
+                        f"{tx.state.name} state, not BLOCKED state")
+                return False
+
+        class ParkRoute(BlockRoute):
+            """Lenient BlockRoute: finish any transaction that isn't the named
+            call, retrying until the named call appears, then park at BLOCKED."""
+            name = 'park'
+
+            def unmatched_subroute(self, d):
+                return self.owner.route_finish_deep(d)
+
+        class PauseRoute(BaseRoute):
+            """Strict; drive the matched call to PAUSED and stop."""
+            name = 'pause'
+
+            def match_subroute(self, d):
+                return self.owner.route_pause_deep(d)
+
+            def after_match(self, d, tx, method):
+                if d.state is not d.success:  # pragma: no cover - defensive route validation
+                    raise RuntimeError(
+                        f"{self.name}: thread {self.thread.name!r} stopped in "
+                        f"unexpected Driver state {d.state.name}")
+                if tx.state is not State.PAUSED:  # pragma: no cover - defensive route validation
+                    raise RuntimeError(
+                        f"{self.name}: thread {self.thread.name!r} stopped "
+                        f"at {tx.state.name}, expected PAUSED")
+                return False
+
+        def drive_route(self, plan, route_cls):
+            """Shared engine for skip / park / pause / block.  route_cls is the
+            BaseRoute subclass implementing the directive's behavior."""
             # Merge segments by thread.  skip may name a thread more than
             # once (switching back and forth with other threads); the per-
             # thread route owns that thread's method loop.
@@ -3549,7 +3545,7 @@ class Scenario:
                     entry = merged[thread]
                     if base_tx is not entry[0]:
                         raise ValueError(
-                            f"{caller}: thread {thread.name!r} given "
+                            f"{route_cls.name}: thread {thread.name!r} given "
                             f"inconsistent base txs")
                     entry[1].extend(methods)
                 else:
@@ -3557,42 +3553,35 @@ class Scenario:
                     order.append(thread)
 
             result = {}
-            tasks = {}
+            routes = []
             drivers = []
             dispatch = self.Dispatch()
             try:
                 for thread in order:
                     base_tx, methods = merged[thread]
                     d = self.Driver(thread, base_tx)
-                    task = SimpleNamespace(
-                        thread=thread,
-                        base_tx=base_tx,
-                        methods=methods,
-                        index=0,
-                        result=None,
-                        caller=caller)
-                    tasks[d] = task
+                    route = route_cls(self, thread, base_tx, methods)
+                    routes.append(route)
                     drivers.append(d)
-                    d.route(lambda dd, task=task, self=self: self.route_drive_named(task, dd))
+                    d.route(route)
                     dispatch.add(d)
 
                 for _ in dispatch:
                     pass
             finally:
                 for d in drivers:
-                    if not d.done:
-                        d.close()
+                    d.close()
 
-            for d, task in tasks.items():
-                if task.result is not None:
-                    result[task.thread] = task.result
-                elif task.index < len(task.methods):  # pragma: no cover - defensive route validation
+            for route in routes:
+                if route.result is not None:
+                    result[route.thread] = route.result
+                elif route.index < len(route.methods):  # pragma: no cover - defensive route validation
                     # Defensive: a route should either complete all requested
                     # methods or raise before getting here.
-                    method = task.methods[task.index]
+                    method = route.methods[route.index]
                     raise RuntimeError(
-                        f"{caller}: thread {task.thread.name!r} stopped before "
-                        f"reaching {method.__name__!r}")
+                        f"{route_cls.name}: thread {route.thread.name!r} stopped "
+                        f"before reaching {method.__name__!r}")
             return result
 
         def skip(self, *args):
@@ -3616,7 +3605,7 @@ class Scenario:
             See Scenario.skip for full docs.
             """
             plan = self.parse_park_skip_args(args, 'skip')
-            return self._drive_named(plan, 'skip')
+            return self.drive_route(plan, self.SkipRoute)
 
         def park(self, *args):
             """Park each thread at its specified method, at BLOCKED.
@@ -3643,7 +3632,7 @@ class Scenario:
             Scenario.park for full docs.
             """
             plan = self.parse_park_skip_args(args, 'park')
-            return self._drive_named(plan, 'park')
+            return self.drive_route(plan, self.ParkRoute)
 
         def pause(self, *args):
             """Drive each thread's named call to PAUSED.
@@ -3662,7 +3651,7 @@ class Scenario:
             full docs.
             """
             plan = self.parse_park_skip_args(args, 'pause')
-            return self._drive_named(plan, 'pause')
+            return self.drive_route(plan, self.PauseRoute)
 
         def block(self, *args):
             """Drive each thread's named call to BLOCKED and leave it there.
@@ -3686,7 +3675,7 @@ class Scenario:
             thread to the blocked transaction.  See Scenario.block.
             """
             plan = self.parse_park_skip_args(args, 'block')
-            return self._drive_named(plan, 'block')
+            return self.drive_route(plan, self.BlockRoute)
 
         @BoundInnerClass
         class LockedDictProxy:
@@ -4130,8 +4119,7 @@ class Scenario:
                     # 1: close any still-active Driver,
                     # so it releases its slot in score.drivers.
                     for d in list(score.drivers.values()):
-                        if not d.done:
-                            d.close()
+                        d.close()
 
                     # 2: deregulate.  New method calls on
                     # scenario primitives from this point on
@@ -4161,212 +4149,48 @@ class Scenario:
                 thread.start()
             return thread
 
-        def signal(self, item):
-            """Wake any waiters parked on item.
+        def wake(self):
+            """Re-sample every parked signal and release the waiters that a
+            now-high signal belongs to.
 
-            Every wait-item is Signaling: item.sample(scenario) is its
-            source of truth, queried on demand.  signal() is purely a
-            wakeup notification -- it confirms the item is currently
-            high (waking on a low signal would be a bug) and releases
-            each parked wtx.  No accumulation, no signaling set.
+            score.waiters -- a normalized signal -> the set of parked
+            WaitTransactions -- is the wait system's only state.  Any change
+            that might take a signal high calls wake(); we sample each parked
+            signal live and, for the high ones, hand the signal to its waiters
+            and release them.
 
-            item must already be in normalized form (the same form
-            WaitTransaction installs as a waiters key).
+            We sample here, on the producer side, *at the instant of the
+            change* -- not on the waiter side after it reacquires the lock.
+            Some signals are pulses: Action(tx) is high only while a barrier
+            action runs (tx.in_action), and the Not(...) of a state/usage
+            that just went low can revert as the next change lands.  A
+            waiter that re-sampled after the dust settled would miss the
+            pulse and park forever.  sample() is the single source of truth,
+            so there is nothing else to keep in sync.
             """
-            assert isinstance(item, Signaling), (
-                f"signal({item!r}): expected a Signaling instance; "
-                "non-Signaling wait items are no longer supported")
-            assert item.sample(self.api), (
-                f"signal({item!r}): item is not high; "
-                "Signaling items must be high when signaled")
-            for wtx in self.waiters.pop(item, ()):
-                if wtx.blocker is not None:
-                    wtx.blocker()
-                    wtx.blocker = None
-                wtx.signaled.add(item)
-
-        def signals(self, items):
-            "Wake waiters for each item.  See signal()."
-            for item in items:
-                self.signal(item)
-
-        def register_wait_interest(self, key, undo):
-            """Register auxiliary indexes for a parked wait key.
-
-            score.waiters is the authoritative waiter store.  These private
-            indexes are only optimizations / low-edge helpers, and are
-            refcounted for the exact duration the WaitTransaction is parked.
-            """
-            if isinstance(key, Call):
-                base_tx = key.base_tx
-                if base_tx is not None:
-                    interest_key = (key.thread, key.method)
-                    base_core = base_tx._core
-                    self.scoped_call_bases[interest_key][base_core] += 1
-                    undo.append(('scoped_call', interest_key, base_core))
+            waiters = self.waiters
+            if not waiters:
+                # Nothing parked.  This is the common case while the scheduler
+                # is actively driving rather than blocked in wait(): worker
+                # state cascades call wake() constantly, and there's no one to
+                # notify.  Bail before touching anything.
                 return
 
-            if isinstance(key, Use):
-                base_tx = key.base_tx
-                if base_tx is not None:
-                    interest_key = (key.thread, key.primitive)
-                    base_core = base_tx._core
-                    self.scoped_use_bases[interest_key][base_core] += 1
-                    undo.append(('scoped_use', interest_key, base_core))
-                return
-
-            if isinstance(key, Not):
-                wrapped = key.wrapped
-                if isinstance(wrapped, Call):
-                    self.sleeping_not_calls[key] += 1
-                    undo.append(('not_call', key))
-                elif isinstance(wrapped, Use):
-                    self.sleeping_not_uses[key] += 1
-                    undo.append(('not_use', key))
-                elif isinstance(wrapped, Nested):
-                    self.sleeping_not_nested[key] += 1
-                    undo.append(('not_nested', key))
-                elif isinstance(wrapped, TransactionState):
-                    self.sleeping_not_transaction_states[key] += 1
-                    undo.append(('not_transaction_state', key))
-
-        def unregister_wait_interests(self, undo):
-            """Undo register_wait_interest calls, deleting zero counts."""
-            for item in undo:
-                kind = item[0]
-                if kind == 'scoped_call':
-                    _, interest_key, base_core = item
-                    counter = self.scoped_call_bases[interest_key]
-                    count = counter[base_core] - 1
-                    if count:
-                        counter[base_core] = count
-                    else:
-                        del counter[base_core]
-                        if not counter:
-                            del self.scoped_call_bases[interest_key]
-                elif kind == 'scoped_use':
-                    _, interest_key, base_core = item
-                    counter = self.scoped_use_bases[interest_key]
-                    count = counter[base_core] - 1
-                    if count:
-                        counter[base_core] = count
-                    else:
-                        del counter[base_core]
-                        if not counter:
-                            del self.scoped_use_bases[interest_key]
-                elif kind == 'not_call':
-                    _, key = item
-                    count = self.sleeping_not_calls[key] - 1
-                    if count:
-                        self.sleeping_not_calls[key] = count
-                    else:
-                        del self.sleeping_not_calls[key]
-                elif kind == 'not_use':
-                    _, key = item
-                    count = self.sleeping_not_uses[key] - 1
-                    if count:
-                        self.sleeping_not_uses[key] = count
-                    else:
-                        del self.sleeping_not_uses[key]
-                elif kind == 'not_nested':
-                    _, key = item
-                    count = self.sleeping_not_nested[key] - 1
-                    if count:
-                        self.sleeping_not_nested[key] = count
-                    else:
-                        del self.sleeping_not_nested[key]
-                elif kind == 'not_transaction_state':
-                    _, key = item
-                    count = self.sleeping_not_transaction_states[key] - 1
-                    if count:
-                        self.sleeping_not_transaction_states[key] = count
-                    else:
-                        del self.sleeping_not_transaction_states[key]
-                else:
-                    raise AssertionError(f"unknown wait-interest kind {kind!r}")
-
-        def signal_sleeping_not_calls(self):
-            """Re-sample parked Not(Call(...)) keys after Call low edges.
-
-            A Call can go low when a transaction leaves a state or when it
-            leaves the active transaction chain.  Re-sampling the parked
-            negated keys centralizes the selection semantics in Call.sample.
-            """
-            for key in tuple(self.sleeping_not_calls):
-                if key.sample(self.api):
-                    self.signal(key)
-
-        def signal_sleeping_not_uses(self):
-            """Re-sample parked Not(Use(...)) keys after Use low edges.
-
-            A Use can go low when a transaction leaves the active
-            transaction chain.  Re-sampling keeps scoped and unscoped
-            Use semantics centralized in Use.sample.
-            """
-            for key in tuple(self.sleeping_not_uses):
-                if key.sample(self.api):
-                    self.signal(key)
-
-        def signal_sleeping_not_nested(self):
-            """Re-sample parked Not(Nested(...)) keys after child removal."""
-            for key in tuple(self.sleeping_not_nested):
-                if key.sample(self.api):
-                    self.signal(key)
-
-        def signal_sleeping_not_transaction_states(self):
-            """Re-sample parked Not(TransactionState(...)) keys after state changes."""
-            for key in tuple(self.sleeping_not_transaction_states):
-                if key.sample(self.api):
-                    self.signal(key)
-
-        def use_signals(self, thread, primitive, tx):
-            """Return unscoped and currently-interesting scoped Use signals.
-
-            ``primitive`` must already be a cooked primitive from
-            ``tx.use_primitives``.  Scoped Use only tests base
-            transactions with sleeping waiters, avoiding one signal per
-            ancestor transaction.
-            """
-            signals = {Use(thread, primitive)}
-            bases = self.scoped_use_bases.get((thread, primitive))
-            if not bases:
-                return signals
-            for base_core in tuple(bases):
-                cur = tx.parent
-                while cur is not None and cur is not base_core:
-                    cur = cur.parent
-                if cur is base_core:
-                    signals.add(Use((thread, base_core.api), primitive))
-            return signals
-
-        def incref_usage(self, *items):
-            """Increment the usage refcount for each item (a cooked
-            primitive or a cooked bound method).  When an item's count
-            goes 0->1 it just became used by some thread, so we signal
-            its aggregate signal (BoundMethod(item) or _Primitive(item))
-            to wake any waiters parked on it.
-
-            Items must already be cooked (normalized); callers pass the
-            tx's cooked family, never raw handles."""
-            for item in items:
-                first = item not in self.usage_counter
-                self.usage_counter[item] += 1
-                if first:
-                    self.signal(self._aggregate_signal(item))
-
-        def decref_usage(self, *items):
-            """Decrement the usage refcount for each item.  When an
-            item's count reaches 0 it's no longer used by any thread,
-            so we drop the key and signal Not(item), where item is the
-            normalized native method or primitive, to wake waiters parked
-            on "nobody is using this"."""
-            for item in items:
-                count = self.usage_counter[item] - 1
-                if count:
-                    self.usage_counter[item] = count
-                else:
-                    del self.usage_counter[item]
-                    self.signal(Not(item))
+            # We hold score.lock, and so does every mutator of waiters (the add
+            # in _install_and_wait and the discard in its finally).  The threads
+            # we release below via blocker.release can't re-acquire score.lock
+            # until wake() returns, and sample() only reads.  So waiters and
+            # every bucket are stable for this whole loop -- iterate directly,
+            # no defensive copy.
+            api = self.api
+            for key, bucket in waiters.items():
+                if not bucket or not key.sample(api):
+                    continue
+                for wtx in bucket:
+                    wtx.signaled.add(key)
+                    if wtx.blocker is not None:
+                        wtx.blocker()
+                        wtx.blocker = None
 
         class Primitive(Signaling, ImmutableSignalToken):
             """An aggregate level signal: high while ANY thread has an active
@@ -4487,12 +4311,6 @@ class Scenario:
             def __repr__(self):
                 name = getattr(self.method, '__name__', repr(self.method))
                 return f"BoundMethod({name})"
-
-        def _aggregate_signal(self, item):
-            "The aggregate Signaling for a cooked primitive or method."
-            if isinstance(item, MethodType):
-                return self.BoundMethod(item)
-            return self.Primitive(item)
 
         def box_signal(self, o):
             """Box a bare top-level thread, primitive, or bound method
@@ -4719,18 +4537,18 @@ class Scenario:
                 self._name = value
                 self.use_fancy_repr = True
 
-            def __call__(self, method, regulated, *, entry=None, **kwargs):
+            def __call__(self, method, regulated, *, called=None, **kwargs):
                 start_time = _current_time()
                 cls = self.methods[method]
                 kwargs['regulated'] = regulated
+                # called is the bound method the user actually invoked, when
+                # it differs from the method this core regulates.  Only a
+                # Condition's acquire/release/locked supply it (they run on
+                # the underlying lock's core but were called on the condition);
+                # everywhere else it defaults to method inside the tx.
+                if called is not None:
+                    kwargs['called'] = called
                 tx = cls(method, start_time, **kwargs)
-                # entry_primitive: the object the user actually invoked
-                # the method on.  Normally that's this core's own
-                # primitive, but a Condition's acquire/release/locked
-                # delegate to the underlying lock's core while passing
-                # entry=condition, so use_primitives can credit the
-                # condition (cond -> ul containment).
-                tx.entry_primitive = self.primitive if entry is None else entry
                 return tx()
 
             def unblock(self, method, threads, *, pause=False):
@@ -4846,11 +4664,7 @@ class Scenario:
                 tuple, meaning the current descendant transaction under
                 ``base_tx``.  Validation of method/state happens separately.
                 """
-                try:
-                    threads = tuple(threads)
-                except TypeError:
-                    raise TypeError(
-                        f"expected an iterable of threads, got {threads!r}") from None
+                assert isinstance(threads, tuple)
                 if not threads:
                     return (threads, [])
 
@@ -4859,15 +4673,6 @@ class Scenario:
                 append = txs.append
                 score = self.score
                 current_thread = threading.current_thread()
-
-                def selected_base_tx(thread, base_tx):
-                    tx = score.transactions.get(thread)
-                    cur = tx
-                    while cur is not None:
-                        if cur is base_tx:
-                            return None if tx is base_tx else tx
-                        cur = cur.parent
-                    return None
 
                 for thread_spec in threads:
                     spec = score.parse_thread_or_base_tuple(thread_spec, caller)
@@ -4890,7 +4695,15 @@ class Scenario:
                         continue
 
                     while True:
-                        tx = selected_base_tx(thread, base_tx)
+                        tx = score.transactions.get(thread)
+                        cursor = tx
+                        while cursor is not None:
+                            if cursor is base_tx:
+                                tx = None if tx is base_tx else tx
+                                break
+                            cursor = cursor.parent
+                        else:
+                            tx = None
                         if tx is not None:
                             append(tx)
                             break
@@ -4898,7 +4711,7 @@ class Scenario:
                             raise RuntimeError(
                                 f"{prefix}thread {thread.name!r} base tx ended "
                                 f"before pushing a child transaction")
-                        if base_tx.state in score.Driver.base_impasse_states:
+                        if base_tx.state in score.Driver.blanket_controlled_states:
                             raise RuntimeError(
                                 f"{prefix}thread {thread.name!r} base tx is "
                                 f"blanket-parked, can't reach a child transaction")
@@ -4913,12 +4726,6 @@ class Scenario:
                                 f"before pushing a child transaction")
 
                 return (threads, txs)
-
-            def thread_to_tx(self, thread, caller):
-                """Translate one user-facing thread spec into an active tx core."""
-                _threads, txs = self.threads_to_txs((thread,), caller)
-                return txs[0]
-
 
             @base()
             @BoundInnerClass
@@ -4943,7 +4750,7 @@ class Scenario:
                 # lock released), WaitingTransaction adds WAITING, etc.
                 parking_states = (State.BLOCKED, State.PAUSED)
 
-                def __init__(self, core, method, start_time, regulated):
+                def __init__(self, core, method, start_time, regulated, called=None):
                     score = core.score
                     thread = threading.current_thread()
 
@@ -4966,14 +4773,28 @@ class Scenario:
                     # to regulate.  Usually that's the method the user
                     # called; Condition.acquire/release/locked delegate to
                     # the underlying lock core, so those arrive here as
-                    # lock methods while entry_primitive records the
-                    # condition.  normalized_method is the internal
+                    # lock methods while `called` records the condition's
+                    # own method.  normalized_method is the internal
                     # matching key: raw->cooked, and Condition lock-family
                     # methods collapse to the underlying lock's method.
                     # method is never invoked (commit runs core.actual),
                     # so these aliases can differ harmlessly.
                     self.method = method
                     self.normalized_method = core.normalize(method)
+                    # called is the bound method the user actually invoked.
+                    # It defaults to method and differs only for a Condition's
+                    # delegated acquire/release/locked, where method is the
+                    # underlying lock's method but called is the condition's.
+                    # called.__self__ is the primitive to credit for usage
+                    # (see use_primitives at publish).  It must name the same
+                    # method as what we regulate.
+                    if called is None:
+                        called = method
+                    else:
+                        assert called.__name__ == method.__name__, (
+                            f"called {called.__name__!r} doesn't match "
+                            f"regulated method {method.__name__!r}")
+                    self.called = called
                     # blanket_pause is owned by blanket's internal
                     # driving/cycle machinery. scheduler_pause is
                     # owned by the user-written scheduler via tx.pause.
@@ -5011,12 +4832,8 @@ class Scenario:
                     self.parent = parent = score.transactions.get(thread)
                     if parent:
                         self.core_parent = self.find_parent_core(parent, core)
-                        self.method_parent = self.find_parent_method(parent, method)
-                        self.depth = 0 if self.method_parent is None else self.method_parent.depth + 1
                     else:
                         self.core_parent = None
-                        self.method_parent = None
-                        self.depth = 0
                     self.child = None
                     self.nested_signal = None
 
@@ -5049,16 +4866,6 @@ class Scenario:
                 def find_parent_core(parent, core):
                     while parent is not None:
                         if parent.core is core:
-                            return parent
-                        parent = parent.parent
-                    return None
-
-                @staticmethod
-                def find_parent_method(parent, method):
-                    key = (method.__self__, method.__func__)
-                    while parent is not None:
-                        parent_key = (parent.method.__self__, parent.method.__func__)
-                        if parent_key == key:
                             return parent
                         parent = parent.parent
                     return None
@@ -5146,21 +4953,6 @@ class Scenario:
                     callers that iterate / test membership.)"""
                     return {self.normalized_method}
 
-                def call_signals(self, state):
-                    thread = self.thread
-                    signals = set()
-                    score = self.score
-                    for method in self.call_methods():
-                        signals.add(Call(thread, method, state))
-                        interest_key = (thread, method)
-                        bases = score.scoped_call_bases.get(interest_key)
-                        if not bases:
-                            continue
-                        for base_core in tuple(bases):
-                            if Call._scoped_tx_selected(self, base_core, method):
-                                signals.add(Call((thread, base_core.api), method, state))
-                    return signals
-
                 def observe(self, state, callback):
                     if state <= self.state:
                         raise ValueError(f"can't register observer for {state!r}, tx is already at state {self.state!r}")
@@ -5176,24 +4968,18 @@ class Scenario:
                     self.state = state
                     self.log.append((_current_time(), state))
 
-                    # Wake waiters parked on the new state's
-                    # Call(t, m, state) signals (going-high transition)
-                    # and the TransactionState(api, state) signal.
-                    # The previous state's Calls just went low; parked
-                    # Not(Call(...)) waiters are re-sampled below.
                     if self.score.transactions.get(self.thread) is self:
                         score = self.score
-                        score.signals(self.call_signals(state))
-                        score.signal(TransactionState(self.api, state))
-                        score.signal_sleeping_not_calls()
-                        score.signal_sleeping_not_transaction_states()
-                        # Signal Reached(self.api, X) for every state X
-                        # we've just crossed.  See last_reached_state
-                        # docstring at __init__.
+                        # Advance last_reached_state across every state we
+                        # crossed; Reached(self.api, X).sample reads it.
                         while self.last_reached_state.index < state.index:
                             next_index = self.last_reached_state.index + 1
                             self.last_reached_state = State.by_index[next_index]
-                            score.signal(Reached(self.api, self.last_reached_state))
+                        # One live re-sample resolves every going-high signal
+                        # (the new state's Calls, TransactionState, Reached)
+                        # and every going-low one (the previous state's
+                        # Not(Call(...)) and Not(TransactionState) waiters).
+                        score.wake()
 
                     while self.state_observers:
                         s, observer = self.state_observers[-1]
@@ -5298,6 +5084,12 @@ class Scenario:
                     self.unpark(State.RESUMED)
                     self.settle()
 
+                def _unpause(self):
+                    "Internal worker for unsetting a pause."
+                    if (self.state is State.PAUSED) and not (self.pausing):
+                        self.unpark(State.EXITING)
+                        self.settle()
+
                 def set_scheduler_pause(self, value):
                     """Set or clear the scheduler-owned pause bit.
 
@@ -5305,20 +5097,25 @@ class Scenario:
                     the scheduler bit or blanket's pause bit is set.
                     """
                     value = bool(value)
-                    if value:
-                        if self.state > State.PAUSED:
-                            raise RuntimeError(
-                                "transaction has already advanced past PAUSED state")
-                        self.scheduler_pause = True
-                        return
-
-                    if self.scheduler_pause and self.state > State.PAUSED:
+                    if (value != self.scheduler_pause) and (self.state > State.PAUSED):
                         raise RuntimeError(
                             "transaction has already advanced past PAUSED state")
-                    self.scheduler_pause = False
-                    if self.state is State.PAUSED and not self.paused:
-                        self.unpark(State.EXITING)
-                        self.settle()
+                    self.scheduler_pause = value
+                    self._unpause()
+
+                def set_blanket_pause(self, value):
+                    """Set or clear blanket's own pause bit -- the parallel of
+                    set_scheduler_pause for the bit blanket holds internally.
+
+                    The transaction stays parked at PAUSED while either bit is
+                    set; clearing the last one releases it.
+                    """
+                    value = bool(value)
+                    if (value != self.blanket_pause) and (self.state > State.PAUSED):
+                        raise RuntimeError(
+                            "transaction has already advanced past PAUSED state")
+                    self.blanket_pause = value
+                    self._unpause()
 
                 def release_blanket_pause(self):
                     """Clear blanket's pause bit.
@@ -5330,9 +5127,7 @@ class Scenario:
                     if not self.blanket_pause:
                         return
                     self.blanket_pause = False
-                    if self.state is State.PAUSED and not self.paused:
-                        self.unpark(State.EXITING)
-                        self.settle()
+                    self._unpause()
 
                 def unpause(self):
                     """Clear the scheduler-owned pause bit.
@@ -5341,7 +5136,7 @@ class Scenario:
                     remaining pause is blanket-owned.
                     """
                     self.set_scheduler_pause(False)
-                    if self.paused:
+                    if self.pausing:
                         raise RuntimeError(
                             "transaction is still paused by blanket")
 
@@ -5354,7 +5149,7 @@ class Scenario:
                     self.set_scheduler_pause(value)
 
                 @property
-                def paused(self):
+                def pausing(self):
                     return self.blanket_pause or self.scheduler_pause
 
                 def clear_all_pauses(self):
@@ -5490,55 +5285,40 @@ class Scenario:
                         if parent is not None:
                             parent.child = self
 
-                        self.signals_thread = parent is None
-
-                        if self.signals_thread:
-                            # Wake waiters parked on this thread's
-                            # presence-of-tx signal.  Thread(t) is
-                            # self-reporting (reads score.transactions).
-                            score.signal(score.Thread(thread))
-
-                        # Aggregate method-usage: bump the usage counter
-                        # for the normalized method this tx is calling.
-                        # incref_usage signals BoundMethod(m) on 0->1.
-                        # Stored on the tx so close() decrefs the same.
+                        # cooked_methods / use_primitives / nested_signal are
+                        # live-tx state read by the Call / Use / _Primitive /
+                        # BoundMethod / Nested sample() methods.  No counters
+                        # to bump: wake() below re-samples them.
                         self.cooked_methods = {self.normalized_method}
-                        score.incref_usage(*self.cooked_methods)
 
                         if parent is not None:
                             self.nested_signal = Nested(parent.api)
-                            score.signal(self.nested_signal)
 
-                        state_signal = TransactionState(self.api, self.state)
-
-                        call_none_signals = self.call_signals(None)
-                        call_state_signals = self.call_signals(self.state)
-                        score.signals(call_none_signals | call_state_signals | {state_signal})
-
-                        # use_primitives: the objects this tx uses.  We
-                        # derive usage from entry_primitive -- the object
-                        # the method was actually invoked on (a
-                        # Condition's acquire records entry=condition even
-                        # though the tx runs on the lock's core) -- plus,
-                        # if that's a Condition, its underlying lock.
-                        # Using a condition uses its lock (cond -> ul),
-                        # never the reverse and never a sibling.
-                        # _Primitive(cond) and _Primitive(ul) stay distinct
-                        # signals; both fire from membership here.
-                        core = self.entry_primitive._core
-                        caller = core.normalize(self.entry_primitive)
+                        # use_primitives: the objects this tx uses.  called
+                        # is the method the user actually invoked, so
+                        # called.__self__ is the primitive it was invoked on
+                        # (a Condition's acquire was called on the condition
+                        # even though the tx runs on the lock's core; every
+                        # other tx's called is its own method, so __self__ is
+                        # this core's primitive).  Credit that primitive,
+                        # this core's primitive, and -- if the called one is a
+                        # Condition -- its underlying lock.  Using a condition
+                        # uses its lock (cond -> ul), never the reverse and
+                        # never a sibling.  Regulated calls always come
+                        # through the cooked handle, so called.__self__ is a
+                        # cooked primitive here; no normalization needed.
+                        caller = self.called.__self__
                         use = {self.core.primitive, caller}
                         underlying = getattr(caller._core, 'underlying', None)
                         if underlying is not None:
                             use.add(underlying.primitive)
                         self.use_primitives = use
-                        # Per-(thread, primitive) Use is self-reporting;
-                        # strobe each cooked form, including scoped Use
-                        # forms someone is currently sleeping on.
-                        for p in self.use_primitives:
-                            score.signals(score.use_signals(thread, p, self))
-                        # Aggregate primitive-usage via the counter.
-                        score.incref_usage(*self.use_primitives)
+
+                        # The tx is now visible and its usage state is set;
+                        # one live re-sample wakes every waiter a now-high
+                        # signal (Thread, Nested, Call, Use, _Primitive,
+                        # BoundMethod, TransactionState) belongs to.
+                        score.wake()
 
                     # Now navigate the state machine.
                     if self.blocking and (self.state <= State.BLOCKED):
@@ -5557,7 +5337,7 @@ class Scenario:
                         # via its sunder shims).
                     terminal_state = self.committed()
 
-                    if self.paused and (self.state <= State.PAUSED):
+                    if self.pausing and (self.state <= State.PAUSED):
                         self.park(State.PAUSED)
 
                     self.exit(terminal_state)
@@ -5631,21 +5411,18 @@ class Scenario:
                     parent_obj = self.parent
                     if parent_obj is not None and parent_obj.child is self:
                         parent_obj.child = None
-                        score.signal_sleeping_not_nested()
 
                     if self.regulated:
                         assert score.transactions.get(thread) is self, \
                             f"close: active tx on {thread.name!r} is not self; active={score.transactions.get(thread)!r}; self={self!r}"
 
-                        # Update score.transactions BEFORE signaling
-                        # Not(thread): Not(thread).sample reads
-                        # `t not in score.transactions`, so the
-                        # transaction-removal must precede the signal
-                        # so the assertion in score.signal (item.sample
-                        # is True) holds.  Likewise the chain change
-                        # silently takes Method(m), Use(t, p),
-                        # _Primitive(p), and Nested(parent) low; those
-                        # don't need decrement wakeups.
+                        # Update score.transactions BEFORE the wake below:
+                        # wake() re-samples live, and Not(thread).sample reads
+                        # `t not in score.transactions`, so the removal must
+                        # precede the re-sample.  The chain change also takes
+                        # Call(m), Use(t, p), _Primitive(p), and Nested(parent)
+                        # low; their Not(...) waiters wake from the same
+                        # re-sample.
                         parent = self.parent
                         if parent is None:
                             del score.transactions[thread]
@@ -5661,35 +5438,29 @@ class Scenario:
                             else:
                                 core.transactions[thread] = self.core_parent
 
-                        # The active transaction chain just changed, so
-                        # stateless Call(...) and Use(...) signals may
-                        # have gone low.
-                        score.signal_sleeping_not_calls()
-                        score.signal_sleeping_not_uses()
+                        # Re-sample on every close, root or nested.  We never
+                        # pulse a Not directly; a falling edge is noticed only
+                        # because some wake() re-samples while it's high.  A
+                        # root close takes Not(thread) high.  A nested close
+                        # takes Nested(parent), Call(child_method), and
+                        # Use(child, p) low -- so their Not(...) waiters go
+                        # high -- with the same registry update above.  Gating
+                        # this on a root close (the old signals_thread check)
+                        # left those nested edges with no wake of their own,
+                        # relying on some adjacent wake (a wait_for predicate
+                        # toggle, a barrier action toggle, a sibling publish) to
+                        # re-sample for us.  That held only by luck of who the
+                        # nested-tx producers happen to be; keep the wake local
+                        # and unconditional instead.
+                        score.wake()
 
-                        # Drop aggregate usage counts.  decref_usage
-                        # signals Not(method) / Not(primitive)
-                        # for any item whose count just reached 0.  We
-                        # decref exactly what open increfed (stored on
-                        # the tx) so a mid-tx family growth can't
-                        # unbalance the counter.
-                        score.decref_usage(*self.cooked_methods)
-                        score.decref_usage(*self.use_primitives)
-
-                        if self.signals_thread:
-                            # Not(thread) high transition needs a wakeup;
-                            # the chain change above already took Thread(t)
-                            # low so the assertion holds.
-                            score.signal(Not(thread))
-
-                    # tx and tx.api both signal when the tx terminates
-                    # and stay signaled forever after.  Cleared by
-                    # scenario.reset() (auto-called on context exit).
-                    # This is deliberately after transaction registry
-                    # updates, so observers never see tx-end before the
-                    # thread's current transaction has been unpublished.
-                    score.signal(self)
-                    score.signal(self.api)
+                    # tx and tx.api both report high once the tx terminates
+                    # and stay high forever after (cleared by scenario.reset,
+                    # auto-called on context exit).  This wake is deliberately
+                    # after the transaction registry updates, so observers
+                    # never see tx-end before the thread's current transaction
+                    # has been unpublished.
+                    score.wake()
 
             @base()
             @BoundInnerClass
@@ -5713,8 +5484,8 @@ class Scenario:
                 # which use -1 to match threading.Lock.acquire.
                 no_timeout = None
 
-                def __init__(self, core, method, start_time, regulated, timeout):
-                    super().__init__(method, start_time, regulated)
+                def __init__(self, core, method, start_time, regulated, timeout, called=None):
+                    super().__init__(method, start_time, regulated, called=called)
                     self.kwargs['timeout'] = timeout
                     # original_timeout is the literal user-supplied value
                     # (or the synthetic value the subclass derived from
@@ -5901,11 +5672,11 @@ class Scenario:
                             self._core.set_scheduler_pause(value)
 
                     @property
-                    def paused(self):
+                    def pausing(self):
                         """True iff this transaction is held at PAUSED
                         by either the user or blanket."""
                         with self._lock:
-                            return self._core.paused
+                            return self._core.pausing
 
                     @property
                     def log(self):
@@ -5935,11 +5706,6 @@ class Scenario:
                         with self._lock:
                             parent = self._core.parent
                             return None if parent is None else parent.api
-
-                    @property
-                    def depth(self):
-                        with self._lock:
-                            return self._core.depth
 
                     @property
                     def end_time(self):
@@ -6069,10 +5835,10 @@ class Scenario:
             class acquire(base.TimeoutTransaction):
                 no_timeout = -1
 
-                def __init__(self, core, method, start_time, regulated, blocking=True, timeout=-1):
+                def __init__(self, core, method, start_time, regulated, blocking=True, timeout=-1, called=None):
                     if (not blocking) and (timeout != -1):
                         raise ValueError("can't specify a timeout for a non-blocking call")
-                    super().__init__(method, start_time, regulated, timeout)
+                    super().__init__(method, start_time, regulated, timeout, called=called)
                     self.kwargs['blocking'] = blocking
 
                 def __repr__(self):
@@ -6223,11 +5989,11 @@ class Scenario:
                         thread = acquirer
                         method = self.primitive.acquire
                         role = 'acquire'
-                    if d.state is d.impasse:  # coverage: defensive
+                    if d.state is d.unexpected and Terminated(d.thread) not in d.motivation:  # coverage: defensive
                         raise RuntimeError(
                             f"assign: thread {thread.name!r} base tx is "
                             f"blanket-parked, can't reach its {role}")
-                    if d.state is d.terminated:
+                    if Terminated(d.thread) in d.motivation:
                         if bases[d] is not None:
                             raise RuntimeError(
                                 f"assign: thread {thread.name!r} base tx ended "
@@ -6330,11 +6096,7 @@ class Scenario:
                 TERMINATED (base_tx exited first, or the thread died
                 before reaching its op).  Called after driving, before
                 validate, at each relay drive point."""
-                if driver.state is driver.impasse:  # coverage: defensive
-                    raise RuntimeError(
-                        f"relay: thread {driver.thread.name!r} base tx is "
-                        f"blanket-parked, can't reach its {role}")
-                if driver.state is driver.terminated:
+                if Terminated(driver.thread) in driver.motivation:
                     if driver.base_tx is not None:
                         raise RuntimeError(
                             f"relay: thread {driver.thread.name!r} base tx "
@@ -6342,6 +6104,10 @@ class Scenario:
                     raise RuntimeError(
                         f"relay: thread {driver.thread.name!r} terminated "
                         f"before reaching its {role}")
+                if driver.state is driver.unexpected:  # coverage: defensive
+                    raise RuntimeError(
+                        f"relay: thread {driver.thread.name!r} base tx is "
+                        f"blanket-parked, can't reach its {role}")
 
             def _relay_generator(self, drivers, pause):
                 locked = False
@@ -6418,18 +6184,20 @@ class Scenario:
                         # Drive acquirer to PAUSED.  Disregard any
                         # timeout on the acquire tx so a pending
                         # timeout doesn't preempt the relay.
-                        # d.pause_internal() sets blanket's pause
+                        # d.blanket_paused() sets blanket's pause
                         # bit and unblocks atomically when driven, so the
                         # acquirer parks at PAUSED when
                         # actual.acquire returns.
                         acquirer.tx.disregard()
-                        acquirer.pause_internal()
+                        acquirer.blanket_paused()
                         acquirer()
 
-                        # Drive past PAUSED to the final state, or
-                        # hand blanket's pause bit to the scheduler.
+                        # Drive past PAUSED to the final state, or let the
+                        # scheduler take over the hold: set its pause bit, then
+                        # blanket drops its own.
                         if pause:
-                            acquirer.handoff_blanket_pause_to_scheduler_pause(acquirer.tx)
+                            acquirer.scheduler_pause = True
+                            acquirer.blanket_pause = False
                         else:
                             acquirer.finish()
                             acquirer()
@@ -6465,8 +6233,7 @@ class Scenario:
                         lock.acquire()
                     try:
                         for d in drivers:
-                            if not d.done:  # pragma: no cover
-                                d.close()
+                            d.close()
                     finally:
                         lock.release()
 
@@ -6855,11 +6622,7 @@ class Scenario:
                     Called at a cycle's per-driver validation point,
                     before touching d.tx (which is None at impasse /
                     terminated)."""
-                    if d.state is d.impasse:
-                        raise RuntimeError(
-                            f"cycle: thread {d.thread.name!r} base tx is "
-                            f"blanket-parked, can't reach its {role}")
-                    if d.state is d.terminated:
+                    if Terminated(d.thread) in d.motivation:
                         if d.base_tx is not None:
                             raise RuntimeError(
                                 f"cycle: thread {d.thread.name!r} base tx "
@@ -6867,6 +6630,10 @@ class Scenario:
                         raise RuntimeError(
                             f"cycle: thread {d.thread.name!r} terminated "
                             f"before reaching its {role}")
+                    if d.state is d.unexpected:
+                        raise RuntimeError(
+                            f"cycle: thread {d.thread.name!r} base tx is "
+                            f"blanket-parked, can't reach its {role}")
 
                 def wake_drivers(self, drivers, *, pause=False):
                     """Drive each Driver past its PAUSED park,
@@ -6901,12 +6668,15 @@ class Scenario:
                     """
                     score = self.core.score
                     if pause:
-                        # Hand-off: each Driver is parked at PAUSED
-                        # via Cycle init's d.pause_internal().  Cycle owns
-                        # the blanket pause bit; convert it to the scheduler's
-                        # pause bit without an unpark gap.
+                        # Each Driver is parked at PAUSED via Cycle init's
+                        # d.blanket_paused(), held by blanket's pause bit.  The
+                        # scheduler takes over the hold: set its pause bit, then
+                        # blanket drops its own.  (No unpark gap: the tx stays
+                        # PAUSED while either bit is set, and the worker can't
+                        # re-check its bits until it reacquires score.lock.)
                         for d in drivers:
-                            d.handoff_blanket_pause_to_scheduler_pause()
+                            d.scheduler_pause = True
+                            d.blanket_pause = False
                         for d in drivers:
                             del self.ready[d.thread]
                         if not self.ready:
@@ -6977,7 +6747,7 @@ class Scenario:
                 def pause(self, threads):
                     """Drive past PAUSED (post-trigger park) and create
                     the scheduler pause bit, in spec order.  The threads end up
-                    parked at PAUSED again with tx.paused true; the
+                    parked at PAUSED again with tx.pausing true; the
                     caller releases each later via tx.api.unpause.  With
                     at least one thread named, pauses just the named
                     threads and returns a tuple of their threads.  With
@@ -7462,8 +7232,7 @@ class Scenario:
                         # incoming, all to be drained later -- so we do
                         # NOT close on success.)
                         for d in self.drivers:
-                            if not d.done:  # pragma: no cover
-                                d.close()
+                            d.close()
                         raise
 
                 def process(self):
@@ -7487,7 +7256,7 @@ class Scenario:
                         # post-notify STALLED park, then hand them to the
                         # user via ready (in spec order).
                         for d in self.waiting:
-                            d.stall()
+                            d.stalled()
                             self.dispatch.add(d)
                         for yielded in self.dispatch:
                             yielded.tx.validate(
@@ -7506,123 +7275,137 @@ class Scenario:
                     false, or a plain cond.wait), or 'ready' if it parked
                     at PAUSED / completed without actually waiting.
                     """
-                    class Entry:
-                        status = None
-
-                    entry = Entry()
-                    self.core.score.run_driver_route(
-                        d, lambda dd, self=self, entry=entry:
-                        self.route_drive_waiter(dd, entry))
-                    if entry.status is None:  # coverage: defensive
+                    route = self.DriveWaiterRoute(self)
+                    self.core.score.run_driver_route(d, route)
+                    if route.status is None:  # coverage: defensive
                         raise RuntimeError(
                             f"{self.caller}: waiter route stopped in "
                             f"unexpected Driver state {d.state.name}")
-                    return entry.status
+                    return route.status
 
-                def route_drive_waiter(self, d, entry):
-                    core = self.core
-                    caller = self.caller
-                    # If it entered at UL.acquire, free UL, drive the
-                    # acquire to terminal, then scan into the cond.wait /
-                    # wait_for that follows.
-                    if d.tx.method == self.ul_acquire:
-                        self.ensure_ul_free()
-                        d.finish()
-                        yield
-                        assert d.state is d.success and d.tx.done
-                        d.scan()
-                        yield
-                        assert d.state is d.success and d.tx is not None and not d.tx.done
-                        d.tx.validate(
-                            method=core.wait_entry_methods,
-                            state=(State.BLOCKED, State.COMMIT, State.WAITING),
-                            method_description='cond.wait or cond.wait_for',
-                            caller=caller)
+                class DriveWaiterRoute:
+                    """Route object driving one cond.cycle waiter.  __call__(d)
+                    is the generator; the outcome ('ready' or 'waiting') is
+                    conveyed back on self.status (None means the route stopped
+                    in an unexpected Driver state)."""
 
-                    if d.tx.method in self.wait_for_methods:
-                        # Pre-pause: set the blanket pause bit before
-                        # releasing the waiter, then stop at predicate entry.
-                        # If the predicate succeeds immediately, the bit
-                        # parks the parent wait_for at PAUSED; if it is false
-                        # and creates the inner cond.wait child, clear the
-                        # speculative bit before driving that child to
-                        # WAITING.
-                        parent_tx = d.tx
-                        wf = parent_tx.api
-                        d.arm_blanket_pause(parent_tx)
-                        retain_blanket_pause = False
-                        try:
-                            d.reenter()
+                    def __init__(self, owner):
+                        self.owner = owner
+                        self.status = None
+
+                    def __call__(self, d):
+                        owner = self.owner
+                        core = owner.core
+                        caller = owner.caller
+                        # If it entered at UL.acquire, free UL, drive the
+                        # acquire to terminal, then scan into the cond.wait /
+                        # wait_for that follows.
+                        if d.tx.method == owner.ul_acquire:
+                            owner.ensure_ul_free()
+                            d.finish()
                             yield
-                            if d.state is d.terminated:  # pragma: no cover - defensive
-                                raise RuntimeError(
-                                    f"{caller}: waiter thread {d.thread.name!r} "
-                                    "terminated during wait_for predicate")
-                            if d.state is not d.success:  # pragma: no cover - defensive
-                                raise RuntimeError(
-                                    f"{caller}: wait_for predicate drive stopped "
-                                    f"in unexpected Driver state {d.state.name}")
+                            assert d.state is d.success and d.tx.done
+                            d.scan()
+                            yield
+                            assert d.state is d.success and d.tx is not None and not d.tx.done
+                            d.tx.validate(
+                                method=core.wait_entry_methods,
+                                state=(State.BLOCKED, State.COMMIT, State.WAITING),
+                                method_description='cond.wait or cond.wait_for',
+                                caller=caller)
 
-                            while d.callback_signal == Predicate(wf):
-                                if self.scheduler is not _do_nothing:
-                                    self.scheduler(wf)
-                                d.resume()
+                        if d.tx.method in owner.wait_for_methods:
+                            # Pre-pause: arm the blanket pause on the wait_for
+                            # before releasing the waiter, then stop at predicate
+                            # entry.  If the predicate succeeds immediately, the
+                            # bit parks the parent at PAUSED; if it is false and
+                            # creates the inner cond.wait child, we descend into
+                            # that child and the pause rides the stacked parent
+                            # frame, so the post-notify ActWaitForRoute inherits
+                            # it without re-arming.
+                            parent_tx = d.tx
+                            wf = parent_tx.api
+                            d.blanket_pause = True
+                            retain_blanket_pause = False
+                            try:
+                                d.reenter()
                                 yield
-                                if d.state is d.terminated:  # pragma: no cover - defensive
+                                if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
                                     raise RuntimeError(
                                         f"{caller}: waiter thread {d.thread.name!r} "
                                         "terminated during wait_for predicate")
                                 if d.state is not d.success:  # pragma: no cover - defensive
                                     raise RuntimeError(
-                                        f"{caller}: wait_for predicate resume stopped "
+                                        f"{caller}: wait_for predicate drive stopped "
                                         f"in unexpected Driver state {d.state.name}")
 
-                                d.wait(Nested(wf), Paused(wf), wf)
+                                # reenter entered the predicate; it now runs
+                                # freely in the worker.  Give the scheduler its
+                                # hook, then settle the predicate in two phases.
+                                if owner.scheduler is not _do_nothing:
+                                    owner.scheduler(wf)
+                                # Phase A: descend into the wait_for and let scan
+                                # absorb the predicate's return (Not(Predicate)),
+                                # any child it spawned, or an immediate PAUSED
+                                # park.  Then exit() confirms the callback has
+                                # returned and clears callback_signal, so the
+                                # next scan won't re-trip on Not(Predicate).
+                                d.push()
+                                d.scan()
                                 yield
-                                if d.state is d.terminated:  # pragma: no cover - defensive
+                                if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
                                     raise RuntimeError(
                                         f"{caller}: waiter thread {d.thread.name!r} "
                                         "terminated while settling wait_for")
-                                if Paused(wf) in d.motivation:
-                                    retain_blanket_pause = True
-                                    entry.status = 'ready'
-                                    return
-                                if Nested(wf) in d.motivation:
-                                    d.release_blanket_pause(parent_tx)
-                                    d.scan(parent_tx)
-                                    yield
+                                d.exit()
+                                yield
+                                d.pop()
+                                # Phase B: the predicate has returned.  Descend
+                                # again; scan now resolves on the real outcome --
+                                # the inner cond.wait child surfaces (success),
+                                # or the wait_for parks at PAUSED (unexpected).
+                                d.push()
+                                d.scan()
+                                yield
+                                if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
+                                    raise RuntimeError(
+                                        f"{caller}: waiter thread {d.thread.name!r} "
+                                        "terminated while settling wait_for")
+                                if d.state is d.success and d.tx is not None and not d.tx.done:
+                                    # Descend into the inner cond.wait: the
+                                    # wait_for is the scope floor (its pause
+                                    # rides the pushed frame), so ActWaitForRoute
+                                    # inherits the pause on pop.
                                     d.waiting()
                                     yield
                                     assert d.state is d.success
                                     assert d.tx.state is State.WAITING
-                                    self.wait_for_drivers.add(d)
-                                    entry.status = 'waiting'
+                                    owner.wait_for_drivers.add(d)
+                                    retain_blanket_pause = True
+                                    self.status = 'waiting'
                                     return
-                                if wf in d.motivation:  # pragma: no cover - rare defensive branch
-                                    entry.status = 'ready'
+                                if Paused(wf) in d.motivation:
+                                    # Predicate succeeded: the wait_for parked at
+                                    # PAUSED.  Back out to it and hand the hold to
+                                    # the scheduler bit.
+                                    d.pop()
+                                    retain_blanket_pause = True
+                                    self.status = 'ready'
                                     return
                                 raise RuntimeError(  # pragma: no cover - defensive
                                     f"{caller}: wait_for predicate produced "
                                     "no recognizable settling signal")
+                            finally:
+                                if not retain_blanket_pause:  # pragma: no cover - defensive cleanup
+                                    d.blanket_pause = False
 
-                            if d.tx is parent_tx and d.tx.state is State.PAUSED:  # pragma: no cover - fast-callback race
-                                retain_blanket_pause = True
-                                entry.status = 'ready'
-                                return
-                            raise RuntimeError(  # pragma: no cover - defensive
-                                f"{caller}: wait_for predicate neither waited "
-                                "nor succeeded")
-                        finally:
-                            if not retain_blanket_pause:  # pragma: no cover - defensive cleanup
-                                d.release_blanket_pause(parent_tx)
-
-                    # Plain cond.wait -> drive to WAITING.
-                    d.waiting()
-                    yield
-                    assert d.state is d.success
-                    assert d.tx.state is State.WAITING
-                    entry.status = 'waiting'
-                    return
+                        # Plain cond.wait -> drive to WAITING.
+                        d.waiting()
+                        yield
+                        assert d.state is d.success
+                        assert d.tx.state is State.WAITING
+                        self.status = 'waiting'
+                        return
 
                 def drive_waker(self):
                     """Drive the waker (the final incoming Driver) through
@@ -7718,7 +7501,7 @@ class Scenario:
                     if prev.tx is None or prev.tx.done:
                         prev.scan()
                         prev()
-                    if prev.state is prev.terminated:
+                    if Terminated(prev.thread) in prev.motivation:
                         raise RuntimeError(
                             f"{caller}: previous thread {prev.thread.name!r} "
                             "terminated while still holding the underlying "
@@ -7827,10 +7610,11 @@ class Scenario:
                         # still holding UL (cycle's blanket pause bit).
                         tx = d.tx
                         if verb == 'pause':
-                            # Hand the cycle's blanket pause bit off to the
-                            # user as a flag-set pause; the Driver stays
-                            # parked at PAUSED.
-                            d.handoff_blanket_pause_to_scheduler_pause()
+                            # The user takes over the hold: set the scheduler's
+                            # pause bit, then blanket drops its own.  The Driver
+                            # stays parked at PAUSED, now on the user's bit.
+                            d.scheduler_pause = True
+                            d.blanket_pause = False
                             self.previous = d
                             return
                         # wake: skip past the already-succeeded wait_for
@@ -7851,7 +7635,7 @@ class Scenario:
                         # wait returns and the thread runs on.  pause
                         # parks it at PAUSED, wake/wait let it run.
                         if verb == 'pause':
-                            d.pause()
+                            d.paused()
                             d()
                             self.previous = d
                             return
@@ -7865,115 +7649,154 @@ class Scenario:
 
                     # A wait_for waiter at STALLED: use a route for
                     # the parent predicate / fresh-inner-wait choreography.
-                    entry = SimpleNamespace(done=False, error=None)
-                    self.core.score.run_driver_route(
-                        d, lambda dd, self=self, verb=verb, entry=entry:
-                        self.route_act_wait_for(dd, verb, entry))
-                    if entry.error is not None:
-                        raise RuntimeError(entry.error)
-                    if not entry.done:  # coverage: defensive
+                    route = self.ActWaitForRoute(self, verb)
+                    self.core.score.run_driver_route(d, route)
+                    if route.error is not None:
+                        raise RuntimeError(route.error)
+                    if not route.done:  # coverage: defensive
                         raise RuntimeError(
                             f"cycle: {verb}() wait_for route stopped in "
                             f"unexpected Driver state {d.state.name}")
                     return
 
-                def route_act_wait_for(self, d, verb, entry):
-                    """Route body for wake/pause/wait on a wait_for waiter.
+                class ActWaitForRoute:
+                    """Route object for wake/pause/wait on a wait_for waiter.
+                    __call__(d) is the generator; the outcome is conveyed back
+                    on self.done (the route reached an endpoint) and self.error
+                    (a message, if the waiter did the wrong thing)."""
 
-                    d starts on the post-notify inner cond.wait child at
-                    STALLED.  The route finishes that child, then observes
-                    the parent wait_for's predicate/result signals with
-                    passive Driver.wait calls.
-                    """
-                    child = d.tx
-                    parent_tx = child.parent
-                    wf = parent_tx.api
-                    armed_blanket_pause = False
-                    if verb == 'pause':
-                        # Pre-arm before the child is released so a fast
-                        # true predicate cannot run past PAUSED.
-                        armed_blanket_pause = d.arm_blanket_pause(parent_tx)
-                    try:
-                        d.finish()
-                        yield
+                    def __init__(self, owner, verb):
+                        self.owner = owner
+                        self.verb = verb
+                        self.done = False
+                        self.error = None
 
-                        while True:
-                            d.wait(Predicate(wf), Nested(wf), Paused(wf), wf)
+                    def __call__(self, d):
+                        """d starts on the post-notify inner cond.wait child at
+                        STALLED.  The route finishes that child, pops back to the
+                        parent wait_for, then re-settles its predicate (reenter ->
+                        scan -> exit -> scan) to see whether it waits again,
+                        succeeds (parks PAUSED), or exits.
+                        """
+                        owner = self.owner
+                        verb = self.verb
+                        child = d.tx
+                        parent_tx = child.parent
+                        wf = parent_tx.api
+
+                        def terminated():
+                            if verb == 'wait':
+                                self.error = (
+                                    "cycle: wait() expected the predicate to "
+                                    "wait again, but the thread terminated")
+                            else:
+                                owner.previous = d
+                            self.done = True
+
+                        # The parent wait_for's blanket pause was armed at the
+                        # start by DriveWaiterRoute and rides the stacked parent
+                        # frame.  Finish the inner child and pop back to the
+                        # parent, restoring that pause.  pause keeps it (the
+                        # wait_for parks at PAUSED, then we hand off to the
+                        # scheduler bit); wake/wait release it so the waiter
+                        # exits or waits again.
+                        try:
+                            d.finish()
                             yield
-                            if d.state is d.terminated:
-                                if verb == 'wait':
-                                    entry.error = (
-                                        "cycle: wait() expected the predicate "
-                                        "to wait again, but the thread terminated")
-                                    entry.done = True
-                                    return
-                                self.previous = d
-                                entry.done = True
+                            d.pop()
+
+                            # The predicate re-evaluates: reenter catches its
+                            # re-entry (the scheduler gets its hook), or the
+                            # PAUSED park if it already raced to success.
+                            d.reenter()
+                            yield
+                            if Terminated(d.thread) in d.motivation:
+                                terminated()
+                                return
+                            if Predicate(wf) in d.motivation and (
+                                    owner.scheduler is not _do_nothing):
+                                owner.scheduler(wf)
+
+                            # Phase A: scan absorbs the predicate's return, then
+                            # exit() confirms it (clearing callback_signal) so
+                            # Phase B won't re-trip on Not(Predicate).
+                            d.push()
+                            d.scan()
+                            yield
+                            if Terminated(d.thread) in d.motivation:
+                                terminated()
+                                return
+                            d.exit()
+                            yield
+                            d.pop()
+
+                            # Phase B: the real outcome -- the inner cond.wait
+                            # child surfaces (the predicate waited again) or the
+                            # wait_for parks at PAUSED (the predicate succeeded).
+                            d.push()
+                            d.scan()
+                            yield
+                            if Terminated(d.thread) in d.motivation:
+                                terminated()
                                 return
 
-                            motivation = d.motivation
-                            if Predicate(wf) in motivation:
-                                if self.scheduler is not _do_nothing:
-                                    self.scheduler(wf)
-                                d.resume()
-                                yield
-                                if d.state is d.terminated:
-                                    if verb == 'wait':
-                                        entry.error = (
-                                            "cycle: wait() expected the predicate "
-                                            "to wait again, but the thread terminated")
-                                        entry.done = True
-                                        return
-                                    self.previous = d
-                                    entry.done = True
-                                    return
-                                continue
-
-                            if verb == 'wait':
-                                if Nested(wf) in motivation:
-                                    d.scan(parent_tx)
+                            if d.state is d.success and d.tx is not None and not d.tx.done:
+                                # The predicate waited again (a fresh inner
+                                # cond.wait).  wait() wanted exactly this: the
+                                # waiter becomes a fresh waiting waiter, so pop
+                                # back to the parent, release the speculative
+                                # hold (the parent is at COMMIT, so no
+                                # unpark/settle), and re-descend onto the inner
+                                # wait to drive it to WAITING.
+                                if verb == 'wait':
+                                    d.pop()
+                                    d.blanket_pause = False
+                                    d.push()
+                                    d.scan()
                                     yield
                                     d.waiting()
                                     yield
-                                    self.previous = d
-                                    entry.done = True
+                                    owner.previous = d
+                                    self.done = True
                                     return
-                                # The predicate did not wait again; this
-                                # waiter has left wait_for and now owns UL
-                                # until its following lock.release runs.
-                                self.previous = d
-                                entry.error = (
+                                self.error = (
+                                    f"cycle: {verb}() expected the wait_for to "
+                                    "exit, but it waited again")
+                                self.done = True
+                                return
+
+                            # Paused: the predicate succeeded.  Pop back to the
+                            # parent, parked at PAUSED on the inherited blanket
+                            # bit (or, if it slipped past, exited).
+                            d.pop()
+                            if verb == 'pause':
+                                # Hand the hold to the scheduler bit, then drop
+                                # blanket's (it stays parked at PAUSED).
+                                d.scheduler_pause = True
+                                d.blanket_pause = False
+                                owner.previous = d
+                                self.done = True
+                                return
+                            # wake/wait: drive the wait_for past PAUSED so the
+                            # waiter runs on to its following lock.release.  A
+                            # driven directive does the unpark under the score
+                            # lock; clearing blanket_pause from a route body can't settle.
+                            if d.tx.state is State.PAUSED:
+                                d.finish()
+                                yield
+                            owner.previous = d
+                            if verb == 'wait':
+                                self.error = (
                                     "cycle: wait() expected the predicate to "
                                     "wait again, but the wait_for exited")
-                                entry.done = True
-                                return
-
-                            if verb == 'pause':
-                                if Paused(wf) in motivation:
-                                    d.handoff_blanket_pause_to_scheduler_pause(parent_tx)
-                                    armed_blanket_pause = False
-                                    self.previous = d
-                                    entry.done = True
-                                    return
-                                entry.error = (
-                                    "cycle: pause() expected the wait_for to "
-                                    "exit at PAUSED, but it waited again")
-                                entry.done = True
-                                return
-
-                            # wake
-                            if wf in motivation:
-                                self.previous = d
-                                entry.done = True
-                                return
-                            entry.error = (
-                                "cycle: wake() expected the wait_for to exit, "
-                                "but it waited again")
-                            entry.done = True
+                            self.done = True
                             return
-                    finally:
-                        if armed_blanket_pause:
-                            d.release_blanket_pause(parent_tx)
+                        finally:
+                            # Defensive: release any pause still riding the
+                            # current frame if the route bails unexpectedly.
+                            if d.blanket_pause and d.tx is not None and (
+                                    d.tx.state is not State.PAUSED):
+                                d.blanket_pause = False
 
                 def wake(self, threads):
                     return self.act(threads, 'wake')
@@ -8161,19 +7984,16 @@ class Scenario:
                     """
                     with self.score.lock:
                         self.in_predicate = True
-                        self.score.signal(Predicate(self.api))
+                        self.score.wake()
                     try:
                         result = self.user_predicate()
                     finally:
                         with self.score.lock:
                             self.in_predicate = False
                             # in_predicate just dropped, so Not(Predicate)
-                            # is now high.  Signal it -- mirroring
-                            # decref_usage signaling Not(aggregate) -- so
-                            # a cycle scheduler waiting on "the predicate
-                            # has returned" wakes.  (Predicate's own
-                            # high->low, like Action's, needs no wakeup.)
-                            self.score.signal(Not(Predicate(self.api)))
+                            # is now high; wake so a cycle scheduler waiting
+                            # on "the predicate has returned" re-samples.
+                            self.score.wake()
                     self.iterations += 1
                     return result
 
@@ -8416,77 +8236,107 @@ class Scenario:
                 acquire_methods = (self.primitive.acquire, self.raw.acquire)
                 release_methods = (self.primitive.release, self.raw.release)
 
-                class Entry:
+                class Participant:
+                    """Route object for one allocate participant.  __call__(d)
+                    is the generator the allocate scheduler drives: phase 1
+                    scans to this participant's acquire/release tx (parked at
+                    BLOCKED) and yields, now schedulable; phase 2 runs that tx
+                    to completion when the scheduler resumes it.  The tx and
+                    role the scheduler needs to choose an order are carried on
+                    self."""
+
                     def __init__(self, index, thread, base_tx):
                         self.index = index
                         self.thread = thread
                         self.base_tx = base_tx
-                        self.driver = None
                         self.tx = None
                         self.role = None
+                        self.steps = None
 
-                entries = [Entry(i, thread, base_tx)
-                           for i, (thread, base_tx) in enumerate(pairs)]
+                    def __call__(self, d):
+                        # phase 1: scan to this participant's acquire/release tx.
+                        d.scan()
+                        d()
+                        if Terminated(d.thread) in d.motivation:
+                            if self.base_tx is not None:
+                                raise RuntimeError(
+                                    f"allocate: thread {self.thread.name!r} base "
+                                    f"tx ended before pushing a tx")
+                            raise RuntimeError(
+                                f"allocate: thread {self.thread.name!r} "
+                                f"terminated before pushing a tx")
+                        if d.state is d.unexpected:  # coverage: defensive
+                            raise RuntimeError(
+                                f"allocate: thread {self.thread.name!r} base tx "
+                                f"is blanket-parked, can't reach its acquire "
+                                f"or release")
+                        if d.state is not d.success or d.tx is None or d.tx.done:
+                            raise RuntimeError(
+                                f"allocate: thread {self.thread.name!r} stopped "
+                                f"in unexpected Driver state {d.state.name}")
+
+                        tx = d.tx
+                        method = tx.method
+                        if method in acquire_methods:
+                            role = 'acquire'
+                        elif method in release_methods:
+                            role = 'release'
+                        else:
+                            raise ValueError(
+                                f"allocate: thread {self.thread.name!r} should be "
+                                f"calling acquire or release on this Semaphore, "
+                                f"but is calling {method}")
+                        if tx.state is not State.BLOCKED:
+                            raise RuntimeError(
+                                f"allocate: {role} thread {self.thread.name!r} "
+                                f"must be at BLOCKED, got {tx.state.name}")
+                        self.tx = tx
+                        self.role = role
+                        yield  # schedulable; the allocate loop picks when I run
+
+                        # phase 2: run my tx when the scheduler resumes me.
+                        if role == 'acquire' and pause:
+                            score.driver_pause_deep(d)
+                        else:
+                            score.driver_finish_deep(d)
+                        if tx.state is State.RAISED:
+                            raise tx.result
+                        if role == 'acquire' and tx.result is False:
+                            status = "timed out" if tx.timed_out else "failed"
+                            raise RuntimeError(
+                                f"allocate: acquire thread {self.thread.name!r} {status}")
+                        if role == 'acquire' and pause:
+                            if d.state is not d.success or tx.state is not State.PAUSED:
+                                raise RuntimeError(
+                                    f"allocate: thread {self.thread.name!r} stopped "
+                                    f"in unexpected Driver state {d.state.name}")
+                        elif d.state is not d.success or not tx.done:
+                            raise RuntimeError(
+                                f"allocate: thread {self.thread.name!r} stopped "
+                                f"in unexpected Driver state {d.state.name}")
+
+                participants = [Participant(i, thread, base_tx)
+                                for i, (thread, base_tx) in enumerate(pairs)]
                 by_thread = defaultdict(deque)
                 thread_order = []
-                for entry in entries:
-                    if entry.thread not in by_thread:
-                        thread_order.append(entry.thread)
-                    by_thread[entry.thread].append(entry)
+                for participant in participants:
+                    if participant.thread not in by_thread:
+                        thread_order.append(participant.thread)
+                    by_thread[participant.thread].append(participant)
 
                 pending = []
                 drivers = []
 
-                def classify(tx):
-                    method = tx.method
-                    if method in acquire_methods:
-                        return 'acquire'
-                    if method in release_methods:
-                        return 'release'
-                    return None
-
-                def start(entry):
-                    d = score.Driver(entry.thread, entry.base_tx)
-                    entry.driver = d
+                def start(participant):
+                    d = score.Driver(participant.thread, participant.base_tx)
                     drivers.append(d)
-                    d.scan()
-                    d()
-                    if d.state is d.impasse:  # coverage: defensive
-                        raise RuntimeError(
-                            f"allocate: thread {entry.thread.name!r} base tx "
-                            f"is blanket-parked, can't reach its acquire "
-                            f"or release")
-                    if d.state is d.terminated:
-                        if entry.base_tx is not None:
-                            raise RuntimeError(
-                                f"allocate: thread {entry.thread.name!r} base "
-                                f"tx ended before pushing a tx")
-                        raise RuntimeError(
-                            f"allocate: thread {entry.thread.name!r} "
-                            f"terminated before pushing a tx")
-                    if d.state is not d.success or d.tx is None or d.tx.done:
-                        raise RuntimeError(
-                            f"allocate: thread {entry.thread.name!r} stopped "
-                            f"in unexpected Driver state {d.state.name}")
+                    participant.steps = participant(d)
+                    next(participant.steps)   # run phase 1 (scan to BLOCKED)
+                    pending.append(participant)
 
-                    tx = d.tx
-                    role = classify(tx)
-                    if role is None:
-                        raise ValueError(
-                            f"allocate: thread {entry.thread.name!r} should be "
-                            f"calling acquire or release on this Semaphore, "
-                            f"but is calling {tx.method}")
-                    if tx.state is not State.BLOCKED:
-                        raise RuntimeError(
-                            f"allocate: {role} thread {entry.thread.name!r} "
-                            f"must be at BLOCKED, got {tx.state.name}")
-                    entry.tx = tx
-                    entry.role = role
-                    pending.append(entry)
-
-                def can_run(entry):
-                    tx = entry.tx
-                    if entry.role == 'release':
+                def can_run(participant):
+                    tx = participant.tx
+                    if participant.role == 'release':
                         if not self.bounded:
                             return True
                         initial = getattr(self.actual, '_initial_value', None)
@@ -8495,7 +8345,7 @@ class Scenario:
                         n = getattr(tx, 'n', 1)
                         return self.value + n <= initial
 
-                    assert entry.role == 'acquire'
+                    assert participant.role == 'acquire'
                     if not tx.kwargs.get('blocking', True):
                         return True
                     if tx.timeout == 0:
@@ -8507,48 +8357,30 @@ class Scenario:
                     for thread in thread_order:
                         start(by_thread[thread][0])
 
-                    remaining = len(entries)
+                    remaining = len(participants)
                     while remaining:
-                        for i, entry in enumerate(pending):
-                            if can_run(entry):
+                        for i, participant in enumerate(pending):
+                            if can_run(participant):
                                 pending.pop(i)
                                 break
                         else:
-                            entry = pending.pop(0)
+                            participant = pending.pop(0)
 
-                        d = entry.driver
-                        if entry.role == 'acquire' and pause:
-                            score.driver_pause_deep(d)
-                        else:
-                            score.driver_finish_deep(d)
-
-                        tx = entry.tx
-                        if tx.state is State.RAISED:
-                            raise tx.result
-                        if entry.role == 'acquire' and tx.result is False:
-                            status = "timed out" if tx.timed_out else "failed"
-                            raise RuntimeError(
-                                f"allocate: acquire thread {entry.thread.name!r} {status}")
-                        if entry.role == 'acquire' and pause:
-                            if d.state is not d.success or tx.state is not State.PAUSED:
-                                raise RuntimeError(
-                                    f"allocate: thread {entry.thread.name!r} stopped "
-                                    f"in unexpected Driver state {d.state.name}")
-                        elif d.state is not d.success or not tx.done:
-                            raise RuntimeError(
-                                f"allocate: thread {entry.thread.name!r} stopped "
-                                f"in unexpected Driver state {d.state.name}")
+                        try:
+                            next(participant.steps)   # run phase 2 to completion
+                        except StopIteration:
+                            pass
 
                         remaining -= 1
 
-                        thread_entries = by_thread[entry.thread]
-                        assert thread_entries[0] is entry
+                        thread_entries = by_thread[participant.thread]
+                        assert thread_entries[0] is participant
                         thread_entries.popleft()
 
-                        if entry.role == 'acquire':
+                        if participant.role == 'acquire':
                             lock.release()
                             try:
-                                yield entry.thread
+                                yield participant.thread
                             finally:
                                 lock.acquire()
 
@@ -8556,8 +8388,7 @@ class Scenario:
                             start(thread_entries[0])
                 finally:
                     for d in drivers:
-                        if not d.done:
-                            d.close()
+                        d.close()
                     lock.release()
 
             @BoundInnerClass
@@ -8675,7 +8506,7 @@ class Scenario:
                     an outcome.
 
                     pause:   park each acquirer at PAUSED after it
-                             succeeds (via d.pause() -- both flag and
+                             succeeds (via d.paused() -- both flag and
                              counter set), instead of running to
                              completion.  Caller releases via the
                              matching tx.api.unpause.
@@ -8755,7 +8586,236 @@ class Scenario:
 
         @base()
         @BoundInnerClass
-        class SimpleQueueCore(Core):
+        class QueueCoreCommon(Core):
+            """Shared base for the queue cores.
+
+            SimpleQueueCore and QueueCoreBase are siblings, not parent and
+            child: a SimpleQueue is unbounded with no task tracking, while
+            Queue / LifoQueue / PriorityQueue are bounded and joinable.  But
+            both drive their get/put traffic through the same deliver()
+            protocol, and both share the introspection / nowait transactions
+            and the reprs.  This base holds exactly that common ground.  The
+            deliver_size and deliver_can_run hooks stay per-subclass
+            (SimpleQueue ignores maxsize; the bounded queues respect it).
+            """
+
+            @property
+            def label(self):
+                # 'SimpleQueue' / 'Queue' / 'LifoQueue' / 'PriorityQueue'
+                return type(self.actual).__name__
+
+            def fancy_repr(self, cls_name):
+                addr = hex(id(self.primitive)).upper()
+                name = f"{self.name} " if self.name else ""
+                return f"<{name}{cls_name} object at {addr}>"
+
+            def compatibility_repr(self):
+                addr = hex(id(self.primitive)).upper()
+                cls = type(self.actual)
+                return f"<{cls.__module__}.{cls.__qualname__} object at {addr}>"
+
+            def deliver_role(self, tx):
+                if tx.core is not self:
+                    return None
+                if isinstance(tx, (self.get, self.get_nowait)):
+                    return 'get'
+                if isinstance(tx, (self.put, self.put_nowait)):
+                    return 'put'
+                return None
+
+            def deliver_adjust_size(self, role, size):
+                if role == 'put':
+                    return size + 1
+                assert role == 'get'
+                return size - 1
+
+            def deliver(self, pairs):
+                """Drive queue get/put traffic for QueueAPI.deliver.
+
+                All participants are strict thread specs.  Each active
+                participant's next transaction must be one of the queue's
+                get / put / get_nowait / put_nowait calls, and it must still
+                be at BLOCKED when deliver first sees it.
+
+                deliver may surface many participants, but it runs only one
+                queue transaction on this queue at a time.  The rest remain
+                parked at BLOCKED.  Whenever possible it chooses a pending
+                transaction that can complete with the queue's current size.
+                If none can be proven runnable, it drives the oldest pending
+                transaction; if that call blocks forever, deliver blocks
+                forever too.
+                """
+                if not pairs:
+                    raise ValueError("deliver requires at least one thread")
+
+                qapi = self   # the QueueAPI; Participant.__call__'s self is the participant
+
+                class Participant:
+                    """Route object for one deliver participant.  __call__(d) is
+                    the generator the deliver scheduler drives: phase 1 scans to
+                    this participant's queue call (parked at BLOCKED) and yields,
+                    now schedulable; phase 2 runs that call to completion when
+                    the scheduler resumes it.  The tx and role the scheduler
+                    needs to choose an order are carried on self."""
+
+                    def __init__(self, index, thread, base_tx):
+                        self.index = index
+                        self.thread = thread
+                        self.base_tx = base_tx
+                        self.tx = None
+                        self.role = None
+                        self.steps = None
+
+                    def __call__(self, d):
+                        # phase 1: scan to this participant's queue call.
+                        d.scan(); d()
+                        if Terminated(d.thread) in d.motivation:
+                            if self.base_tx is not None:
+                                raise RuntimeError(
+                                    f"deliver: thread {self.thread.name!r} base tx ended "
+                                    f"before pushing a queue call")
+                            raise RuntimeError(
+                                f"deliver: thread {self.thread.name!r} terminated "
+                                f"before pushing a queue call")
+                        if d.state is d.unexpected:
+                            raise RuntimeError(
+                                f"deliver: thread {self.thread.name!r} base tx is "
+                                f"blanket-parked, can't reach its queue call")
+                        if d.state is not d.success or d.tx is None or d.tx.done:
+                            raise RuntimeError(
+                                f"deliver: thread {self.thread.name!r} stopped in "
+                                f"unexpected Driver state {d.state.name}")
+
+                        tx = d.tx
+                        role = qapi.deliver_role(tx)
+                        if role is None:
+                            raise ValueError(
+                                f"deliver: thread {self.thread.name!r} should be "
+                                f"calling get, put, get_nowait, or put_nowait on "
+                                f"this queue, but is calling {tx.method}")
+                        if tx.state is not State.BLOCKED:
+                            raise RuntimeError(
+                                f"deliver: thread {self.thread.name!r} {role} tx "
+                                f"must be at BLOCKED, got {tx.state.name}")
+                        self.tx = tx
+                        self.role = role
+                        yield  # schedulable; the deliver loop picks when I run
+
+                        # phase 2: run my queue call when the scheduler resumes me.
+                        qapi.score.driver_finish_deep(d)
+                        if tx.state is State.RAISED:
+                            raise tx.result
+                        if not tx.done or d.state is not d.success:
+                            raise RuntimeError(
+                                f"deliver: thread {self.thread.name!r} stopped "
+                                f"in unexpected Driver state {d.state.name}")
+
+                participants = [Participant(i, thread, base_tx)
+                                for i, (thread, base_tx) in enumerate(pairs)]
+                by_thread = defaultdict(deque)
+                thread_order = []
+                for participant in participants:
+                    if participant.thread not in by_thread:
+                        thread_order.append(participant.thread)
+                    by_thread[participant.thread].append(participant)
+
+                active = {}
+                pending = []
+                drivers = []
+                results = [None] * len(participants)
+
+                def start(participant):
+                    d = self.score.Driver(participant.thread, participant.base_tx)
+                    drivers.append(d)
+                    participant.steps = participant(d)
+                    next(participant.steps)   # run phase 1 (scan to BLOCKED)
+                    active[participant.thread] = participant
+                    pending.append(participant)
+
+                try:
+                    for thread in thread_order:
+                        start(by_thread[thread][0])
+
+                    size = self.deliver_size()
+                    remaining = len(participants)
+                    while remaining:
+                        for i, participant in enumerate(pending):
+                            if self.deliver_can_run(participant.role, size):
+                                pending.pop(i)
+                                break
+                        else:
+                            # No pending queue operation can be proven to
+                            # complete immediately.  Drive the oldest one
+                            # anyway; for a blocking get/put this may block
+                            # forever, which mirrors the user's deadlocked
+                            # traffic script.  For a nowait call it will
+                            # usually raise the stdlib queue exception.
+                            participant = pending.pop(0)
+
+                        try:
+                            next(participant.steps)   # run phase 2 to completion
+                        except StopIteration:
+                            pass
+
+                        results[participant.index] = participant.tx
+                        size = self.deliver_adjust_size(participant.role, size)
+                        remaining -= 1
+
+                        active.pop(participant.thread)
+                        thread_entries = by_thread[participant.thread]
+                        assert thread_entries[0] is participant
+                        thread_entries.popleft()
+                        if thread_entries:
+                            start(thread_entries[0])
+
+                    return tuple(tx.api for tx in results)
+                finally:
+                    for d in drivers:
+                        d.close()
+
+            @BoundInnerClass
+            class qsize(base.Transaction):
+                def __repr__(self):
+                    return self.repr(f"{self.core.label}.qsize")
+
+                def commit(self):
+                    with unlock(self.score.lock):
+                        return self.core.actual.qsize()
+
+            @BoundInnerClass
+            class empty(base.Transaction):
+                def __repr__(self):
+                    return self.repr(f"{self.core.label}.empty")
+
+                def commit(self):
+                    with unlock(self.score.lock):
+                        return self.core.actual.empty()
+
+            @BoundInnerClass
+            class get_nowait(base.Transaction):
+                def __repr__(self):
+                    return self.repr(f"{self.core.label}.get_nowait")
+
+                def commit(self):
+                    with unlock(self.score.lock):
+                        return self.core.actual.get_nowait()
+
+            @BoundInnerClass
+            class put_nowait(base.Transaction):
+                def __init__(self, core, method, start_time, regulated, item=None):
+                    super().__init__(method, start_time, regulated)
+                    self.kwargs['item'] = item
+
+                def __repr__(self):
+                    return self.repr(f"{self.core.label}.put_nowait")
+
+                def commit(self):
+                    with unlock(self.score.lock):
+                        return self.core.actual.put_nowait(self.kwargs['item'])
+
+        @base()
+        @BoundInnerClass
+        class SimpleQueueCore(base.QueueCoreCommon):
             """Core for the SimpleQueue primitive.
 
             SimpleQueue is unbounded: put never blocks.  The only
@@ -8798,42 +8858,14 @@ class Scenario:
 
                 super().__init__(primitive, self.SimpleQueueAPI, raw, methods)
 
-            def fancy_repr(self, cls_name):
-                addr = hex(id(self.primitive)).upper()
-                name = f"{self.name} " if self.name else ""
-                return f"<{name}{cls_name} object at {addr}>"
-
-            def compatibility_repr(self):
-                addr = hex(id(self.primitive)).upper()
-                cls = type(self.actual)
-                return f"<{cls.__module__}.{cls.__qualname__} object at {addr}>"
-
             def __repr__(self):
                 return self.fancy_repr('SimpleQueueCore')
-
-            def deliver_role(self, tx):
-                if tx.core is not self:
-                    return None
-                if isinstance(tx, (self.get, self.get_nowait)):
-                    return 'get'
-                if isinstance(tx, (self.put, self.put_nowait)):
-                    return 'put'
-                return None
 
             def deliver_size(self):
                 return self.actual.qsize()
 
             def deliver_can_run(self, role, size):
                 return role == 'put' or size > 0
-
-            def deliver_adjust_size(self, role, size):
-                if role == 'put':
-                    return size + 1
-                assert role == 'get'
-                return size - 1
-
-            def deliver(self, pairs):
-                return self.score.drive_queue_deliver(self, pairs)
 
             # ---- blocking method: get (TimeoutTransaction) ----
 
@@ -8856,15 +8888,6 @@ class Scenario:
                     with unlock(self.score.lock):
                         return self.core.actual.get(block, timeout)
 
-            @BoundInnerClass
-            class get_nowait(base.Transaction):
-                def __repr__(self):
-                    return self.repr("SimpleQueue.get_nowait")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.get_nowait()
-
             # ---- non-blocking methods (Transaction) ----
 
             @BoundInnerClass
@@ -8884,38 +8907,6 @@ class Scenario:
                     timeout = self.kwargs['timeout']
                     with unlock(self.score.lock):
                         return self.core.actual.put(item, block, timeout)
-
-            @BoundInnerClass
-            class put_nowait(base.Transaction):
-                def __init__(self, core, method, start_time, regulated, item=None):
-                    super().__init__(method, start_time, regulated)
-                    self.kwargs['item'] = item
-
-                def __repr__(self):
-                    return self.repr("SimpleQueue.put_nowait")
-
-                def commit(self):
-                    item = self.kwargs['item']
-                    with unlock(self.score.lock):
-                        return self.core.actual.put_nowait(item)
-
-            @BoundInnerClass
-            class qsize(base.Transaction):
-                def __repr__(self):
-                    return self.repr("SimpleQueue.qsize")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.qsize()
-
-            @BoundInnerClass
-            class empty(base.Transaction):
-                def __repr__(self):
-                    return self.repr("SimpleQueue.empty")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.empty()
 
             @BoundInnerClass
             @base()
@@ -8992,7 +8983,7 @@ class Scenario:
 
         @base()
         @BoundInnerClass
-        class QueueCoreBase(Core):
+        class QueueCoreBase(base.QueueCoreCommon):
             """Core for Queue / LifoQueue / PriorityQueue.
 
             blanket swaps the queue's shared mutex and its three internal
@@ -9073,32 +9064,8 @@ class Scenario:
                 super().__init__(primitive, api_cls, raw, methods)
 
             @property
-            def label(self):
-                # 'Queue' / 'LifoQueue' / 'PriorityQueue'
-                return type(self.actual).__name__
-
-            @property
             def maxsize(self):
                 return self.actual.maxsize
-
-            def fancy_repr(self, cls_name):
-                addr = hex(id(self.primitive)).upper()
-                name = f"{self.name} " if self.name else ""
-                return f"<{name}{cls_name} object at {addr}>"
-
-            def compatibility_repr(self):
-                addr = hex(id(self.primitive)).upper()
-                cls = type(self.actual)
-                return f"<{cls.__module__}.{cls.__qualname__} object at {addr}>"
-
-            def deliver_role(self, tx):
-                if tx.core is not self:
-                    return None
-                if isinstance(tx, (self.get, self.get_nowait)):
-                    return 'get'
-                if isinstance(tx, (self.put, self.put_nowait)):
-                    return 'put'
-                return None
 
             def deliver_size(self):
                 return self.actual._qsize()
@@ -9109,34 +9076,7 @@ class Scenario:
                 assert role == 'put'
                 return self.maxsize <= 0 or size < self.maxsize
 
-            def deliver_adjust_size(self, role, size):
-                if role == 'put':
-                    return size + 1
-                assert role == 'get'
-                return size - 1
-
-            def deliver(self, pairs):
-                return self.score.drive_queue_deliver(self, pairs)
-
             # ---- non-blocking methods (plain Transaction) ----
-
-            @BoundInnerClass
-            class qsize(base.Transaction):
-                def __repr__(self):
-                    return self.repr(f"{self.core.label}.qsize")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.qsize()
-
-            @BoundInnerClass
-            class empty(base.Transaction):
-                def __repr__(self):
-                    return self.repr(f"{self.core.label}.empty")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.empty()
 
             @BoundInnerClass
             class full(base.Transaction):
@@ -9146,28 +9086,6 @@ class Scenario:
                 def commit(self):
                     with unlock(self.score.lock):
                         return self.core.actual.full()
-
-            @BoundInnerClass
-            class put_nowait(base.Transaction):
-                def __init__(self, core, method, start_time, regulated, item=None):
-                    super().__init__(method, start_time, regulated)
-                    self.kwargs['item'] = item
-
-                def __repr__(self):
-                    return self.repr(f"{self.core.label}.put_nowait")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.put_nowait(self.kwargs['item'])
-
-            @BoundInnerClass
-            class get_nowait(base.Transaction):
-                def __repr__(self):
-                    return self.repr(f"{self.core.label}.get_nowait")
-
-                def commit(self):
-                    with unlock(self.score.lock):
-                        return self.core.actual.get_nowait()
 
             @BoundInnerClass
             class task_done(base.Transaction):
@@ -9566,7 +9484,7 @@ class Scenario:
                             assert d.state is d.success, f"expected parked, got {d.state}"
                             assert d.tx.state is State.WAITING, f"expected tx WAITING, got {d.tx.state}"
                         for d in waiters:
-                            d.pause_internal()
+                            d.blanket_paused()
                             self.dispatch.add(d)
 
                         actual_waiters = core.actual_waiter_count()
@@ -9575,7 +9493,7 @@ class Scenario:
                         if core.actual.is_set():
                             raise RuntimeError("cycle: Event was set unexpectedly")
 
-                        # Stage 3 first half: setter.pause_internal() drives
+                        # Stage 3 first half: setter.blanket_paused() drives
                         # the setter through commit (actual.set),
                         # releasing waiters from actual.wait.  Iterate:
                         # setter yields PARKED at PAUSED, waiters yield
@@ -9583,7 +9501,7 @@ class Scenario:
                         # Cycle owns these incref's on its bookkeeping
                         # and releases them at wake/pause time, no user
                         # pause flag involved here.
-                        setter.pause_internal()
+                        setter.blanket_paused()
                         self.dispatch.add(setter)
 
                         for d in self.dispatch:
@@ -9601,8 +9519,7 @@ class Scenario:
                         # path: every Driver is parked@PAUSED (terminal),
                         # close() already ran from Driver.to(), no-op.
                         for d in self.drivers:
-                            if not d.done:  # pragma: no cover
-                                d.close()
+                            d.close()
 
                 def repr(self):
                     status = 'closed' if self.closed else f'{len(self.ready)} ready'
@@ -9758,7 +9675,7 @@ class Scenario:
                         if self.user_action is not None:
                             tx = candidate
                             tx.in_action = True
-                            self.score.signal(Action(tx.api))
+                            self.score.wake()
                 try:
                     if self.user_action is not None:
                         return self.user_action(tx.api if tx is not None else None)
@@ -9767,13 +9684,12 @@ class Scenario:
                     if tx is not None:
                         with self.score.lock:
                             tx.in_action = False
-                            # in_action just dropped, so Not(Action) is
-                            # now high.  Signal it so a cycle scheduler
-                            # waiting on "the action has returned" wakes
-                            # -- symmetric with call_predicate signaling
-                            # Not(Predicate).  (Action's own high->low,
-                            # like Predicate's, needs no wakeup.)
-                            self.score.signal(Not(Action(tx.api)))
+                            # in_action just dropped, so Not(Action) is now
+                            # high.  Wake so a cycle scheduler waiting on "the
+                            # action has returned" re-samples -- symmetric with
+                            # call_predicate.  (Action's own high->low needs no
+                            # wakeup.)
+                            self.score.wake()
 
             @property
             def parties(self):
@@ -9953,7 +9869,7 @@ class Scenario:
                             raise
 
                         for d in waiters:
-                            d.pause_internal()
+                            d.blanket_paused()
                             self.dispatch.add(d)
 
                         # Arm the waiter PAUSED holds before the opener
@@ -9964,17 +9880,14 @@ class Scenario:
                         self.dispatch.drain_recent()
 
                         if have_action:
-                            action_entry = SimpleNamespace(done=False)
-                            score.run_driver_route(
-                                opener,
-                                lambda dd, self=self, scheduler=scheduler, entry=action_entry:
-                                    self.route_action_opener(dd, scheduler, entry))
-                            if not action_entry.done:  # coverage: defensive
+                            action_route = self.ActionOpenerRoute(scheduler)
+                            score.run_driver_route(opener, action_route)
+                            if not action_route.done:  # coverage: defensive
                                 raise RuntimeError(
                                     "cycle: barrier action opener route stopped "
                                     f"in unexpected Driver state {opener.state.name}")
                         else:
-                            opener.pause_internal()
+                            opener.blanket_paused()
                             self.dispatch.add(opener)
 
                         for d in self.dispatch:
@@ -9991,55 +9904,70 @@ class Scenario:
                         self.extra_waiters = 0
                     finally:
                         for d in self.drivers:
-                            if not d.done:  # pragma: no cover
-                                d.close()
+                            d.close()
 
-                def route_action_opener(self, d, scheduler, entry):
-                    tx = d.tx
-                    api = tx.api
-                    d.arm_blanket_pause(tx)
-                    retain_blanket_pause = False
-                    try:
-                        d.reenter()
-                        yield
-                        if d.state is d.terminated:  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action opener terminated "
-                                "before action ran")
-                        if d.state is not d.success or d.callback_signal != Action(api):  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action opener did not enter "
-                                "its action")
+                class ActionOpenerRoute:
+                    """Route object driving a barrier opener through its action
+                    callback.  __call__(d) is the generator; the completion
+                    flag the caller needs is conveyed back on self.done."""
 
-                        scheduler(api)
+                    def __init__(self, scheduler):
+                        self.scheduler = scheduler
+                        self.done = False
 
-                        d.resume()
-                        yield
-                        if d.state is d.terminated:  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action opener terminated "
-                                "during action")
-                        if d.state is not d.success:  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action resume stopped in "
-                                f"unexpected Driver state {d.state.name}")
+                    def __call__(self, d):
+                        scheduler = self.scheduler
+                        tx = d.tx
+                        api = tx.api
+                        d.blanket_pause = True
+                        retain_blanket_pause = False
+                        try:
+                            d.reenter()
+                            yield
+                            if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener terminated "
+                                    "before action ran")
+                            if d.state is not d.success or d.callback_signal != Action(api):  # pragma: no cover - defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener did not enter "
+                                    "its action")
 
-                        d.wait(Paused(api), api)
-                        yield
-                        if d.state is d.terminated:  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action opener terminated "
-                                "before parking at PAUSED")
-                        if Paused(api) not in d.motivation:  # pragma: no cover - defensive
-                            raise RuntimeError(
-                                "cycle: barrier action opener did not park "
-                                "at PAUSED")
-                        retain_blanket_pause = True
-                        entry.done = True
-                        return
-                    finally:
-                        if not retain_blanket_pause:  # pragma: no cover - defensive cleanup
-                            d.release_blanket_pause(tx)
+                            scheduler(api)
+
+                            # The action runs freely after reenter entered it.
+                            # Phase A absorbs its return; exit() confirms it
+                            # (clearing callback_signal) so Phase B can observe
+                            # the opener parking at PAUSED without re-tripping on
+                            # Not(Action).
+                            d.push()
+                            d.scan()
+                            yield
+                            if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener terminated "
+                                    "before parking at PAUSED")
+                            d.exit()
+                            yield
+                            d.pop()
+                            d.push()
+                            d.scan()
+                            yield
+                            if Terminated(d.thread) in d.motivation:  # pragma: no cover - defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener terminated "
+                                    "before parking at PAUSED")
+                            if Paused(api) not in d.motivation:  # pragma: no cover - defensive
+                                raise RuntimeError(
+                                    "cycle: barrier action opener did not park "
+                                    "at PAUSED")
+                            d.pop()
+                            retain_blanket_pause = True
+                            self.done = True
+                            return
+                        finally:
+                            if not retain_blanket_pause:  # pragma: no cover - defensive cleanup
+                                d.blanket_pause = False
 
                 def repr(self):
                     status = 'closed' if self.closed else f'{len(self.ready)} ready'
@@ -10156,7 +10084,7 @@ class Scenario:
         explicit staged directives.  A fresh Driver is undirected; use
         scan() to select the thread's current published transaction,
         then stage follow-up directives such as finish(), pause(),
-        wait(*signals), reenter(), resume(), until(), or route().
+        wait(*signals), reenter(), push(), pop(), until(), or route().
 
         Construct with a worker thread, optionally with a base
         transaction.  Driver objects claim the score's per-thread
@@ -10169,17 +10097,14 @@ class Scenario:
         undirected = base.Driver.undirected
         driving    = base.Driver.driving
         success    = base.Driver.success
-        returned   = base.Driver.returned
-        overshot   = base.Driver.overshot
-        persisted  = base.Driver.persisted
+        unexpected = base.Driver.unexpected
         mutated    = base.Driver.mutated
-        raised     = base.Driver.raised
-        terminated = base.Driver.terminated
-        nested     = base.Driver.nested
-        impasse    = base.Driver.impasse
+        detained   = base.Driver.detained
 
-        driving_states  = frozenset((driving,))
-        terminal_states = base.Driver.terminal_states
+        # until() prediction targets (arguments to until(), not rest states).
+        terminated = base.Driver.terminated
+        raised     = base.Driver.raised
+        impasse    = base.Driver.impasse
 
         def __init__(self, scenario, thread, tx=None, *, route=None):
             score = scenario._core
@@ -10217,7 +10142,7 @@ class Scenario:
                 directive = getattr(self, directive.__name__)
             args = tuple(
                 arg.api if isinstance(arg, self._core.score.Transaction) else arg
-                for arg in status.directive_args)
+                for arg in status.args)
             tx = status.tx
             tx = tx.api if tx is not None else None
             return DriverStatus(
@@ -10291,14 +10216,14 @@ class Scenario:
                 return getattr(self, status.directive.__name__)
 
         @property
-        def directive_args(self):
+        def args(self):
             with self._lock:
                 status = self._core.status
                 if status is None:
                     return ()
                 return tuple(
                     arg.api if isinstance(arg, self._core.score.Transaction) else arg
-                    for arg in status.directive_args)
+                    for arg in status.args)
 
         @property
         def routed(self):
@@ -10306,13 +10231,38 @@ class Scenario:
                 return self._core.routed
 
         @property
-        def done(self):
+        def pause(self):
             with self._lock:
-                return self._core.done
+                return self._core.scheduler_pause
+
+        @pause.setter
+        def pause(self, value):
+            with self._lock:
+                self._core.scheduler_pause = value
+
+        @property
+        def pausing(self):
+            with self._lock:
+                return self._core.pausing
 
         def scan(self, base_tx=None):
             with self._lock:
                 self._core.scan(base_tx._core if base_tx is not None else None)
+
+        # Nesting directives: push() makes the current tx the scope floor
+        # (base_tx) so scan() finds its children; pop() restores the frame.
+        def push(self):
+            with self._lock:
+                self._core.push()
+
+        def pop(self):
+            with self._lock:
+                self._core.pop()
+
+        @property
+        def stack(self):
+            with self._lock:
+                return self._core.stack
 
         def refresh(self):
             with self._lock:
@@ -10322,9 +10272,9 @@ class Scenario:
             with self._lock:
                 self._core.finish()
 
-        def block(self):
+        def blocked(self):
             with self._lock:
-                self._core.block()
+                self._core.blocked()
 
         def commit(self):
             with self._lock:
@@ -10342,21 +10292,21 @@ class Scenario:
             with self._lock:
                 self._core.reenter()
 
-        def resume(self):
+        def exit(self):
             with self._lock:
-                self._core.resume()
+                self._core.exit()
 
         def until(self, state):
             with self._lock:
                 self._core.until(state)
 
-        def stall(self):
+        def stalled(self):
             with self._lock:
-                self._core.stall()
+                self._core.stalled()
 
-        def pause(self):
+        def paused(self):
             with self._lock:
-                self._core.pause()
+                self._core.paused()
 
         def __call__(self):
             with self._lock:
@@ -10623,8 +10573,10 @@ class Scenario:
             # don't bother to lock the scenario lock for this.
             # One impersonator per impersonated module, reusing the
             # scenario's cached handles (scenario.threading / .queue).
-            impersonators = {m: scenario._impersonator(m)
-                             for m in scenario._core.impersonated_modules}
+            impersonators = {
+                threading: scenario.threading,
+                queue: scenario.queue,
+                }
             self._injection = scenario._core.Injection(module, impersonators)
 
         def __repr__(self):
@@ -10715,18 +10667,18 @@ class Scenario:
         def acquire(self, blocking=True, timeout=-1):
             ul = self._core.underlying.primitive
             with ul._lock:
-                return ul._core(ul.acquire, True, blocking=blocking, timeout=timeout, entry=self)
+                return ul._core(ul.acquire, True, blocking=blocking, timeout=timeout, called=self.acquire)
 
         def release(self):
             ul = self._core.underlying.primitive
             with ul._lock:
-                return ul._core(ul.release, True, entry=self)
+                return ul._core(ul.release, True, called=self.release)
 
         if _condition_provides_locked:
             def locked(self):
                 ul = self._core.underlying.primitive
                 with ul._lock:
-                    return ul._core(ul.locked, True, entry=self)
+                    return ul._core(ul.locked, True, called=self.locked)
 
         def __enter__(self):
             self.acquire()

@@ -2165,7 +2165,9 @@ Properties:
   recently completed directive, as a tuple.
 - **`driver.routed`** - `True` while a route is installed and still
   active.
-- **`driver.done`** - `True` if in a terminal driver state.
+- **`driver.done`** - `True` if in a terminal driver state.  Only
+  `terminated` is terminal, so in practice this means "the thread is gone."
+  A `raised` Driver is *not* done -- it's recoverable via `scan()`.
 
 Driver has these states:
 
@@ -2188,8 +2190,16 @@ Driver has these states:
   but the thread began another transaction instead.
 - `mutated`, another actor moved a thread past a blanket-controlled point
   this Driver had parked it at.  Recover by scanning again.
-- `raised`, the driven transaction transitioned to `RAISED`.
-- `terminated`, the thread terminated.
+- `raised`, the driven transaction transitioned to `RAISED` -- an
+  *unanticipated* raise (an expected one, via `until(raised)`, lands in
+  `success`).  This is **not** a terminal state: an uncaught exception would
+  have killed the thread (landing in `terminated`), so reaching `raised`
+  means the worker raised but is still alive and may catch it and carry on.
+  Recover by scanning again, exactly like `mutated`; the raise is surfaced
+  in the `DriverStatus` without bricking the Driver.
+- `terminated`, the thread terminated.  This is the one true terminal state
+  -- the only one the Driver can never transition out of, because there is
+  no longer a thread to produce transactions to drive.
 - `impasse`, a scoped Driver can't currently reach nested work because the
   base transaction is parked in a blanket-controlled state or has gone away.
 
@@ -2635,6 +2645,13 @@ But the official test and coverage path is `tests/test_all.py`.
 
     - Driver directives are staged into one pending slot, and the last staged
       directive wins.
+
+    - `raised` is no longer a terminal Driver state.  `terminated` is now the
+      only terminal state -- the only one a Driver can never leave.  A
+      transaction raising does not kill its thread (an *uncaught* raise would,
+      landing in `terminated`), so a worker that catches the exception and
+      keeps running is now drivable past the raise: `scan()` recovers and
+      picks up its next transaction, the same way you recover from `mutated`.
 
     - `Driver.wait` is now the Driver-level companion to `scenario.wait`:
       `driver.wait(*signals)` passively waits until one of the named signals
